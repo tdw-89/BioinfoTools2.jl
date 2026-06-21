@@ -4,7 +4,23 @@ version = "0.1.0"
 authors = ["Tom Wolfe <thomas_wolfe@student.uml.edu>"]
 
 [deps]
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
 CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+CategoricalArrays = "324d7699-5711-5eae-9e2f-1d82baa6b597"
+DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
+GLM = "38e38edf-8417-5370-95a0-9cbb8c7f171a"
+HypothesisTests = "09f84164-cd44-5f33-b23f-e6b0d136a0d5"
+MultipleTesting = "f8716d33-7c4a-5097-896f-ce0ecbd3ef6b"
+OhMyREPL = "5fb14364-9ced-5910-84b2-373655c76a03"
+StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 
 [compat]
+CSV = "0.10.16"
 CairoMakie = "0.15.12"
+CategoricalArrays = "1.1.1"
+DataFrames = "1.8.2"
+GLM = "1.9.5"
+HypothesisTests = "0.11.8"
+MultipleTesting = "0.6.0"
+OhMyREPL = "0.5.32"
+StatsBase = "0.34.12"

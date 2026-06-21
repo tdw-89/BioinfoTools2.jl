@@ -1,0 +1,6 @@
+using BioinfoTools2
+using Test
+
+@testset "BioinfoTools.jl" begin
+    include("TESTS_paralogs.jl")
+end
