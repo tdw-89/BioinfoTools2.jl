@@ -1,0 +1,10 @@
+name = "BioinfoTools2"
+uuid = "961a5d6f-8097-4ecf-bcda-6ee52fd0e99f"
+version = "0.1.0"
+authors = ["Tom Wolfe <thomas_wolfe@student.uml.edu>"]
+
+[deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
+
+[compat]
+CairoMakie = "0.15.12"
