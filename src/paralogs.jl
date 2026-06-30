@@ -1,4 +1,5 @@
 module Paralogs
+
 using DataFrames
 
 function rbh_ds(paralog_df::DataFrame)
@@ -59,7 +60,7 @@ function rbh_ds(paralog_df::DataFrame)
         "GeneID" => rbh_gene, 
         "ParalogID" => rbh_paralog, 
         "ds" => score_i_origs
-        )
+    )
 end
 
 """
