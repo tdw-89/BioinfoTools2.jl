@@ -1,10 +1,12 @@
 module Reference
 
+using BioGenerics
 using CodecZlib
 using GFF3
 using IntervalTrees
 
 const RECORD_BUFFER = 1_000
+const IntervalMeta64 = IntervalTree{UInt32, IntervalValue{UInt32, UInt64}}
 
 ##############################= Scaffolds =##############################
 
@@ -17,7 +19,7 @@ struct Scaffold
     name::String
 
     # Intervals
-    genes::IntervalTree{UInt32, IntervalValue{UInt32, UInt64}}
+    genes::IntervalMeta64
 end
 
 
@@ -184,7 +186,7 @@ function build_genome!(ch::Channel{Vector{ParseResult}}, genome::Genome)
         for result in batch
             # Ensure the scaffold exists, creating it lazily if not
             scaffold = get!(genome.scaffolds, result.scaffold_id) do
-                Scaffold(result.scaffold_id, IntervalTree{UInt32, IntervalValue{UInt32, UInt64}}())
+                Scaffold(result.scaffold_id, IntervalMeta64())
             end
 
             # 1. Add the gene interval (start, end, 64-bit code) to the scaffold tree
@@ -223,18 +225,31 @@ function add_features!(gff_path::String, genome::Genome)
         sizehint!(buffer, RECORD_BUFFER)
 
         try
-            while !eof(rdr)
-                read!(rdr, record)
-                result = parse_record(record, meta_index)
-                if result !== nothing
-                    push!(buffer, result)
-                    meta_index += UInt32(1)
-                    if length(buffer) == RECORD_BUFFER
-                        put!(ch, buffer)
-                        buffer = Vector{ParseResult}()
-                        sizehint!(buffer, RECORD_BUFFER)
+            while true
+                # Don't need to `empty!` record because GFF3.jl does this
+                # as a first step in `read!`
+                at_eof = false
+                try
+                    read!(rdr, record)
+                catch e
+                    e isa EOFError || rethrow()
+                    at_eof = true
+                end
+                # Process if filled: handles both normal reads and the last record
+                # in files without a trailing newline (EOFError thrown after fill).
+                if BioGenerics.isfilled(record)
+                    result = parse_record(record, meta_index)
+                    if result !== nothing
+                        push!(buffer, result)
+                        meta_index += UInt32(1)
+                        if length(buffer) == RECORD_BUFFER
+                            put!(ch, buffer)
+                            buffer = Vector{ParseResult}()
+                            sizehint!(buffer, RECORD_BUFFER)
+                        end
                     end
                 end
+                at_eof && break
             end
             # Flush any remaining records that didn't fill a complete batch
             isempty(buffer) || put!(ch, buffer)
