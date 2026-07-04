@@ -2,8 +2,9 @@ using BioinfoTools2.Studies
 using Test
 
 const ST_DATA_DIR = joinpath(@__DIR__, "data")
-const MICRO_BED   = joinpath(ST_DATA_DIR, "micro.narrowPeak")
-const FULL_BED    = joinpath(ST_DATA_DIR, "full.narrowPeak")
+const MICRO_BED = joinpath(ST_DATA_DIR, "micro.bed")
+const MICRO_NARROWPEAK   = joinpath(ST_DATA_DIR, "micro.narrowPeak")
+const FULL_NARROWPEAK    = joinpath(ST_DATA_DIR, "full.narrowPeak")
 
 @testset "Studies" begin
 
@@ -20,7 +21,7 @@ const FULL_BED    = joinpath(ST_DATA_DIR, "full.narrowPeak")
 
     # -------------------------------------------------------------------------
     @testset "load_bed - micro.narrowPeak (8 records, 1 scaffold)" begin
-        bd = Studies.load_bed(MICRO_BED)
+        bd = Studies.load_bed(MICRO_NARROWPEAK)
 
         @test bd isa Studies.BedData
         @test length(bd.scaffolds) == 1
@@ -31,7 +32,7 @@ const FULL_BED    = joinpath(ST_DATA_DIR, "full.narrowPeak")
     # -------------------------------------------------------------------------
     @testset "load_bed - strand encoding in micro.narrowPeak" begin
         # All 8 records in micro.narrowPeak have strand '.' → UInt8(0)
-        bd = Studies.load_bed(MICRO_BED)
+        bd = Studies.load_bed(MICRO_NARROWPEAK)
 
         for (_, tree) in bd.scaffolds
             for iv in tree
@@ -42,8 +43,20 @@ const FULL_BED    = joinpath(ST_DATA_DIR, "full.narrowPeak")
 
     # -------------------------------------------------------------------------
     @testset "load_bed - coordinate conversion in micro.narrowPeak" begin
-        # BED is 0-based half-open; loader converts to 1-based closed.
+        # BED is 0-based half-open; BED.jl should convert to 1-based closed.
         # First record: chromStart=4, chromEnd=1609 → start=5, end=1609
+        bd = Studies.load_bed(MICRO_NARROWPEAK)
+        tree = bd.scaffolds["DDB0215018"]
+
+        starts = sort([iv.first for iv in tree])
+        ends   = sort([iv.last  for iv in tree])
+
+        @test minimum(starts) == UInt32(5)    # 0-based 4  → 1-based 5
+        @test ends[1]         == UInt32(1609) # chromEnd unchanged
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "load_bed - BED (3 + 3)" begin
         bd = Studies.load_bed(MICRO_BED)
         tree = bd.scaffolds["DDB0215018"]
 
@@ -56,7 +69,7 @@ const FULL_BED    = joinpath(ST_DATA_DIR, "full.narrowPeak")
 
     # -------------------------------------------------------------------------
     @testset "load_bed - full.narrowPeak (4448 records total)" begin
-        bd = Studies.load_bed(FULL_BED)
+        bd = Studies.load_bed(FULL_NARROWPEAK)
 
         @test bd isa Studies.BedData
         @test !isempty(bd.scaffolds)
@@ -64,5 +77,4 @@ const FULL_BED    = joinpath(ST_DATA_DIR, "full.narrowPeak")
         total = sum(length(tree) for tree in values(bd.scaffolds))
         @test total == 4448
     end
-
 end

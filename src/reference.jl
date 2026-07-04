@@ -171,7 +171,7 @@ function Species(name::String; taxon_id::String = "")
 end
 
 # Interns `s` into the genome's vocab, returning its 1-based UInt16 token.
-function intern_string!(genome::Genome, s::String)::UInt16
+function intern_string!(genome::Genome, s::String)
     get!(genome.vocab_lookup, s) do
         token = UInt16(length(genome.vocab) + 1)
         push!(genome.vocab, s)
@@ -225,18 +225,10 @@ function add_features!(gff_path::String, genome::Genome)
         sizehint!(buffer, RECORD_BUFFER)
 
         try
-            while true
+            while !eof(rdr)
                 # Don't need to `empty!` record because GFF3.jl does this
                 # as a first step in `read!`
-                at_eof = false
-                try
-                    read!(rdr, record)
-                catch e
-                    e isa EOFError || rethrow()
-                    at_eof = true
-                end
-                # Process if filled: handles both normal reads and the last record
-                # in files without a trailing newline (EOFError thrown after fill).
+                read!(rdr, record)
                 if BioGenerics.isfilled(record)
                     result = parse_record(record, meta_index)
                     if result !== nothing
@@ -249,7 +241,7 @@ function add_features!(gff_path::String, genome::Genome)
                         end
                     end
                 end
-                at_eof && break
+                # at_eof && break
             end
             # Flush any remaining records that didn't fill a complete batch
             isempty(buffer) || put!(ch, buffer)

@@ -25,11 +25,11 @@ Bits 33-40 encode strand using the same scheme as gene intervals in `Scaffold`.
 - Bits 33-40  : strand (0 = unknown/unstranded, 1 = +, 2 = -)
 - Bits 41-64  : reserved
 """
-function pack_bed_code(strand::UInt8)::UInt64
+function pack_bed_code(strand::UInt8)
     return UInt64(strand) << 32
 end
 
-function parse_bed_strand(code::UInt64)::UInt8
+function parse_bed_strand(code::UInt64)
     return UInt8((code >> 32) & 0xFF)
 end
 
@@ -58,15 +58,9 @@ function load_bed(file_path::String)
 
         record = BED.Record()
         try
-            while true
+            while !eof(rdr)
                 empty!(record)
-                at_eof = false
-                try
-                    read!(rdr, record)
-                catch e
-                    e isa EOFError || rethrow()
-                    at_eof = true
-                end
+                read!(rdr, record)
                 # Process if filled: handles both normal reads and the last record
                 # in files without a trailing newline (EOFError thrown after fill).
                 if BED.isfilled(record)
@@ -74,7 +68,7 @@ function load_bed(file_path::String)
                     # convert to 1-based closed [start, end] to match gene intervals.
                     # from GFF3 files.
                     chrom     = BED.chrom(record)
-                    start_pos = UInt32(BED.chromstart(record) + 1)
+                    start_pos = UInt32(BED.chromstart(record))
                     end_pos   = UInt32(BED.chromend(record))
 
                     strand = bed_record_strand(record)
@@ -83,7 +77,6 @@ function load_bed(file_path::String)
                     tree = get!(Reference.IntervalMeta64, scaffolds, chrom)
                     push!(tree, IntervalValue(start_pos, end_pos, code))
                 end
-                at_eof && break
             end
         finally
             close(rdr)
