@@ -254,6 +254,10 @@ function add_features!(gff_path::String, genome::Genome)
     wait(builder_task)
 end
 
+function add_features!(gff_path::String, species::Species)
+    add_features!(gff_path, species.genome)
+end
+
 export
     Species,
     Genome,
