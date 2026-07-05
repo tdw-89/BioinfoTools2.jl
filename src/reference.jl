@@ -259,7 +259,6 @@ export
     Genome,
     Scaffold,
     add_features!,
-    load_genome,
     get_metadata
     
 end
