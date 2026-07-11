@@ -5,6 +5,8 @@ using CodecZlib
 using GFF3
 using IntervalTrees
 
+using ..SOTerms
+
 const RECORD_BUFFER = 1_000
 const IntervalMeta64 = IntervalTree{UInt32, IntervalValue{UInt32, UInt64}}
 
@@ -35,9 +37,10 @@ function convert_strand(strand::GFF3.GenomicFeatures.Strand)
     end
 end
 
-"""TODO: Currently just a dummy function that returns 0x0001 for everything"""
-function convert_so_term(so_term::String)
-    UInt16(1)
+"""Get the 16-bit code for a given SO term label"""
+function convert_so_term(label::String)
+    bit_code, _ = SO_TERMS[label]
+    return bit_code
 end
 
 """

@@ -1,7 +1,7 @@
 module BioinfoTools2
 
-    const ASSETS = joinpath(pkgdir(BioinfoTools2), "assets")
-    include("_load_sofa.jl")
+    # Internal modules
+    include("so_terms.jl")
 
     # Exported modules
     include("reference.jl")

@@ -3,7 +3,7 @@ using DataFrames
 using Test
 
 
-@testset "ParalogUtils Tests" begin
+@testset "ParalogUtils" begin
 
     # ========================================
     # Tests for rbh()

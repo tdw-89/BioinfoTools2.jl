@@ -1,6 +1,8 @@
+module SOTerms
 #========= Build the SO term reference =========#
 using JSON
 
+const ASSETS = joinpath(pkgdir(SOTerms), "assets")
 const SO_JSON = joinpath(ASSETS, "SOFA.json")
 include_dependency(SO_JSON)
 
@@ -70,6 +72,7 @@ function Base.getindex(lookup::SOTermLookup, full::Int, label::Symbol)
     return actual_short
 end
 Base.getindex(lookup::SOTermLookup, label::Symbol, full::Int) = lookup[full, label]
+Base.getindex(lookup::SOTermLookup, label::AbstractString) = lookup[Symbol(label)]
 
 Base.show(io::IO, lookup::SOTermLookup) = print(io, "SOTermLookup(", length(lookup.by_short), " terms)")
 
@@ -112,3 +115,6 @@ function _build_lookups()
 end
 
 const SO_TERMS, SO_DEFS = _build_lookups()
+export SO_TERMS, SO_DEFS
+
+end
