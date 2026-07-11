@@ -260,6 +260,23 @@ function add_features!(gff_path::String, species::Species)
     add_features!(gff_path, species.genome)
 end
 
+Base.show(io::IO, s::Scaffold) = print(io, "Scaffold(\"$(s.name)\", $(length(s.genes)) gene$(length(s.genes) == 1 ? "" : "s"))")
+
+function Base.show(io::IO, r::ParseResult)
+    print(io, "ParseResult($(r.scaffold_id):$(r.start_pos)-$(r.end_pos), id=\"$(r.id)\", biotype=$(r.biotype))")
+end
+
+function Base.show(io::IO, g::Genome)
+    nscaff = length(g.scaffolds)
+    ngenes = sum(length(sc.genes) for sc in values(g.scaffolds); init=0)
+    print(io, "Genome($(nscaff) scaffold$(nscaff == 1 ? "" : "s"), $(ngenes) gene$(ngenes == 1 ? "" : "s"))")
+end
+
+function Base.show(io::IO, sp::Species)
+    taxon = isempty(sp.taxon_id) ? "" : ", taxon=$(sp.taxon_id)"
+    print(io, "Species(\"$(sp.name)\"$(taxon), $(sp.genome))")
+end
+
 export
     Species,
     Genome,

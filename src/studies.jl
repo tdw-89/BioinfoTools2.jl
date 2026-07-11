@@ -125,4 +125,33 @@ mutable struct Study
     assays::Vector{Assay}
 end
 
+function Base.show(io::IO, b::BedData)
+    n = length(b.scaffolds)
+    print(io, "BedData($(n) scaffold$(n == 1 ? "" : "s"))")
+end
+
+function Base.show(io::IO, t::TabularData)
+    r, c = size(t.table)
+    print(io, "TabularData($(r)×$(c) $(eltype(t.table)))")
+end
+
+function Base.show(io::IO, b::BioSample)
+    print(io, "BioSample(\"$(b.sample_id)\", tissue=$(b.tissue_type), species=\"$(b.species.name)\")")
+end
+
+Base.show(io::IO, a::AssayMethod) = print(io, "AssayMethod(\"$(a.name)\")")
+
+function Base.show(io::IO, m::Measurement)
+    print(io, "Measurement(\"$(basename(m.file_path))\", format=$(m.format))")
+end
+
+function Base.show(io::IO, a::Assay)
+    print(io, "Assay(\"$(a.id)\", type=$(a.type))")
+end
+
+function Base.show(io::IO, s::Study)
+    n = length(s.assays)
+    print(io, "Study(\"$(s.id)\", \"$(s.title)\", $(s.date), $(n) assay$(n == 1 ? "" : "s"))")
+end
+
 end
