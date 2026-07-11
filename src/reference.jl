@@ -64,7 +64,6 @@ function parse_so_term(code::UInt64)
     return UInt16(code >> (32 + 8)) & 0xFFFF
 end
 
-
 struct ParseResult
     scaffold_id::String
     start_pos::UInt32

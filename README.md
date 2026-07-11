@@ -65,7 +65,7 @@ direction TB
     style Genome fill:#a9dae8
     style Data fill:#a9dae8
 ```
-As shown, a [Study](<./src/study.jl>) is composed of several 
+As shown, a `Study` is composed of one or more `Assay`'s. An `Assay` contains a `Measurement` with processed data (currently either BED/interval-based data or tabular data).
 
 
 ## Author

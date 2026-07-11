@@ -18,7 +18,6 @@ function rbh_ds(paralog_df::DataFrame)
     # Fill in the matrix, treating gene 'i' as the query and gene 'j' as the subject
     for row in eachrow(paralog_df)
         
-
         i = ids_to_ind_dict[row[1]]
         j = ids_to_ind_dict[row[2]]
 
