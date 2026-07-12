@@ -36,6 +36,19 @@ jobs:
       - name: Cache Julia artifacts
         uses: julia-actions/cache@v2
 
+      - name: Install forked dependencies
+        shell: julia --color=yes --project=@. {0}
+        run: |
+          using Pkg
+          # These packages must come from the maintainer's forks, not the
+          # public registry, for BioinfoTools2 to build and run correctly.
+          Pkg.add([
+              PackageSpec(url="https://github.com/tdw-89/Indexes.jl"),
+              PackageSpec(url="https://github.com/tdw-89/GenomicFeatures.jl"),
+              PackageSpec(url="https://github.com/tdw-89/GFF3.jl.git"),
+              PackageSpec(url="https://github.com/tdw-89/BED.jl.git"),
+          ])
+
       - name: Build package
         uses: julia-actions/julia-buildpkg@v1
 
