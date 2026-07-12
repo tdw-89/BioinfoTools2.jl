@@ -1,17 +1,62 @@
-- name: Setup Julia environment
-  # You may pin to the exact commit or the version.
-  # uses: julia-actions/setup-julia@fa02766e078afaaf09b14210362cee14137e6a32
-  uses: julia-actions/setup-julia@v3.0.2
-  with:
-    # The Julia version to download (if necessary) and use. Use a string input to avoid unwanted decimal conversion e.g. 1.10 without quotes will be interpreted as 1.1. Examples: "1", "1.10", "lts", "pre"
-    version: # optional, default is 1
-    # Include prereleases when matching the Julia version to available versions.
-    include-all-prereleases: # optional, default is false
-    # Architecture of the Julia binaries. Defaults to the architecture of the runner executing the job.
-    arch: # optional, default is default
-    # Force the use of the specified architecture even when it may be suboptimal on the runner (e.g., x86 on Apple Silicon macOS runners). By default, requesting x86/x64 on aarch64 macOS runners will fail with an error.
-    force-arch: # optional, default is false
-    # Display InteractiveUtils.versioninfo() after installing
-    show-versioninfo: # optional, default is false
-    # The path to the project directory or file to use when resolving some versions (e.g. min)
-    project: # optional, default is 
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags: ['*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.12'
+        os:
+          - ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+
+      - name: Cache Julia artifacts
+        uses: julia-actions/cache@v2
+
+      - name: Build package
+        uses: julia-actions/julia-buildpkg@v1
+
+      - name: Run tests with coverage
+        uses: julia-actions/julia-runtest@v1
+        with:
+          coverage: true
+
+      - name: Process coverage with Coverage.jl
+        shell: julia --color=yes --project=@. {0}
+        run: |
+          using Pkg
+          Pkg.add("Coverage")
+          using Coverage
+          coverage = process_folder("src")
+          LCOV.writefile("lcov.info", coverage)
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+

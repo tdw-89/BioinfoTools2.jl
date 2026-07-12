@@ -1,4 +1,6 @@
 # BioinfoTools2.jl
+[![codecov](https://codecov.io/gh/tdw-89/BioinfoTools2.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/tdw-89/BioinfoTools2.jl)
+
 A second attempt at creating a comprehensive suite of bioinformatics tools in pure Julia.
 
 - [Getting Started](#getting-started)
