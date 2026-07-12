@@ -14,8 +14,11 @@ struct SOTermLookup{T1 <: Tuple, T2 <: Tuple, T3 <: Tuple}
 end
 
 function Base.getindex(lookup::SOTermLookup, short::UInt16)
-    (short < 1 || short > length(lookup.by_short)) && throw(KeyError("Short ID $short out of bounds."))
-    return lookup.by_short[short]
+    if short >= 1 && short <= length(lookup.by_short)
+        return lookup.by_short[short]
+    else
+        return nothing
+    end
 end
 
 function Base.getindex(lookup::SOTermLookup, full::Int)
@@ -32,7 +35,7 @@ function Base.getindex(lookup::SOTermLookup, full::Int)
             right = mid - 1
         end
     end
-    throw(KeyError("Full ID $full not found in Sequence Ontology."))
+    return nothing
 end
 
 function Base.getindex(lookup::SOTermLookup, label::Symbol)
@@ -49,29 +52,9 @@ function Base.getindex(lookup::SOTermLookup, label::Symbol)
             right = mid - 1
         end
     end
-    throw(KeyError("Label :$label not found in Sequence Ontology."))
+    return nothing
 end
 
-function Base.getindex(lookup::SOTermLookup, short::UInt16, full::Int)
-    actual_full, actual_label = lookup[short]
-    actual_full == full || throw(KeyError("Mismatch: Short ID $short belongs to Full ID $actual_full, not $full."))
-    return actual_label
-end
-Base.getindex(lookup::SOTermLookup, full::Int, short::UInt16) = lookup[short, full]
-
-function Base.getindex(lookup::SOTermLookup, short::UInt16, label::Symbol)
-    actual_full, actual_label = lookup[short]
-    actual_label === label || throw(KeyError("Mismatch: Short ID $short belongs to :$actual_label, not :$label."))
-    return actual_full
-end
-Base.getindex(lookup::SOTermLookup, label::Symbol, short::UInt16) = lookup[short, label]
-
-function Base.getindex(lookup::SOTermLookup, full::Int, label::Symbol)
-    actual_short, actual_label = lookup[full]
-    actual_label === label || throw(KeyError("Mismatch: Full ID $full belongs to :$actual_label, not :$label."))
-    return actual_short
-end
-Base.getindex(lookup::SOTermLookup, label::Symbol, full::Int) = lookup[full, label]
 Base.getindex(lookup::SOTermLookup, label::AbstractString) = lookup[Symbol(label)]
 
 Base.show(io::IO, lookup::SOTermLookup) = print(io, "SOTermLookup(", length(lookup.by_short), " terms)")
