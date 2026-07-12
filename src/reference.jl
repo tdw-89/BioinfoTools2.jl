@@ -25,14 +25,14 @@ struct Scaffold
 end
 
 function convert_strand(strand::GFF3.GenomicFeatures.Strand)
-    if strand == GFF3.GenomicFeatures.STRAND_NA
-        UInt8(0)
-    elseif strand == GFF3.GenomicFeatures.STRAND_POS
+    if strand == GFF3.GenomicFeatures.STRAND_POS
         UInt8(1)
     elseif strand == GFF3.GenomicFeatures.STRAND_NEG
         UInt8(2)
-    elseif strand == GFF3.GenomicFeatures.STRAND_NEG
+    elseif strand == GFF3.GenomicFeatures.STRAND_BOTH
         UInt8(3)
+    else
+        UInt8(0)
     end
 end
 
@@ -62,7 +62,16 @@ function parse_index(code::UInt64)
 end
 
 function parse_strand(code::UInt64)
-    return UInt8((code >> 32) & 0xFF)
+    bit_code = UInt8((code >> 32) & 0xFF)
+    if bit_code == 1
+        return GFF3.GenomicFeatures.STRAND_POS
+    elseif bit_code == 2
+        return GFF3.GenomicFeatures.STRAND_NEG
+    elseif bit_code == 3
+        return GFF3.GenomicFeatures.STRAND_BOTH
+    else
+        return GFF3.GenomicFeatures.STRAND_NA
+    end
 end
 
 function parse_so_term(code::UInt64)

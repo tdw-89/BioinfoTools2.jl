@@ -154,4 +154,11 @@ function Base.show(io::IO, s::Study)
     print(io, "Study(\"$(s.id)\", \"$(s.title)\", $(s.date), $(n) assay$(n == 1 ? "" : "s"))")
 end
 
+export Study
+    Assay
+    AssayMethod
+    Measurement
+    BioSample
+    BedData
+
 end
