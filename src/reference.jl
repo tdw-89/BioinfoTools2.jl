@@ -93,7 +93,7 @@ function parse_record(record::GFF3.Record, meta_index::UInt32)
     scaffold = GFF3.seqname(record)
     feature_attr = GFF3.attributes(record) |> Dict
     feature_id = haskey(feature_attr, "ID") && length(feature_attr["ID"]) == 1 ? only(feature_attr["ID"]) : "NA"
-    feature_source = GFF3.source(record)
+    feature_source = GFF3.hassource(record) ? GFF3.source(record) : "NA"
     gene_biotype = haskey(feature_attr, "gene_biotype") && length(feature_attr["gene_biotype"]) == 1 ? only(feature_attr["gene_biotype"]) : "NA"
     
     # bits
