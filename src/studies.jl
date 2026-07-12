@@ -9,7 +9,7 @@ using IntervalTrees
 using ..Reference
 
 mutable struct BedData
-    scaffolds::Dict{String, Reference.IntervalMeta64}
+    scaffolds::Dict{String, IntervalMeta64}
 
 end
 
@@ -49,7 +49,7 @@ function bed_record_strand(record::BED.Record)
 end
 
 function load_bed(file_path::String)
-    scaffolds = Dict{String, Reference.IntervalMeta64}()
+    scaffolds = Dict{String, IntervalMeta64}()
 
     open(file_path) do fh
         rdr = endswith(file_path, ".gz") ?
@@ -74,7 +74,7 @@ function load_bed(file_path::String)
                     strand = bed_record_strand(record)
                     code   = pack_bed_code(strand)
 
-                    tree = get!(Reference.IntervalMeta64, scaffolds, chrom)
+                    tree = get!(IntervalMeta64, scaffolds, chrom)
                     push!(tree, IntervalValue(start_pos, end_pos, code))
                 end
             end
@@ -107,6 +107,81 @@ mutable struct Measurement
     file_path::String
     format::String
     data::Data
+end
+
+function intersect(tree_a::IntervalMeta64, tree_b::IntervalMeta64)
+    intersection = IntervalMeta64()
+    itr = IntervalTrees.intersect(tree_a, tree_b)
+    for overlap in itr
+        a = overlap[1].first:overlap[1].last
+        b = overlap[2].first:overlap[2].last
+        a_x_b = Base.intersect(a,b)
+        new_interval = IntervalValue(first(a_x_b), last(a_x_b), overlap[1].value)
+        push!(intersection, new_interval)
+    end
+    return intersection
+end
+
+function intersect(
+    scaffold::Scaffold, 
+    bed_data::BedData, 
+    feature::Union{AbstractString, Symbol})
+    if !haskey(bed_data.scaffolds, scaffold.name)
+        return nothing
+    end
+    feature_intervals = get_feature(scaffold, feature)
+    if isnothing(tree)
+        return nothing
+    end
+    return intersect(feature_intervals, bed_data.scaffolds[scaffold.name])
+end
+
+function intersect(
+    genome::Genome,
+    bed_data::BedData,
+    feature::Union{AbstractString, Symbol})
+    scaffolds = Dict{String, IntervalMeta64}()
+    for (scaffold_name, scaffold) in genome.scaffolds
+        intersect_result = intersect(scaffold, bed_data, feature)
+        if !isnothing(intersect_result)
+            scaffolds[scaffold_name] = intersect_result
+        end
+    end
+    return scaffolds
+end
+
+function intersect(
+    genome::Genome,
+    bed_data::BedData,
+    feature::Union{AbstractString, Symbol})
+    scaffolds = Dict{String, IntervalMeta64}()
+    for (scaffold_name, scaffold) in genome.scaffolds
+        if haskey(bed_data.scaffolds, scaffold_name)
+            scaffolds[scaffold_name] = intersect(scaffold, bed_data, feature)
+        end
+    end
+    return scaffolds
+end
+
+function intersect(scaffold::Scaffold, bed_data::BedData)
+    if !haskey(bed_data.scaffolds, scaffold.name)
+        return nothing
+    end
+
+    return intersect(scaffold.features, bed_data.scaffolds[scaffold.name])
+end
+
+function intersect(genome::Genome, bed_data::BedData)
+    scaffolds = Dict{String, IntervalMeta64}()
+    for (scaffold_name, scaffold) in genome.scaffolds
+        if haskey(bed_data.scaffolds, scaffold_name)
+            intersect_result = intersect(scaffold, bed_data)
+            if !isnothing(intersect_result)
+                scaffolds[scaffold_name] = intersect_result
+            end
+        end
+    end
+    return scaffolds
 end
 
 mutable struct Assay

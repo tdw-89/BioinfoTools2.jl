@@ -336,6 +336,7 @@ end
 
 export
     Species,
+    IntervalMeta64,
     Genome,
     Scaffold,
     add_features!,
