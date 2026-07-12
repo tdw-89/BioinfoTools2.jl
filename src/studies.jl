@@ -130,7 +130,7 @@ function intersect(
         return nothing
     end
     feature_intervals = get_feature(scaffold, feature)
-    if isnothing(tree)
+    if isnothing(feature_intervals)
         return nothing
     end
     return intersect(feature_intervals, bed_data.scaffolds[scaffold.name])
@@ -142,22 +142,11 @@ function intersect(
     feature::Union{AbstractString, Symbol})
     scaffolds = Dict{String, IntervalMeta64}()
     for (scaffold_name, scaffold) in genome.scaffolds
-        intersect_result = intersect(scaffold, bed_data, feature)
-        if !isnothing(intersect_result)
-            scaffolds[scaffold_name] = intersect_result
-        end
-    end
-    return scaffolds
-end
-
-function intersect(
-    genome::Genome,
-    bed_data::BedData,
-    feature::Union{AbstractString, Symbol})
-    scaffolds = Dict{String, IntervalMeta64}()
-    for (scaffold_name, scaffold) in genome.scaffolds
         if haskey(bed_data.scaffolds, scaffold_name)
-            scaffolds[scaffold_name] = intersect(scaffold, bed_data, feature)
+            intersect_result = intersect(scaffold, bed_data, feature)
+            if !isnothing(intersect_result)
+                scaffolds[scaffold_name] = intersect_result
+            end
         end
     end
     return scaffolds
