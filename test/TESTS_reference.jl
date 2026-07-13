@@ -110,6 +110,37 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
     end
 
     # -------------------------------------------------------------------------
+    @testset "add_features! - ID sanitization" begin
+        gff = tempname() * ".gff3"
+        open(gff, "w") do io
+            write(io, "##gff-version 3\n")
+            write(io, "chr1\tRefSeq\tgene\t1\t10\t.\t+\t.\tID=gene:transcript:GENE0001;gene_biotype=protein_coding\n")
+        end
+
+        @testset "default sanitization (on)" begin
+            s = Species("Test species")
+            add_features!(gff, s.genome)
+
+            meta = get_metadata(s.genome, UInt32(1))
+            @test length(meta) == 3
+            @test meta[1] == "GENE0001"
+            @test meta[2] == "RefSeq"
+            @test meta[3] == "protein_coding"
+        end
+
+        @testset "sanitization disabled" begin
+            s = Species("Test species")
+            add_features!(gff, s.genome; sanitize_ids = false)
+
+            meta = get_metadata(s.genome, UInt32(1))
+            @test length(meta) == 3
+            @test meta[1] == "gene:transcript:GENE0001"
+            @test meta[2] == "RefSeq"
+            @test meta[3] == "protein_coding"
+        end
+    end
+
+    # -------------------------------------------------------------------------
     @testset "get_metadata – all overloads" begin
         s = Species("C. elegans")
         add_features!(GFF_SINGLE, s.genome)
@@ -196,6 +227,25 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
             for scaffold_name in keys(by_symbol)
                 @test length(by_symbol[scaffold_name]) == length(by_string[scaffold_name])
             end
+        end
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "get_so_terms" begin
+        @testset "empty genome" begin
+            s = Species("C. elegans")
+            @test get_so_terms(s.genome) == Symbol[]
+        end
+
+        @testset "single-scaffold genome" begin
+            s = Species("C. elegans")
+            add_features!(GFF_SINGLE, s.genome)
+
+            used_terms = get_so_terms(s.genome)
+            @test used_terms isa Vector{Symbol}
+            @test !isempty(used_terms)
+            @test :gene in used_terms
+            @test issorted(used_terms)
         end
     end
 end

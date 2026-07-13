@@ -88,11 +88,29 @@ struct ParseResult
     biotype::String
 end
 
-function parse_record(record::GFF3.Record, meta_index::UInt32)
+"""
+Strip common feature-type prefixes (for example `gene:` or `transcript:`)
+from IDs when present.
+"""
+function sanitize_id(id::AbstractString)
+    cleaned = String(id)
+    # Some annotations can stack prefixes (e.g. "gene:transcript:...").
+    while true
+        m = match(r"^(gene|transcript|mrna|rna|cds|protein):(.+)$"i, cleaned)
+        m === nothing && break
+        cleaned = m.captures[2]
+    end
+    return cleaned
+end
+
+function parse_record(record::GFF3.Record, meta_index::UInt32; sanitize_ids::Bool = true)
     # interned
     scaffold = GFF3.seqname(record)
     feature_attr = GFF3.attributes(record) |> Dict
     feature_id = haskey(feature_attr, "ID") && length(feature_attr["ID"]) == 1 ? only(feature_attr["ID"]) : "NA"
+    if sanitize_ids
+        feature_id = sanitize_id(feature_id)
+    end
     feature_source = GFF3.hassource(record) ? GFF3.source(record) : "NA"
     gene_biotype = haskey(feature_attr, "gene_biotype") && length(feature_attr["gene_biotype"]) == 1 ? only(feature_attr["gene_biotype"]) : "NA"
     
@@ -164,6 +182,31 @@ function get_metadata(genome::Genome, meta_index::UInt32)
     return [genome.vocab[t] for t in tokens]
 end
 
+"""
+Return only the interned ID (the first metadata token) for `meta_index`, or
+`nothing` when the feature carries no metadata.
+
+The ID is always stored as the first `UInt32` token of a feature's metadata
+entry, so this reads just those 4 bytes directly from the blob (native endian,
+matching how `build_genome!` wrote it) instead of allocating the full metadata
+vector. Prefer this over `get_metadata` when only the ID is needed.
+"""
+function get_metadata_id(genome::Genome, meta_index::UInt32)
+    if meta_index < 0x1 || length(genome.meta_offsets) <= 1 || (meta_index + 1) > length(genome.meta_offsets)
+        return nothing
+    end
+
+    start_byte = genome.meta_offsets[meta_index]
+    end_byte = genome.meta_offsets[meta_index + 1] - 1
+
+    if start_byte > end_byte
+        return nothing
+    end
+
+    token = GC.@preserve genome unsafe_load(Ptr{UInt32}(pointer(genome.meta_blob, start_byte)))
+    return genome.vocab[token]
+end
+
 function get_metadata(genome::Genome, features::IntervalMeta64)
     metadata_list = Vector{Vector{String}}(undef, length(features))
     for (i, interval) in enumerate(features)
@@ -211,6 +254,23 @@ function get_feature(genome::Genome, feature::Symbol)
 end
 
 get_feature(genome::Genome, feature::AbstractString) = get_feature(genome, Symbol(feature))
+
+"""
+Return the unique SO term labels used by features stored in `genome`.
+"""
+function get_so_terms(genome::Genome)
+    terms = Set{Symbol}()
+    for scaffold in values(genome.scaffolds)
+        for interval in scaffold.features
+            short_id = parse_so_term(interval.value)
+            term = SO_TERMS[short_id]
+            if !isnothing(term)
+                push!(terms, term[2])
+            end
+        end
+    end
+    return sort!(collect(terms))
+end
 
 mutable struct Species
     name::String
@@ -267,7 +327,7 @@ function build_genome!(ch::Channel{Vector{ParseResult}}, genome::Genome)
     push!(genome.meta_offsets, UInt32(length(genome.meta_blob) + 1))
 end
 
-function add_features!(gff_path::String, genome::Genome)
+function add_features!(gff_path::String, genome::Genome; sanitize_ids::Bool = true)
     # Unbounded channel so the parser never blocks waiting for the builder
     ch = Channel{Vector{ParseResult}}(Inf)
     builder_task = Threads.@spawn build_genome!(ch, genome)
@@ -289,7 +349,7 @@ function add_features!(gff_path::String, genome::Genome)
                 # as a first step in `read!`
                 read!(rdr, record)
                 if BioGenerics.isfilled(record)
-                    result = parse_record(record, meta_index)
+                    result = parse_record(record, meta_index; sanitize_ids = sanitize_ids)
                     if !isnothing(result) 
                         push!(buffer, result)
                         meta_index += UInt32(1)
@@ -313,8 +373,8 @@ function add_features!(gff_path::String, genome::Genome)
     wait(builder_task)
 end
 
-function add_features!(gff_path::String, species::Species)
-    add_features!(gff_path, species.genome)
+function add_features!(gff_path::String, species::Species; sanitize_ids::Bool = true)
+    add_features!(gff_path, species.genome; sanitize_ids = sanitize_ids)
 end
 
 Base.show(io::IO, s::Scaffold) = print(io, "Scaffold(\"$(s.name)\", $(length(s.features)) feature$(length(s.features) == 1 ? "" : "s"))")
@@ -341,6 +401,7 @@ export
     Scaffold,
     add_features!,
     get_metadata,
-    get_feature
+    get_feature,
+    get_so_terms
     
 end

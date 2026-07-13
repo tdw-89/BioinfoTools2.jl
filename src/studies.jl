@@ -3,6 +3,7 @@ module Studies
 using BED
 using BioGenerics
 using CodecZlib
+using DataFrames
 using Dates
 using GFF3
 using IntervalTrees
@@ -11,6 +12,112 @@ using ..Reference
 mutable struct BedData
     scaffolds::Dict{String, IntervalMeta64}
 
+end
+
+mutable struct TabularData{T}
+    variables::Vector{AbstractString}
+    samples::Vector{Union{Nothing, Tuple{String, UInt32}}}
+    table::Matrix{T}
+end
+
+const Data = Union{BedData, TabularData}
+
+mutable struct BioSample
+    sample_id::String
+    tissue_type::String
+    species::Species
+end
+
+mutable struct AssayMethod
+    name::String
+    description::String
+end
+
+mutable struct Measurement
+    file_path::String
+    format::String
+    data::Data
+end
+
+mutable struct Assay
+    id::String
+    type::String
+    description::String
+    measurement::Measurement
+    biosample::BioSample
+    method::AssayMethod
+end
+
+mutable struct Study
+    id::String
+    title::String
+    date::Date
+    assays::Vector{Assay}
+end
+
+#= Methods =#
+
+"""
+NOTE: This functions assumes that the first column is a list of 
+sample IDs (e.g., gene accessions or transcript accessions)
+and that all other columns are of the same numeric type.
+"""
+function load_table(genome::Genome, data_frame::DataFrame, feature::Union{String, Symbol})
+    sample_col_correct = typeof(Vector(data_frame[!, 1])) <: Array{S, 1} where S <: AbstractString
+    data_cols_correct = [typeof(Vector(data_frame[!, i])) <: Array{N, 1} where N <: Number for i in 2:ncol(data_frame)] |> all
+    if !(sample_col_correct && data_cols_correct)
+        if !sample_col_correct
+            @warn "Sample column incorrect format"
+        end
+        if !data_cols_correct
+            @warn "Data columns incorrect format"
+        end
+        return nothing
+    end
+
+    # (sample_id, original 1-based row index) for every row of the table.
+    sample_names = collect(zip(data_frame[!, 1], 1:nrow(data_frame)))
+
+    # Output vector, parallel to the table rows. A slot stays `nothing` if its
+    # sample ID never matches any feature's metadata ID.
+    samples = Vector{Union{Nothing, Tuple{String, UInt32}}}(nothing, length(sample_names))
+
+    # Samples still awaiting a match: sample_id => original row index. Using a
+    # Dict makes each match an O(1) lookup + "pop", so the whole search is
+    # O(features) and can stop early once every sample has been matched.
+    remaining = Dict{String, UInt32}()
+    sizehint!(remaining, length(sample_names))
+    for (id, idx) in sample_names
+        remaining[String(id)] = UInt32(idx)
+    end
+
+    # 1. Walk every scaffold, restricting to features of the requested type, and
+    # 2. match each feature's metadata ID against the remaining samples.
+    for (scaffold_name, scaffold) in genome.scaffolds
+        isempty(remaining) && break
+
+        feature_intervals = get_feature(scaffold, feature)
+        (isnothing(feature_intervals) || isempty(feature_intervals)) && continue
+
+        for interval in feature_intervals
+            # The 32-bit metadata index links this interval back to its metadata.
+            meta_idx = Reference.parse_index(interval.value)
+            id = Reference.get_metadata_id(genome, meta_idx)
+            isnothing(id) && continue
+
+            row = get(remaining, id, nothing)
+            if row !== nothing
+                samples[row] = (scaffold_name, meta_idx)
+                delete!(remaining, id)   # pop the matched sample
+                isempty(remaining) && break
+            end
+        end
+    end
+
+    variables = Vector{AbstractString}(names(data_frame)[2:end])
+    table = Matrix(data_frame[!, 2:end])
+
+    return TabularData(variables, samples, table)
 end
 
 """
@@ -86,29 +193,6 @@ function load_bed(file_path::String)
     return BedData(scaffolds)
 end
 
-mutable struct TabularData{T}
-    table::Matrix{T}
-end
-
-const Data = Union{BedData, TabularData}
-
-mutable struct BioSample
-    sample_id::String
-    tissue_type::String
-    species::Species
-end
-
-mutable struct AssayMethod
-    name::String
-    description::String
-end
-
-mutable struct Measurement
-    file_path::String
-    format::String
-    data::Data
-end
-
 function intersect(tree_a::IntervalMeta64, tree_b::IntervalMeta64)
     intersection = IntervalMeta64()
     itr = IntervalTrees.intersect(tree_a, tree_b)
@@ -173,21 +257,7 @@ function intersect(genome::Genome, bed_data::BedData)
     return scaffolds
 end
 
-mutable struct Assay
-    id::String
-    type::String
-    description::String
-    measurement::Measurement
-    biosample::BioSample
-    method::AssayMethod
-end
-
-mutable struct Study
-    id::String
-    title::String
-    date::Date
-    assays::Vector{Assay}
-end
+#= Base.show overloads =#
 
 function Base.show(io::IO, b::BedData)
     n = length(b.scaffolds)
