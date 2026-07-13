@@ -33,7 +33,21 @@ direction TB
     }
 
     class Data {
+        <<Union>>
     }
+
+    class Tabular {
+        Vector~String~ variables
+        Vector~Tuple~String, UInt32~~ samples
+        Matrix table
+    }
+
+    class BedData {
+        Dict~String, IntervalMeta64~  scaffolds
+    }
+
+    Data <|-- Tabular
+    Data <|-- BedData
 
     class BioSample {
 	    String sample_id
@@ -63,9 +77,6 @@ direction TB
     Data .. Genome
     Assay --> AssayMethod
     AssayMethod .. Measurement
-
-    style Genome fill:#a9dae8
-    style Data fill:#a9dae8
 ```
 As shown, a `Study` is composed of one or more `Assay`'s. An `Assay` contains a `Measurement` with processed data (currently either BED/interval-based data or tabular data).
 

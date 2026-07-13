@@ -1,5 +1,6 @@
 using BioinfoTools2.Studies
 using BioinfoTools2.Reference
+using DataFrames
 using IntervalTrees
 using Test
 
@@ -188,4 +189,97 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         end
 
     end  # intersect – all overloads
+
+    # =========================================================================
+    @testset "TabularData indexing & DataFrame conversion" begin
+        # Build a real TabularData: load a genome, grab a few real gene IDs, then
+        # assemble a DataFrame whose first column carries those IDs (plus one that
+        # matches nothing) and two numeric variable columns.
+        sp = Species("C. elegans")
+        add_features!(ST_GFF_SINGLE, sp.genome)
+        scaffold_nc = sp.genome.scaffolds["NC_003280.10"]
+
+        gene_ids = String[]
+        for iv in Reference.get_feature(scaffold_nc, :gene)
+            gid = Reference.get_metadata_id(sp.genome, Reference.parse_index(iv.value))
+            gid !== nothing && push!(gene_ids, gid)
+            length(gene_ids) >= 3 && break
+        end
+
+        df = DataFrame(
+            sample = vcat(gene_ids, ["NO_SUCH_ID"]),
+            v1 = [10.0, 20.0, 30.0, 40.0],
+            v2 = [11.0, 21.0, 31.0, 41.0],
+        )
+        tab = Studies.load_table(sp.genome, df, :gene)
+
+        # --- Integer / cartesian indexing ------------------------------------
+        @testset "getindex(Integer...) – scalar elements" begin
+            @test tab[1, 1] == 10.0
+            @test tab[3, 2] == 31.0
+            @test tab[4, 1] == 40.0
+        end
+
+        @testset "getindex(Integer...) – row ranges and column slices" begin
+            @test tab[1:2, :] == [10.0 11.0; 20.0 21.0]
+            @test tab[:, 1]   == [10.0, 20.0, 30.0, 40.0]
+            @test tab[4, :]   == [40.0, 41.0]
+        end
+
+        # --- Single-string lookup --------------------------------------------
+        @testset "getindex(genome, String) – match returns 1-row TabularData" begin
+            one = tab[sp.genome, gene_ids[2]]
+            @test one isa Studies.TabularData
+            @test size(one.table) == (1, 2)
+            @test one.table == [20.0 21.0]
+            @test one.variables == tab.variables
+            @test length(one.samples) == 1
+            @test Studies.sample_id(sp.genome, one.samples[1]) == gene_ids[2]
+        end
+
+        @testset "getindex(genome, String) – no match returns nothing" begin
+            # "NO_SUCH_ID" is present in the table but never matched a feature,
+            # so its sample slot is `nothing` and cannot be looked up.
+            @test isnothing(tab[sp.genome, "NO_SUCH_ID"])
+            @test isnothing(tab[sp.genome, "totally_absent_id"])
+        end
+
+        # --- Vector-of-strings lookup ----------------------------------------
+        @testset "getindex(genome, Vector{String}) – subset, skipping misses" begin
+            # Query order is deliberately scrambled and includes an absent ID;
+            # the result must follow the original table's row order.
+            sub = tab[sp.genome, [gene_ids[3], "absent_id", gene_ids[1]]]
+            @test sub isa Studies.TabularData
+            @test size(sub.table) == (2, 2)
+            @test sub.table == [10.0 11.0; 30.0 31.0]
+            @test sub.variables == tab.variables
+            @test Studies.sample_id(sp.genome, sub.samples[1]) == gene_ids[1]
+            @test Studies.sample_id(sp.genome, sub.samples[2]) == gene_ids[3]
+        end
+
+        @testset "getindex(genome, Vector{String}) – no matches → empty sub-table" begin
+            sub = tab[sp.genome, ["nope_1", "nope_2"]]
+            @test sub isa Studies.TabularData
+            @test size(sub.table) == (0, 2)
+            @test isempty(sub.samples)
+            @test sub.variables == tab.variables
+        end
+
+        # --- DataFrame conversion --------------------------------------------
+        @testset "DataFrame(tab, genome) – columns, names and values" begin
+            out = DataFrame(tab, sp.genome)
+            @test names(out) == ["ID", "v1", "v2"]
+            @test nrow(out) == 4
+            @test out.ID[1:3] == gene_ids
+            @test out.v1 == [10.0, 20.0, 30.0, 40.0]
+            @test out.v2 == [11.0, 21.0, 31.0, 41.0]
+        end
+
+        @testset "DataFrame(tab, genome) – unmatched sample becomes missing" begin
+            out = DataFrame(tab, sp.genome)
+            @test eltype(out.ID) == Union{Missing, String}
+            @test ismissing(out.ID[4])
+            @test count(ismissing, out.ID) == 1
+        end
+    end  # TabularData indexing & DataFrame conversion
 end

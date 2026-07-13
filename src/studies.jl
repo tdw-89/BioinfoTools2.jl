@@ -120,6 +120,69 @@ function load_table(genome::Genome, data_frame::DataFrame, feature::Union{String
     return TabularData(variables, samples, table)
 end
 
+#= TabularData indexing =#
+
+# Integer / cartesian indexing behaves exactly like indexing the underlying
+# matrix (e.g. `tab[2, 2]`, `tab[1:10, :]`).
+Base.getindex(t::TabularData, inds...) = getindex(t.table, inds...)
+
+# Resolve the ID of a single sample by looking its metadata up in `genome`.
+# Returns `nothing` for empty slots or features without metadata.
+function sample_id(genome::Genome, sample::Union{Nothing, Tuple{String, UInt32}})
+    isnothing(sample) && return nothing
+    return Reference.get_metadata_id(genome, sample[2])
+end
+
+"""
+Look up a single sample by its (putative) ID string. Every sample's ID is
+resolved from `genome` and compared to `id`; the first match is returned as a
+one-row `TabularData`. Returns `nothing` when no sample matches.
+
+This is intentionally O(samples) per lookup (it resolves each sample's ID on
+demand) rather than maintaining an ID index.
+"""
+function Base.getindex(t::TabularData, genome::Genome, id::AbstractString)
+    for (row, sample) in enumerate(t.samples)
+        if sample_id(genome, sample) == id
+            return TabularData(copy(t.variables), t.samples[row:row], t.table[row:row, :])
+        end
+    end
+    return nothing
+end
+
+"""
+Look up every sample whose (putative) ID is contained in `ids`, returning a
+`TabularData` sub-table (with matching `variables`, `samples` and `table`
+rows). IDs with no matching sample are silently skipped; row order follows the
+original table.
+"""
+function Base.getindex(t::TabularData, genome::Genome, ids::AbstractVector{<:AbstractString})
+    wanted = Set{String}(ids)
+    rows = Int[]
+    for (row, sample) in enumerate(t.samples)
+        sid = sample_id(genome, sample)
+        if !isnothing(sid) && sid in wanted
+            push!(rows, row)
+        end
+    end
+    return TabularData(copy(t.variables), t.samples[rows], t.table[rows, :])
+end
+
+"""
+Convert a `TabularData` back into a `DataFrame`. The first column, `ID`, holds
+the ID that each sample's metadata index points to (resolved from `genome`;
+unmatched samples become `missing`), followed by one column per entry in
+`variables` carrying the corresponding `table` column.
+"""
+function DataFrames.DataFrame(t::TabularData, genome::Genome)
+    df = DataFrame()
+    df[!, :ID] = Union{Missing, String}[something(sample_id(genome, s), missing) for s in t.samples]
+    for (j, variable) in enumerate(t.variables)
+        df[!, string(variable)] = t.table[:, j]
+    end
+    return df
+end
+
 """
 Bit layout for the 64-bit metadata code attached to each BED interval.
 Bits 33-40 encode strand using the same scheme as gene intervals in `Scaffold`.
