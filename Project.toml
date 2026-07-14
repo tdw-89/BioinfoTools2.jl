@@ -20,6 +20,7 @@ IntervalTrees = "524e6230-43b7-53ae-be76-1e9e4d08d11b"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 MultipleTesting = "f8716d33-7c4a-5097-896f-ce0ecbd3ef6b"
 OhMyREPL = "5fb14364-9ced-5910-84b2-373655c76a03"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
 
 [compat]

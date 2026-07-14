@@ -7,6 +7,7 @@ using DataFrames
 using Dates
 using GFF3
 using IntervalTrees
+using SparseArrays
 using ..Reference
 
 mutable struct BedData
@@ -270,8 +271,8 @@ function intersect(tree_a::IntervalMeta64, tree_b::IntervalMeta64)
 end
 
 function intersect(
-    scaffold::Scaffold, 
-    bed_data::BedData, 
+    scaffold::Scaffold,
+    bed_data::BedData,
     feature::Union{AbstractString, Symbol})
     if !haskey(bed_data.scaffolds, scaffold.name)
         return nothing
@@ -320,6 +321,102 @@ function intersect(genome::Genome, bed_data::BedData)
     return scaffolds
 end
 
+"""
+Merge the intervals of an interval tree into a sorted vector of disjoint,
+closed `(start, end)` segments (1-based). Overlapping intervals are combined so
+that each base is covered by at most one resulting segment.
+"""
+function merge_segments(tree::IntervalMeta64)
+    segments = Tuple{Int, Int}[]
+    ivs = sort!([(Int(iv.first), Int(iv.last)) for iv in tree])
+    for (s, e) in ivs
+        if !isempty(segments) && s <= segments[end][2]
+            last_s, last_e = segments[end]
+            segments[end] = (last_s, max(last_e, e))
+        else
+            push!(segments, (s, e))
+        end
+    end
+    return segments
+end
+
+"""
+Given a set of `BedData` measurements, compute how many of them cover each base
+of the genome. The genome is returned as a dictionary keyed by scaffold name,
+whose values are sparse arrays holding the per-base frequency (length = the
+largest interval end seen on that scaffold).
+
+When `merge` is `true` (the default), overlapping intervals *within a single
+measurement* are merged first (via [`merge_segments`](@ref)), so each measurement
+contributes at most 1 to a given base and the maximum possible value is the
+number of measurements. Set `merge = false` to skip this step when the intervals
+are already disjoint (e.g. ChIP-seq peak calls), in which case any within-measurement
+overlaps will stack.
+
+The element type is chosen to fit the measurement count: `UInt8` for up to 255
+measurements and `UInt16` for up to 65535. More measurements raise an error.
+"""
+function calculate_frequency(measurements::Vector{BedData}; merge::Bool = true)
+    n = length(measurements)
+    T = if n <= typemax(UInt8)
+        UInt8
+    elseif n <= typemax(UInt16)
+        UInt16
+    else
+        error("calculate_frequency supports at most $(Int(typemax(UInt16))) BedData measurements (received $n)")
+    end
+
+    # Every scaffold that appears in at least one measurement.
+    scaffold_names = Set{String}()
+    for measurement in measurements
+        union!(scaffold_names, keys(measurement.scaffolds))
+    end
+
+    genome = Dict{String, SparseVector{T, Int}}()
+
+    for name in scaffold_names
+        # Difference array: +1 where a segment starts, -1 just past its end. The
+        # running total while sweeping left-to-right is the per-base frequency
+        # across measurements.
+        deltas = Dict{Int, Int}()
+        scaffold_len = 0
+
+        for measurement in measurements
+            haskey(measurement.scaffolds, name) || continue
+            tree = measurement.scaffolds[name]
+            segments = merge ? merge_segments(tree) :
+                [(Int(iv.first), Int(iv.last)) for iv in tree]
+            for (s, e) in segments
+                deltas[s]     = get(deltas, s, 0) + 1
+                deltas[e + 1] = get(deltas, e + 1, 0) - 1
+                scaffold_len  = max(scaffold_len, e)
+            end
+        end
+
+        isempty(deltas) && continue
+
+        # Sweep the breakpoints in order, emitting a value for every covered base.
+        breakpoints = sort!(collect(keys(deltas)))
+        indices = Int[]
+        values  = T[]
+        coverage = 0
+        for k in eachindex(breakpoints)
+            p = breakpoints[k]
+            coverage += deltas[p]
+            if coverage > 0 && k < length(breakpoints)
+                for base in p:(breakpoints[k + 1] - 1)
+                    push!(indices, base)
+                    push!(values, T(coverage))
+                end
+            end
+        end
+
+        genome[name] = sparsevec(indices, values, scaffold_len)
+    end
+
+    return genome
+end
+
 #= Base.show overloads =#
 
 function Base.show(io::IO, b::BedData)
@@ -351,11 +448,19 @@ function Base.show(io::IO, s::Study)
     print(io, "Study(\"$(s.id)\", \"$(s.title)\", $(s.date), $(n) assay$(n == 1 ? "" : "s"))")
 end
 
-export Study
-    Assay
-    AssayMethod
-    Measurement
-    BioSample
-    BedData
+export
+    Study,
+    Assay,
+    AssayMethod,
+    Measurement,
+    BioSample,
+    BedData,
+    Data,
+    TabularData,
+    intersect,
+    load_bed,
+    load_table,
+    merge_segments,
+    calculate_frequency
 
 end

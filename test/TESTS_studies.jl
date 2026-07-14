@@ -25,9 +25,9 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
     # -------------------------------------------------------------------------
     @testset "load_bed - micro.narrowPeak (8 records, 1 scaffold)" begin
-        bd = Studies.load_bed(MICRO_NARROWPEAK)
+        bd = load_bed(MICRO_NARROWPEAK)
 
-        @test bd isa Studies.BedData
+        @test bd isa BedData
         @test length(bd.scaffolds) == 1
         @test haskey(bd.scaffolds, "DDB0215018")
         @test length(bd.scaffolds["DDB0215018"]) == 8
@@ -36,7 +36,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
     # -------------------------------------------------------------------------
     @testset "load_bed - strand encoding in micro.narrowPeak" begin
         # All 8 records in micro.narrowPeak have strand '.' → UInt8(0)
-        bd = Studies.load_bed(MICRO_NARROWPEAK)
+        bd = load_bed(MICRO_NARROWPEAK)
 
         for (_, tree) in bd.scaffolds
             for iv in tree
@@ -49,7 +49,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
     @testset "load_bed - coordinate conversion in micro.narrowPeak" begin
         # BED is 0-based half-open; BED.jl should convert to 1-based closed.
         # First record: chromStart=4, chromEnd=1609 → start=5, end=1609
-        bd = Studies.load_bed(MICRO_NARROWPEAK)
+        bd = load_bed(MICRO_NARROWPEAK)
         tree = bd.scaffolds["DDB0215018"]
 
         starts = sort([iv.first for iv in tree])
@@ -61,7 +61,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
     # -------------------------------------------------------------------------
     @testset "load_bed - BED (3 + 3)" begin
-        bd = Studies.load_bed(MICRO_BED)
+        bd = load_bed(MICRO_BED)
         tree = bd.scaffolds["DDB0215018"]
 
         starts = sort([iv.first for iv in tree])
@@ -73,9 +73,9 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
     # -------------------------------------------------------------------------
     @testset "load_bed - full.narrowPeak (4448 records total)" begin
-        bd = Studies.load_bed(FULL_NARROWPEAK)
+        bd = load_bed(FULL_NARROWPEAK)
 
-        @test bd isa Studies.BedData
+        @test bd isa BedData
         @test !isempty(bd.scaffolds)
 
         total = sum(length(tree) for tree in values(bd.scaffolds))
@@ -94,11 +94,11 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         bed_nc = let
             tree = IntervalMeta64()
             push!(tree, IntervalValue(UInt32(1), UInt32(100_000_000), UInt64(0)))
-            Studies.BedData(Dict("NC_003280.10" => tree))
+            BedData(Dict("NC_003280.10" => tree))
         end
 
         # BedData with a scaffold name that has no match in sp.genome.
-        bed_no_match = Studies.BedData(Dict("NOMATCH" => IntervalMeta64()))
+        bed_no_match = BedData(Dict("NOMATCH" => IntervalMeta64()))
 
         # -----------------------------------------------------------------------
         @testset "intersect(IntervalMeta64, IntervalMeta64) – overlap" begin
@@ -200,7 +200,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         scaffold_nc = sp.genome.scaffolds["NC_003280.10"]
 
         gene_ids = String[]
-        for iv in Reference.get_feature(scaffold_nc, :gene)
+        for iv in get_feature(scaffold_nc, :gene)
             gid = Reference.get_metadata_id(sp.genome, Reference.parse_index(iv.value))
             gid !== nothing && push!(gene_ids, gid)
             length(gene_ids) >= 3 && break
@@ -211,7 +211,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             v1 = [10.0, 20.0, 30.0, 40.0],
             v2 = [11.0, 21.0, 31.0, 41.0],
         )
-        tab = Studies.load_table(sp.genome, df, :gene)
+        tab = load_table(sp.genome, df, :gene)
 
         # --- Integer / cartesian indexing ------------------------------------
         @testset "getindex(Integer...) – scalar elements" begin
@@ -229,7 +229,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         # --- Single-string lookup --------------------------------------------
         @testset "getindex(genome, String) – match returns 1-row TabularData" begin
             one = tab[sp.genome, gene_ids[2]]
-            @test one isa Studies.TabularData
+            @test one isa TabularData
             @test size(one.table) == (1, 2)
             @test one.table == [20.0 21.0]
             @test one.variables == tab.variables
@@ -249,7 +249,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             # Query order is deliberately scrambled and includes an absent ID;
             # the result must follow the original table's row order.
             sub = tab[sp.genome, [gene_ids[3], "absent_id", gene_ids[1]]]
-            @test sub isa Studies.TabularData
+            @test sub isa TabularData
             @test size(sub.table) == (2, 2)
             @test sub.table == [10.0 11.0; 30.0 31.0]
             @test sub.variables == tab.variables
@@ -259,7 +259,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
         @testset "getindex(genome, Vector{String}) – no matches → empty sub-table" begin
             sub = tab[sp.genome, ["nope_1", "nope_2"]]
-            @test sub isa Studies.TabularData
+            @test sub isa TabularData
             @test size(sub.table) == (0, 2)
             @test isempty(sub.samples)
             @test sub.variables == tab.variables
@@ -282,4 +282,62 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             @test count(ismissing, out.ID) == 1
         end
     end  # TabularData indexing & DataFrame conversion
+
+    # =========================================================================
+    @testset "calculate_frequency" begin
+        # Build a BedData from `scaffold => [(start, end), ...]` pairs.
+        make_bed(pairs...) = begin
+            scaffolds = Dict{String, IntervalMeta64}()
+            for (name, ivs) in pairs
+                tree = IntervalMeta64()
+                for (s, e) in ivs
+                    push!(tree, IntervalValue(UInt32(s), UInt32(e), UInt64(0)))
+                end
+                scaffolds[name] = tree
+            end
+            BedData(scaffolds)
+        end
+
+        @testset "per-base counts across measurements (UInt8)" begin
+            m1 = make_bed("chr1" => [(1, 5), (10, 12)])
+            m2 = make_bed("chr1" => [(3, 11)])
+            freq = calculate_frequency([m1, m2])
+
+            @test freq isa Dict
+            @test haskey(freq, "chr1")
+            v = freq["chr1"]
+            @test eltype(v) == UInt8
+            @test length(v) == 12
+            # base:      1  2  3  4  5  6  7  8  9 10 11 12
+            @test Vector(v) == UInt8[1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 2, 1]
+        end
+
+        @testset "merge default merges within-measurement overlaps" begin
+            m = make_bed("chr1" => [(1, 5), (3, 8)])
+
+            merged = calculate_frequency([m])                # merge = true (default)
+            @test Vector(merged["chr1"]) == UInt8[1, 1, 1, 1, 1, 1, 1, 1]
+            @test maximum(merged["chr1"]) == 1
+
+            unmerged = calculate_frequency([m]; merge = false)
+            @test Vector(unmerged["chr1"]) == UInt8[1, 1, 2, 2, 2, 1, 1, 1]
+        end
+
+        @testset "multiple scaffolds with independent coverage" begin
+            m1 = make_bed("chrA" => [(1, 3)], "chrB" => [(5, 6)])
+            m2 = make_bed("chrA" => [(2, 4)])
+            freq = calculate_frequency([m1, m2])
+
+            @test Set(keys(freq)) == Set(["chrA", "chrB"])
+            @test Vector(freq["chrA"]) == UInt8[1, 2, 2, 1]        # length 4
+            @test Vector(freq["chrB"]) == UInt8[0, 0, 0, 0, 1, 1]  # length 6
+        end
+
+        @testset "element type widens to UInt16 past 255 measurements" begin
+            measurements = [make_bed("chr1" => [(1, 2)]) for _ in 1:256]
+            freq = calculate_frequency(measurements)
+            @test eltype(freq["chr1"]) == UInt16
+            @test Vector(freq["chr1"]) == UInt16[256, 256]
+        end
+    end  # calculate_frequency
 end
