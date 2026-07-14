@@ -272,6 +272,74 @@ function get_so_terms(genome::Genome)
     return sort!(collect(terms))
 end
 
+"""
+A single annotated feature looked up from a `Genome`:
+- `id`: the ID the feature was searched by (first metadata field)
+- `feature_type`: the SO term label (e.g. `:gene`)
+- `chromosome`: the scaffold name the feature lives on
+- `start_pos` / `end_pos`: 1-based closed interval bounds
+- `metadata`: the parsed metadata stored for the feature (ID, source, biotype)
+"""
+struct FeatureRecord
+    id::String
+    feature_type::Symbol
+    chromosome::String
+    start_pos::UInt32
+    end_pos::UInt32
+    metadata::Vector{String}
+end
+
+# Build a FeatureRecord from a scaffold name and one of its interval entries.
+function _feature_record(genome::Genome, chromosome::String, interval::IntervalValue{UInt32, UInt64})
+    code = interval.value
+    so_result = SO_TERMS[parse_so_term(code)]
+    feature_type = isnothing(so_result) ? Symbol("") : so_result[2]
+    metadata = get_metadata(genome, parse_index(code))
+    id = isempty(metadata) ? "" : metadata[1]
+    return FeatureRecord(id, feature_type, chromosome, interval.first, interval.last, metadata)
+end
+
+"""
+Look up a single feature by its ID (the first metadata field). Every feature's
+ID is resolved on demand and compared to `id`; the first match is returned as a
+[`FeatureRecord`](@ref), or `nothing` when no feature matches.
+
+This scans the genome's features (O(features) per lookup) rather than keeping an
+ID index.
+"""
+function Base.getindex(genome::Genome, id::AbstractString)
+    for (name, scaffold) in genome.scaffolds
+        for interval in scaffold.features
+            if get_metadata_id(genome, parse_index(interval.value)) == id
+                return _feature_record(genome, name, interval)
+            end
+        end
+    end
+    return nothing
+end
+
+"""
+Look up every feature whose ID (first metadata field) is contained in `ids`,
+returning a `Vector{FeatureRecord}`. IDs with no matching feature are skipped.
+"""
+function Base.getindex(genome::Genome, ids::AbstractVector{<:AbstractString})
+    wanted = Set{String}(ids)
+    records = FeatureRecord[]
+    for (name, scaffold) in genome.scaffolds
+        for interval in scaffold.features
+            fid = get_metadata_id(genome, parse_index(interval.value))
+            if !isnothing(fid) && fid in wanted
+                push!(records, _feature_record(genome, name, interval))
+            end
+        end
+    end
+    return records
+end
+
+function Base.show(io::IO, f::FeatureRecord)
+    print(io, "FeatureRecord(\"$(f.id)\", $(f.feature_type), $(f.chromosome):$(f.start_pos)-$(f.end_pos), metadata=$(f.metadata))")
+end
+
 mutable struct Species
     name::String
     taxon_id::String
@@ -399,6 +467,7 @@ export
     IntervalMeta64,
     Genome,
     Scaffold,
+    FeatureRecord,
     add_features!,
     get_metadata,
     get_feature,
