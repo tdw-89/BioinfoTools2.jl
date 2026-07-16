@@ -192,9 +192,9 @@ Bits 33-40 encode strand using the same scheme as gene intervals in `Scaffold`.
 |---------|---------|--------|------------------------|
 | <NULL>  | <NULL>  | Strand |        <NULL>          |
 
-- Bits  1-32  : reserved
-- Bits 33-40  : strand (0 = unknown/unstranded, 1 = +, 2 = -)
-- Bits 41-64  : reserved
+- Bits  1-32 : reserved
+- Bits 33-40 : strand (0 = unknown/unstranded, 1 = +, 2 = -)
+- Bits 41-64 : reserved
 """
 function pack_bed_code(strand::UInt8)
     return UInt64(strand) << 32
@@ -257,7 +257,7 @@ function load_bed(file_path::String)
     return BedData(scaffolds)
 end
 
-function intersect(tree_a::IntervalMeta64, tree_b::IntervalMeta64)
+function intersect(tree_a::IntervalMeta64, tree_b::IntervalMeta64)::IntervalMeta64
     intersection = IntervalMeta64()
     itr = IntervalTrees.intersect(tree_a, tree_b)
     for overlap in itr
@@ -287,7 +287,7 @@ end
 function intersect(
     genome::Genome,
     bed_data::BedData,
-    feature::Union{AbstractString, Symbol})
+    feature::Union{AbstractString, Symbol})::Dict{String, IntervalMeta64}
     scaffolds = Dict{String, IntervalMeta64}()
     for (scaffold_name, scaffold) in genome.scaffolds
         if haskey(bed_data.scaffolds, scaffold_name)
@@ -300,7 +300,7 @@ function intersect(
     return scaffolds
 end
 
-function intersect(scaffold::Scaffold, bed_data::BedData)
+function intersect(scaffold::Scaffold, bed_data::BedData)::IntervalMeta64
     if !haskey(bed_data.scaffolds, scaffold.name)
         return nothing
     end
@@ -308,7 +308,7 @@ function intersect(scaffold::Scaffold, bed_data::BedData)
     return intersect(scaffold.features, bed_data.scaffolds[scaffold.name])
 end
 
-function intersect(genome::Genome, bed_data::BedData)
+function intersect(genome::Genome, bed_data::BedData)::Dict{String, IntervalMeta64}
     scaffolds = Dict{String, IntervalMeta64}()
     for (scaffold_name, scaffold) in genome.scaffolds
         if haskey(bed_data.scaffolds, scaffold_name)
@@ -319,6 +319,60 @@ function intersect(genome::Genome, bed_data::BedData)
         end
     end
     return scaffolds
+end
+
+"""
+Left-join two interval trees, preserving every interval of `treeL` and pairing
+each with a (possibly `nothing`) interval from `treeR`.
+
+The returned value is a lazy iterator of `(left, right)` tuples where `left` is
+always an interval from `treeL` and `right` is either a matching interval from
+`treeR` or `nothing`. Left intervals are visited in the tree's natural (sorted)
+order; a left interval with several right matches yields one tuple per match,
+while a left interval with no match yields a single `(left, nothing)` tuple.
+Right intervals that never match a left interval are dropped.
+
+How intervals are matched is controlled by `on`:
+
+- `:metadata` (default) : match on the 64-bit metadata `value`.
+- `:start`              : match on the start position (`first`).
+- `:end`                : match on the end position (`last`).
+- `:interval`           : match only when both `first` and `last` are equal.
+"""
+function leftjoin(treeL::IntervalMeta64, treeR::IntervalMeta64, on::Symbol=:metadata)
+    if on === :metadata
+        return _leftjoin(treeL, treeR, iv -> iv.value, UInt64)
+    elseif on === :start
+        return _leftjoin(treeL, treeR, iv -> iv.first, UInt32)
+    elseif on === :end
+        return _leftjoin(treeL, treeR, iv -> iv.last, UInt32)
+    elseif on === :interval
+        return _leftjoin(treeL, treeR, iv -> (iv.first, iv.last), Tuple{UInt32, UInt32})
+    else
+        throw(ArgumentError("`on` must be one of :metadata, :start, :end, :interval (got :$on)"))
+    end
+end
+
+function _leftjoin(treeL::IntervalMeta64, treeR::IntervalMeta64, keyfn::F, ::Type{KT}) where {F, KT}
+    IV = eltype(treeL)   # IntervalValue{UInt32, UInt64}
+
+    # Index the right tree by join key: key => right intervals sharing that key.
+    right_index = Dict{KT, Vector{IV}}()
+    for r in treeR
+        push!(get!(() -> IV[], right_index, keyfn(r)), r)
+    end
+
+    # For each left interval, emit one tuple per matching right interval, or a
+    # single `(left, nothing)` tuple when there is no match. `flatten` keeps the
+    # whole thing lazy.
+    return Iterators.flatten(
+        let matches = get(right_index, keyfn(l), nothing)
+            matches === nothing ?
+                ((l, nothing),) :
+                ((l, r) for r in matches)
+        end
+        for l in treeL
+    )
 end
 
 """
@@ -458,6 +512,7 @@ export
     Data,
     TabularData,
     intersect,
+    leftjoin,
     load_bed,
     load_table,
     merge_segments,

@@ -226,7 +226,7 @@ function get_metadata(genome::Genome)
     return scaffolds
 end
 
-function get_feature(scaffold::Scaffold, feature::Symbol)
+function get_feature(scaffold::Scaffold, feature::Symbol)::IntervalMeta64
     result = SO_TERMS[feature]
     isnothing(result) && return nothing
     feature_bit_mask, _ = result
@@ -240,7 +240,7 @@ function get_feature(scaffold::Scaffold, feature::Symbol)
     return tree
 end
 
-get_feature(scaffold::Scaffold, feature::AbstractString) = get_feature(scaffold, Symbol(feature))
+get_feature(scaffold::Scaffold, feature::AbstractString)::IntervalMeta64 = get_feature(scaffold, Symbol(feature))
 
 function get_feature(genome::Genome, feature::Symbol)
     result = SO_TERMS[feature]

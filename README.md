@@ -10,7 +10,7 @@ A second attempt at creating a comprehensive suite of bioinformatics tools in pu
 ## Getting Started
 
 ## Package Structure
-As the purpose of this package is to allow for the easy organization, analysis and manipulation of bioinformatics data, every type unique to this package is organized hierarchically in a [*Study*](<./src/study.jl>):
+As the purpose of this package is to allow for the easy organization, analysis and manipulation of bioinformatics data, every type unique to this package is organized hierarchically in a [*Study*](<./src/studies.jl>):
 ```mermaid
 classDiagram
 direction TB
@@ -61,6 +61,7 @@ direction TB
     }
 
     class Genome {
+        Dict~String, Scaffold~ scaffolds
     }
 
     class AssayMethod {

@@ -340,4 +340,102 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             @test Vector(freq["chr1"]) == UInt16[256, 256]
         end
     end  # calculate_frequency
+
+    # =========================================================================
+    @testset "leftjoin" begin
+        # Build an IntervalMeta64 tree from `(start, end, value)` triples.
+        make_tree(triples...) = begin
+            tree = IntervalMeta64()
+            for (s, e, v) in triples
+                push!(tree, IntervalValue(UInt32(s), UInt32(e), UInt64(v)))
+            end
+            tree
+        end
+
+        # Represent a joined pair as plain values so results are easy to compare
+        # regardless of interval order: (left triple, right triple or `nothing`).
+        as_triple(iv) = (Int(iv.first), Int(iv.last), Int(iv.value))
+        as_pair(p) = (as_triple(p[1]), p[2] === nothing ? nothing : as_triple(p[2]))
+
+        @testset "on = :metadata (default)" begin
+            left  = make_tree((10, 20, 100), (30, 40, 200), (50, 60, 300))
+            # value 100 matches, 200 has no match, 300 matches twice.
+            right = make_tree((11, 21, 100), (35, 45, 999), (55, 65, 300), (70, 80, 300))
+
+            pairs = Set(as_pair(p) for p in Studies.leftjoin(left, right))   # default :metadata
+            @test pairs == Set([
+                ((10, 20, 100), (11, 21, 100)),
+                ((30, 40, 200), nothing),
+                ((50, 60, 300), (55, 65, 300)),
+                ((50, 60, 300), (70, 80, 300)),
+            ])
+
+            # Explicitly passing :metadata gives the same result.
+            @test Set(as_pair(p) for p in Studies.leftjoin(left, right, :metadata)) == pairs
+        end
+
+        @testset "on = :start" begin
+            left  = make_tree((10, 20, 1), (30, 45, 2))
+            # start 10 matches (end/value differ), start 30 has no match.
+            right = make_tree((10, 99, 7), (31, 45, 8))
+
+            pairs = Set(as_pair(p) for p in Studies.leftjoin(left, right, :start))
+            @test pairs == Set([
+                ((10, 20, 1), (10, 99, 7)),
+                ((30, 45, 2), nothing),
+            ])
+        end
+
+        @testset "on = :end" begin
+            left  = make_tree((10, 50, 1), (30, 60, 2))
+            # end 50 matches (start/value differ), end 60 has no match.
+            right = make_tree((5, 50, 7), (5, 61, 8))
+
+            pairs = Set(as_pair(p) for p in Studies.leftjoin(left, right, :end))
+            @test pairs == Set([
+                ((10, 50, 1), (5, 50, 7)),
+                ((30, 60, 2), nothing),
+            ])
+        end
+
+        @testset "on = :interval" begin
+            left  = make_tree((10, 20, 1), (30, 40, 2))
+            # (10,20) matches on both coords; (30,40) matches only start, so drops.
+            right = make_tree((10, 20, 7), (30, 41, 8))
+
+            pairs = Set(as_pair(p) for p in Studies.leftjoin(left, right, :interval))
+            @test pairs == Set([
+                ((10, 20, 1), (10, 20, 7)),
+                ((30, 40, 2), nothing),
+            ])
+        end
+
+        @testset "all left intervals preserved, unmatched right dropped" begin
+            left  = make_tree((10, 20, 1), (30, 40, 2))
+            # No right interval shares a value with any left interval.
+            right = make_tree((10, 20, 999), (30, 40, 888))
+
+            result = collect(Studies.leftjoin(left, right, :metadata))
+            @test length(result) == 2                       # exactly one row per left
+            @test all(p -> p[2] === nothing, result)        # nothing matched
+        end
+
+        @testset "empty right tree pairs every left with nothing" begin
+            left = make_tree((10, 20, 1), (30, 40, 2))
+            result = collect(Studies.leftjoin(left, IntervalMeta64(), :metadata))
+            @test length(result) == 2
+            @test all(p -> p[2] === nothing, result)
+        end
+
+        @testset "empty left tree yields no pairs" begin
+            right = make_tree((10, 20, 1))
+            @test isempty(collect(Studies.leftjoin(IntervalMeta64(), right, :metadata)))
+        end
+
+        @testset "invalid `on` throws ArgumentError" begin
+            left  = make_tree((10, 20, 1))
+            right = make_tree((10, 20, 1))
+            @test_throws ArgumentError Studies.leftjoin(left, right, :not_valid)
+        end
+    end  # leftjoin
 end
