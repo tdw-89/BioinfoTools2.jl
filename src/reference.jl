@@ -226,7 +226,7 @@ function get_metadata(genome::Genome)
     return scaffolds
 end
 
-function get_feature(scaffold::Scaffold, feature::Symbol)::IntervalMeta64
+function get_feature(scaffold::Scaffold, feature::Symbol)::Union{Nothing, IntervalMeta64}
     result = SO_TERMS[feature]
     isnothing(result) && return nothing
     feature_bit_mask, _ = result
@@ -240,7 +240,7 @@ function get_feature(scaffold::Scaffold, feature::Symbol)::IntervalMeta64
     return tree
 end
 
-get_feature(scaffold::Scaffold, feature::AbstractString)::IntervalMeta64 = get_feature(scaffold, Symbol(feature))
+get_feature(scaffold::Scaffold, feature::AbstractString)::Union{Nothing, IntervalMeta64} = get_feature(scaffold, Symbol(feature))
 
 function get_feature(genome::Genome, feature::Symbol)
     result = SO_TERMS[feature]
@@ -334,6 +334,26 @@ function Base.getindex(genome::Genome, ids::AbstractVector{<:AbstractString})
         end
     end
     return records
+end
+
+"""
+Look up the feature carrying the 32-bit metadata index `meta_index`, returning
+it as a [`FeatureRecord`](@ref), or `nothing` when no feature uses that index.
+
+Scans the genome's intervals (O(features) per lookup), comparing each interval's
+parsed metadata index (see [`parse_index`](@ref)) against `meta_index`. This is a
+convenience for turning the metadata index stored on a `TabularData` sample back
+into a full feature record.
+"""
+function Base.getindex(genome::Genome, meta_index::UInt32)
+    for (name, scaffold) in genome.scaffolds
+        for interval in scaffold.features
+            if parse_index(interval.value) == meta_index
+                return _feature_record(genome, name, interval)
+            end
+        end
+    end
+    return nothing
 end
 
 function Base.show(io::IO, f::FeatureRecord)

@@ -6,4 +6,5 @@ using Test
     include("TESTS_paralogs.jl")
     include("TESTS_reference.jl")
     include("TESTS_studies.jl")
+    include("TEST_exploration.jl")
 end

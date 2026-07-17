@@ -248,4 +248,44 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
             @test issorted(used_terms)
         end
     end
+
+    # -------------------------------------------------------------------------
+    @testset "getindex – FeatureRecord lookups" begin
+        s = Species("C. elegans")
+        add_features!(GFF_SINGLE, s.genome)
+        scaffold = s.genome.scaffolds["NC_003280.10"]
+
+        # Grab a real gene interval, its metadata index and its ID.
+        gene_iv  = first(get_feature(scaffold, :gene))
+        gene_idx = BioinfoTools2.Reference.parse_index(gene_iv.value)
+        gene_id  = BioinfoTools2.Reference.get_metadata_id(s.genome, gene_idx)
+
+        @testset "getindex(genome, String) – match / miss" begin
+            rec = s.genome[gene_id]
+            @test rec isa FeatureRecord
+            @test rec.id == gene_id
+            @test rec.chromosome == "NC_003280.10"
+            @test isnothing(s.genome["NO_SUCH_FEATURE_ID"])
+        end
+
+        @testset "getindex(genome, Vector{String})" begin
+            recs = s.genome[[gene_id, "NO_SUCH_FEATURE_ID"]]
+            @test recs isa Vector{FeatureRecord}
+            @test any(r -> r.id == gene_id, recs)
+            @test isempty(s.genome[["nope_1", "nope_2"]])
+        end
+
+        @testset "getindex(genome, UInt32) – metadata index" begin
+            rec = s.genome[gene_idx]
+            @test rec isa FeatureRecord
+            @test rec.id == gene_id
+            @test rec.feature_type == :gene
+            @test rec.chromosome == "NC_003280.10"
+            @test rec.start_pos == gene_iv.first
+            @test rec.end_pos == gene_iv.last
+
+            # An index no feature uses returns nothing.
+            @test isnothing(s.genome[typemax(UInt32)])
+        end
+    end
 end

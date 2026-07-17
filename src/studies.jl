@@ -300,7 +300,7 @@ function intersect(
     return scaffolds
 end
 
-function intersect(scaffold::Scaffold, bed_data::BedData)::IntervalMeta64
+function intersect(scaffold::Scaffold, bed_data::BedData)::Union{Nothing, IntervalMeta64}
     if !haskey(bed_data.scaffolds, scaffold.name)
         return nothing
     end
