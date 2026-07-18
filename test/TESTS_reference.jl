@@ -1,9 +1,44 @@
 using BioinfoTools2.Reference
+using BioGenerics
+using GFF3
 using Test
 
 const REF_DATA_DIR = joinpath(@__DIR__, "data")
 const GFF_SINGLE = joinpath(REF_DATA_DIR, "NC_003280.10.gff.gz")  # 4 893 genes, 1 scaffold
 const GFF_MULTI = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 genes, 7 scaffolds
+
+function read_test_gff_record(line::AbstractString)
+    gff = tempname() * ".gff3"
+    record = GFF3.Record()
+    found = false
+    try
+        open(gff, "w") do io
+            write(io, "##gff-version 3\n")
+            write(io, line)
+            endswith(line, '\n') || write(io, '\n')
+        end
+
+        open(gff) do io
+            rdr = GFF3.Reader(io)
+            try
+                while !eof(rdr)
+                    read!(rdr, record)
+                    if BioGenerics.isfilled(record)
+                        found = true
+                        break
+                    end
+                end
+            finally
+                close(rdr)
+            end
+        end
+    finally
+        rm(gff; force = true)
+    end
+
+    found || error("No GFF3 record read from test line")
+    return record
+end
 
 @testset "Reference" begin
 
@@ -22,6 +57,84 @@ const GFF_MULTI = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 genes
         @test s2.name == "Homo sapiens"
         @test s2.taxon_id == "9606"
         @test isempty(s2.genome.scaffolds)
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "sanitize_id" begin
+        @test Reference.sanitize_id("gene:WBGene00000001") == "WBGene00000001"
+        @test Reference.sanitize_id("gene:transcript:TX0001") == "TX0001"
+        @test Reference.sanitize_id("mRNA:RNA:CDS:Protein:ABC123") == "ABC123"
+        @test Reference.sanitize_id("gene-family:ABC123") == "gene-family:ABC123"
+        @test Reference.sanitize_id("ABC123") == "ABC123"
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "parse_record" begin
+        @testset "known SO term with sanitized ID and full metadata" begin
+            record = read_test_gff_record(
+                "chr1\tRefSeq\tgene\t5\t20\t.\t+\t.\tID=gene:transcript:GENE0001;gene_biotype=protein_coding",
+            )
+
+            result = Reference.parse_record(record, UInt32(7))
+
+            @test result isa Reference.ParseResult
+            @test result.scaffold_id == "chr1"
+            @test result.start_pos == UInt32(5)
+            @test result.end_pos == UInt32(20)
+            @test Reference.parse_index(result.code) == UInt32(7)
+            @test Reference.parse_strand(result.code) ==
+                  GFF3.GenomicFeatures.STRAND_POS
+            @test Reference.parse_so_term(result.code) == Reference.convert_so_term("gene")
+            @test result.id == "GENE0001"
+            @test result.source == "RefSeq"
+            @test result.biotype == "protein_coding"
+        end
+
+        @testset "sanitization disabled preserves prefixed ID" begin
+            record = read_test_gff_record(
+                "chr1\tRefSeq\tmRNA\t10\t30\t.\t-\t.\tID=transcript:TX0001;gene_biotype=ncRNA",
+            )
+
+            result = Reference.parse_record(
+                record,
+                UInt32(8);
+                sanitize_ids = false,
+            )
+
+            @test result.id == "transcript:TX0001"
+            @test Reference.parse_strand(result.code) == GFF3.GenomicFeatures.STRAND_NEG
+        end
+
+        @testset "missing optional fields fall back to NA" begin
+            record = read_test_gff_record("chr2\t.\tgene\t1\t9\t.\t.\t.\tName=no_id")
+
+            result = Reference.parse_record(record, UInt32(9))
+
+            @test result.id == "NA"
+            @test result.source == "NA"
+            @test result.biotype == "NA"
+            @test Reference.parse_strand(result.code) == GFF3.GenomicFeatures.STRAND_BOTH
+        end
+
+        @testset "multi-valued ID and biotype fall back to NA" begin
+            record = read_test_gff_record(
+                "chr3\tRefSeq\tgene\t2\t8\t.\t+\t.\tID=gene:ONE,gene:TWO;gene_biotype=type1,type2",
+            )
+
+            result = Reference.parse_record(record, UInt32(10))
+
+            @test result.id == "NA"
+            @test result.source == "RefSeq"
+            @test result.biotype == "NA"
+        end
+
+        @testset "unknown SO term is skipped" begin
+            record = read_test_gff_record(
+                "chr4\tRefSeq\tnot_a_real_so_term\t3\t6\t.\t+\t.\tID=gene:SKIPME;gene_biotype=protein_coding",
+            )
+
+            @test isnothing(Reference.parse_record(record, UInt32(11)))
+        end
     end
 
     # -------------------------------------------------------------------------
