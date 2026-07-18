@@ -8,7 +8,7 @@ using IntervalTrees
 using ..SOTerms
 
 const RECORD_BUFFER = 1_000
-const IntervalMeta64 = IntervalTree{UInt32, IntervalValue{UInt32, UInt64}}
+const IntervalMeta64 = IntervalTree{UInt32,IntervalValue{UInt32,UInt64}}
 
 ##############################= Scaffolds =##############################
 
@@ -41,7 +41,7 @@ function convert_so_term(label::String)
     so_term_result = SO_TERMS[label]
     if isnothing(so_term_result)
         return nothing
-    end 
+    end
     return so_term_result[1]
 end
 
@@ -103,17 +103,25 @@ function sanitize_id(id::AbstractString)
     return cleaned
 end
 
-function parse_record(record::GFF3.Record, meta_index::UInt32; sanitize_ids::Bool = true)::ParseResult
+function parse_record(
+    record::GFF3.Record,
+    meta_index::UInt32;
+    sanitize_ids::Bool = true,
+)::ParseResult
     # interned
     scaffold = GFF3.seqname(record)
     feature_attr = GFF3.attributes(record) |> Dict
-    feature_id = haskey(feature_attr, "ID") && length(feature_attr["ID"]) == 1 ? only(feature_attr["ID"]) : "NA"
+    feature_id =
+        haskey(feature_attr, "ID") && length(feature_attr["ID"]) == 1 ?
+        only(feature_attr["ID"]) : "NA"
     if sanitize_ids
         feature_id = sanitize_id(feature_id)
     end
     feature_source = GFF3.hassource(record) ? GFF3.source(record) : "NA"
-    gene_biotype = haskey(feature_attr, "gene_biotype") && length(feature_attr["gene_biotype"]) == 1 ? only(feature_attr["gene_biotype"]) : "NA"
-    
+    gene_biotype =
+        haskey(feature_attr, "gene_biotype") && length(feature_attr["gene_biotype"]) == 1 ?
+        only(feature_attr["gene_biotype"]) : "NA"
+
     # bits
     feature_type = record |> GFF3.featuretype
     so_term = feature_type |> convert_so_term
@@ -122,7 +130,7 @@ function parse_record(record::GFF3.Record, meta_index::UInt32; sanitize_ids::Boo
     end
     strand = record |> GFF3.strand |> convert_strand
     code = pack_metadata(meta_index, strand, so_term)
-    
+
     # Interval
     start_pos = record |> GFF3.seqstart |> UInt32
     end_pos = record |> GFF3.seqend |> UInt32
@@ -134,7 +142,7 @@ function parse_record(record::GFF3.Record, meta_index::UInt32; sanitize_ids::Boo
         code,
         feature_id,
         feature_source,
-        gene_biotype
+        gene_biotype,
     )
 end
 
@@ -153,11 +161,11 @@ while the second 32 bits are an index into the `meta_offsets` vector which gives
 byte blob for that feature.
 """
 mutable struct Genome
-    scaffolds::Dict{String, Scaffold}
+    scaffolds::Dict{String,Scaffold}
 
     # String intern pool
     vocab::Vector{String}
-    vocab_lookup::Dict{String, UInt32}
+    vocab_lookup::Dict{String,UInt32}
 
     # Metadata store
     meta_offsets::Vector{UInt32}
@@ -170,15 +178,15 @@ function get_metadata(genome::Genome, meta_index::UInt32)
     end
 
     start_byte = genome.meta_offsets[meta_index]
-    end_byte = genome.meta_offsets[meta_index + 1] - 1
-    
+    end_byte = genome.meta_offsets[meta_index+1] - 1
+
     if start_byte > end_byte
         return String[]
     end
-    
+
     raw_bytes = genome.meta_blob[start_byte:end_byte]
     tokens = reinterpret(UInt32, raw_bytes)
-    
+
     return [genome.vocab[t] for t in tokens]
 end
 
@@ -192,18 +200,21 @@ matching how `build_genome!` wrote it) instead of allocating the full metadata
 vector. Prefer this over `get_metadata` when only the ID is needed.
 """
 function get_metadata_id(genome::Genome, meta_index::UInt32)
-    if meta_index < 0x1 || length(genome.meta_offsets) <= 1 || (meta_index + 1) > length(genome.meta_offsets)
+    if meta_index < 0x1 ||
+       length(genome.meta_offsets) <= 1 ||
+       (meta_index + 1) > length(genome.meta_offsets)
         return nothing
     end
 
     start_byte = genome.meta_offsets[meta_index]
-    end_byte = genome.meta_offsets[meta_index + 1] - 1
+    end_byte = genome.meta_offsets[meta_index+1] - 1
 
     if start_byte > end_byte
         return nothing
     end
 
-    token = GC.@preserve genome unsafe_load(Ptr{UInt32}(pointer(genome.meta_blob, start_byte)))
+    token =
+        GC.@preserve genome unsafe_load(Ptr{UInt32}(pointer(genome.meta_blob, start_byte)))
     return genome.vocab[token]
 end
 
@@ -219,14 +230,14 @@ end
 get_metadata(genome::Genome, scaffold::Scaffold) = get_metadata(genome, scaffold.features)
 
 function get_metadata(genome::Genome)
-    scaffolds = Dict{String, Vector{Vector{String}}}()
+    scaffolds = Dict{String,Vector{Vector{String}}}()
     for (scaffold_name, scaffold) in genome.scaffolds
         scaffolds[scaffold_name] = get_metadata(genome, scaffold)
     end
     return scaffolds
 end
 
-function get_feature(scaffold::Scaffold, feature::Symbol)::Union{Nothing, IntervalMeta64}
+function get_feature(scaffold::Scaffold, feature::Symbol)::Union{Nothing,IntervalMeta64}
     result = SO_TERMS[feature]
     isnothing(result) && return nothing
     feature_bit_mask, _ = result
@@ -240,13 +251,14 @@ function get_feature(scaffold::Scaffold, feature::Symbol)::Union{Nothing, Interv
     return tree
 end
 
-get_feature(scaffold::Scaffold, feature::AbstractString)::Union{Nothing, IntervalMeta64} = get_feature(scaffold, Symbol(feature))
+get_feature(scaffold::Scaffold, feature::AbstractString)::Union{Nothing,IntervalMeta64} =
+    get_feature(scaffold, Symbol(feature))
 
 function get_feature(genome::Genome, feature::Symbol)
     result = SO_TERMS[feature]
-    isnothing(result) && return Dict{String, IntervalMeta64}()
+    isnothing(result) && return Dict{String,IntervalMeta64}()
 
-    scaffolds = Dict{String, IntervalMeta64}()
+    scaffolds = Dict{String,IntervalMeta64}()
     for (scaffold_name, scaffold) in genome.scaffolds
         scaffolds[scaffold_name] = get_feature(scaffold, feature)
     end
@@ -290,13 +302,24 @@ struct FeatureRecord
 end
 
 # Build a FeatureRecord from a scaffold name and one of its interval entries.
-function _feature_record(genome::Genome, chromosome::String, interval::IntervalValue{UInt32, UInt64})
+function _feature_record(
+    genome::Genome,
+    chromosome::String,
+    interval::IntervalValue{UInt32,UInt64},
+)
     code = interval.value
     so_result = SO_TERMS[parse_so_term(code)]
     feature_type = isnothing(so_result) ? Symbol("") : so_result[2]
     metadata = get_metadata(genome, parse_index(code))
     id = isempty(metadata) ? "" : metadata[1]
-    return FeatureRecord(id, feature_type, chromosome, interval.first, interval.last, metadata)
+    return FeatureRecord(
+        id,
+        feature_type,
+        chromosome,
+        interval.first,
+        interval.last,
+        metadata,
+    )
 end
 
 """
@@ -357,7 +380,10 @@ function Base.getindex(genome::Genome, meta_index::UInt32)
 end
 
 function Base.show(io::IO, f::FeatureRecord)
-    print(io, "FeatureRecord(\"$(f.id)\", $(f.feature_type), $(f.chromosome):$(f.start_pos)-$(f.end_pos), metadata=$(f.metadata))")
+    print(
+        io,
+        "FeatureRecord(\"$(f.id)\", $(f.feature_type), $(f.chromosome):$(f.start_pos)-$(f.end_pos), metadata=$(f.metadata))",
+    )
 end
 
 mutable struct Species
@@ -367,13 +393,8 @@ mutable struct Species
 end
 
 function Species(name::String; taxon_id::String = "")
-    genome = Genome(
-        Dict{String, Scaffold}(),
-        String[],
-        Dict{String, UInt32}(),
-        UInt32[],
-        UInt8[]
-    )
+    genome =
+        Genome(Dict{String,Scaffold}(), String[], Dict{String,UInt32}(), UInt32[], UInt8[])
     return Species(name, taxon_id, genome)
 end
 
@@ -397,7 +418,10 @@ function build_genome!(ch::Channel{Vector{ParseResult}}, genome::Genome)
             end
 
             # 1. Add the feature interval (start, end, 64-bit code) to the scaffold tree
-            push!(scaffold.features, IntervalValue(result.start_pos, result.end_pos, result.code))
+            push!(
+                scaffold.features,
+                IntervalValue(result.start_pos, result.end_pos, result.code),
+            )
 
             # 2. Record the start offset for this features's metadata entry, then encode it.
             #    meta_offsets grows one entry per feature; a final sentinel is appended at the
@@ -421,8 +445,8 @@ function add_features!(gff_path::String, genome::Genome; sanitize_ids::Bool = tr
     builder_task = Threads.@spawn build_genome!(ch, genome)
 
     open(gff_path) do fh
-        rdr = endswith(gff_path, ".gz") ?
-            GFF3.Reader(GzipDecompressorStream(fh)) :
+        rdr =
+            endswith(gff_path, ".gz") ? GFF3.Reader(GzipDecompressorStream(fh)) :
             GFF3.Reader(fh)
 
         record = GFF3.Record()
@@ -438,7 +462,7 @@ function add_features!(gff_path::String, genome::Genome; sanitize_ids::Bool = tr
                 read!(rdr, record)
                 if BioGenerics.isfilled(record)
                     result = parse_record(record, meta_index; sanitize_ids = sanitize_ids)
-                    if !isnothing(result) 
+                    if !isnothing(result)
                         push!(buffer, result)
                         meta_index += UInt32(1)
                         if length(buffer) == RECORD_BUFFER
@@ -465,16 +489,25 @@ function add_features!(gff_path::String, species::Species; sanitize_ids::Bool = 
     add_features!(gff_path, species.genome; sanitize_ids = sanitize_ids)
 end
 
-Base.show(io::IO, s::Scaffold) = print(io, "Scaffold(\"$(s.name)\", $(length(s.features)) feature$(length(s.features) == 1 ? "" : "s"))")
+Base.show(io::IO, s::Scaffold) = print(
+    io,
+    "Scaffold(\"$(s.name)\", $(length(s.features)) feature$(length(s.features) == 1 ? "" : "s"))",
+)
 
 function Base.show(io::IO, r::ParseResult)
-    print(io, "ParseResult($(r.scaffold_id):$(r.start_pos)-$(r.end_pos), id=\"$(r.id)\", biotype=$(r.biotype))")
+    print(
+        io,
+        "ParseResult($(r.scaffold_id):$(r.start_pos)-$(r.end_pos), id=\"$(r.id)\", biotype=$(r.biotype))",
+    )
 end
 
 function Base.show(io::IO, g::Genome)
     nscaff = length(g.scaffolds)
-    nfeatures = sum(length(sc.features) for sc in values(g.scaffolds); init=0)
-    print(io, "Genome($(nscaff) scaffold$(nscaff == 1 ? "" : "s"), $(nfeatures) feature$(nfeatures == 1 ? "" : "s"))")
+    nfeatures = sum(length(sc.features) for sc in values(g.scaffolds); init = 0)
+    print(
+        io,
+        "Genome($(nscaff) scaffold$(nscaff == 1 ? "" : "s"), $(nfeatures) feature$(nfeatures == 1 ? "" : "s"))",
+    )
 end
 
 function Base.show(io::IO, sp::Species)
@@ -482,8 +515,7 @@ function Base.show(io::IO, sp::Species)
     print(io, "Species(\"$(sp.name)\"$(taxon), $(sp.genome))")
 end
 
-export
-    Species,
+export Species,
     IntervalMeta64,
     Genome,
     Scaffold,
@@ -492,5 +524,5 @@ export
     get_metadata,
     get_feature,
     get_so_terms
-    
+
 end

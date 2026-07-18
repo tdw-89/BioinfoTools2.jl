@@ -3,11 +3,11 @@ module Paralogs
 using DataFrames
 
 function rbh_ds(paralog_df::DataFrame)
-    @assert typeof(paralog_df[1,1]) <: AbstractString
-    @assert typeof(paralog_df[1,2]) <: AbstractString
-    @assert typeof(paralog_df[1,3]) <: AbstractFloat
+    @assert typeof(paralog_df[1, 1]) <: AbstractString
+    @assert typeof(paralog_df[1, 2]) <: AbstractString
+    @assert typeof(paralog_df[1, 3]) <: AbstractFloat
 
-    unique_ids = unique(vcat(paralog_df[:,1], paralog_df[:,2]))
+    unique_ids = unique(vcat(paralog_df[:, 1], paralog_df[:, 2]))
     ids_to_ind_dict = Dict(unique_ids[i] => i for i in eachindex(unique_ids))
     ind_to_ids_dict = Dict(i => unique_ids[i] for i in eachindex(unique_ids))
 
@@ -17,33 +17,34 @@ function rbh_ds(paralog_df::DataFrame)
 
     # Fill in the matrix, treating gene 'i' as the query and gene 'j' as the subject
     for row in eachrow(paralog_df)
-        
+
         i = ids_to_ind_dict[row[1]]
         j = ids_to_ind_dict[row[2]]
 
-        orig_mat[i,j] = row[3]
-        orig_mat[j,i] = row[3]
-        rbh_matrix[i,j] = row[3]
-        rbh_matrix[j,i] = row[3]
+        orig_mat[i, j] = row[3]
+        orig_mat[j, i] = row[3]
+        rbh_matrix[i, j] = row[3]
+        rbh_matrix[j, i] = row[3]
     end
 
     rbh_gene, rbh_paralog = String[], String[]
     matched_inds = Int[]
-    score_i_origs, score_j_origs, max_scores, mean_scores = Float64[], Float64[], Float64[], Float64[]
-    for i in 1:size(rbh_matrix)[1]
+    score_i_origs, score_j_origs, max_scores, mean_scores =
+        Float64[], Float64[], Float64[], Float64[]
+    for i = 1:size(rbh_matrix)[1]
 
-        _, max_i = findmax(rbh_matrix[i,:])[1:2]
-        _, max_j = findmax(rbh_matrix[:,max_i])[1:2]
-        score_i_orig = orig_mat[i,max_i]
-        score_j_orig = orig_mat[max_i,i]
+        _, max_i = findmax(rbh_matrix[i, :])[1:2]
+        _, max_j = findmax(rbh_matrix[:, max_i])[1:2]
+        score_i_orig = orig_mat[i, max_i]
+        score_j_orig = orig_mat[max_i, i]
         max_score = max(score_i_orig, score_j_orig)
         mean_score = (score_i_orig + score_j_orig) / 2
-        
+
         if i == max_j && max_i ∉ matched_inds && max_j ∉ matched_inds
-            
+
             id_i = ind_to_ids_dict[max_i]
             id_j = ind_to_ids_dict[max_j]
-            
+
             push!(rbh_gene, id_i)
             push!(rbh_paralog, id_j)
             push!(matched_inds, max_i)
@@ -56,9 +57,9 @@ function rbh_ds(paralog_df::DataFrame)
     end
 
     return DataFrame(
-        "GeneID" => rbh_gene, 
-        "ParalogID" => rbh_paralog, 
-        "ds" => score_i_origs
+        "GeneID" => rbh_gene,
+        "ParalogID" => rbh_paralog,
+        "ds" => score_i_origs,
     )
 end
 
@@ -99,27 +100,31 @@ df = DataFrame(
 rbh_pairs = rbh(df; scoring="max")
 ```
 """
-function rbh(paralog_df::DataFrame; scoring::String="max")
+function rbh(paralog_df::DataFrame; scoring::String = "max")
 
     scoring = lowercase(scoring)
 
     if !(scoring in ["max", "maximum", "double_max", "mean", "average", "avg", "ds"])
 
-        error("Invalid scoring method. Must be 'ds', 'max', 'maximum', 'double_max', 'mean', 'avg', or 'average'.")
+        error(
+            "Invalid scoring method. Must be 'ds', 'max', 'maximum', 'double_max', 'mean', 'avg', or 'average'.",
+        )
     end
 
-    scoring = scoring in ["max", "maximum"] ? "max" : scoring in ["mean", "avg", "average"] ? "mean" : scoring
+    scoring =
+        scoring in ["max", "maximum"] ? "max" :
+        scoring in ["mean", "avg", "average"] ? "mean" : scoring
 
     if scoring == "ds"
         return rbh_ds(paralog_df)
     end
 
-    @assert typeof(paralog_df[1,1]) <: AbstractString
-    @assert typeof(paralog_df[1,2]) <: AbstractString
-    @assert typeof(paralog_df[1,3]) <: AbstractFloat
-    @assert typeof(paralog_df[1,4]) <: AbstractFloat
+    @assert typeof(paralog_df[1, 1]) <: AbstractString
+    @assert typeof(paralog_df[1, 2]) <: AbstractString
+    @assert typeof(paralog_df[1, 3]) <: AbstractFloat
+    @assert typeof(paralog_df[1, 4]) <: AbstractFloat
 
-    unique_ids = unique(vcat(paralog_df[:,1], paralog_df[:,2]))
+    unique_ids = unique(vcat(paralog_df[:, 1], paralog_df[:, 2]))
     ids_to_ind_dict = Dict(unique_ids[i] => i for i in eachindex(unique_ids))
     ind_to_ids_dict = Dict(i => unique_ids[i] for i in eachindex(unique_ids))
 
@@ -132,45 +137,46 @@ function rbh(paralog_df::DataFrame; scoring::String="max")
 
         i = ids_to_ind_dict[row[1]]
         j = ids_to_ind_dict[row[2]]
-        
-        orig_mat[i,j] = row[3]
-        orig_mat[j,i] = row[4]
+
+        orig_mat[i, j] = row[3]
+        orig_mat[j, i] = row[4]
 
         if scoring == "max"
 
             max_perc_temp = max(row[3], row[4])
-            rbh_matrix[i,j] = max_perc_temp
-            rbh_matrix[j,i] = max_perc_temp
+            rbh_matrix[i, j] = max_perc_temp
+            rbh_matrix[j, i] = max_perc_temp
         elseif scoring == "mean"
 
             mean_perc_temp = (row[3] + row[4]) / 2
-            rbh_matrix[i,j] = mean_perc_temp
-            rbh_matrix[j,i] = mean_perc_temp
+            rbh_matrix[i, j] = mean_perc_temp
+            rbh_matrix[j, i] = mean_perc_temp
         else
 
-            rbh_matrix[i,j] = orig_mat[i,j]
-            rbh_matrix[j,i] = orig_mat[j,i]
+            rbh_matrix[i, j] = orig_mat[i, j]
+            rbh_matrix[j, i] = orig_mat[j, i]
         end
     end
 
     rbh_gene, rbh_paralog = String[], String[]
     matched_inds = Int[]
-    perc_i_origs, perc_j_origs, max_percs, mean_percs = Float64[], Float64[], Float64[], Float64[]
-        
-    for i in 1:size(rbh_matrix)[1]
+    perc_i_origs, perc_j_origs, max_percs, mean_percs =
+        Float64[], Float64[], Float64[], Float64[]
 
-        _, max_i = findmax(rbh_matrix[i,:])[1:2]
-        _, max_j = findmax(rbh_matrix[:,max_i])[1:2]
-        perc_i_orig = orig_mat[i,max_i]
-        perc_j_orig = orig_mat[max_i,i]
+    for i = 1:size(rbh_matrix)[1]
+
+        _, max_i = findmax(rbh_matrix[i, :])[1:2]
+        _, max_j = findmax(rbh_matrix[:, max_i])[1:2]
+        perc_i_orig = orig_mat[i, max_i]
+        perc_j_orig = orig_mat[max_i, i]
         max_perc = max(perc_i_orig, perc_j_orig)
         mean_perc = (perc_i_orig + perc_j_orig) / 2
-        
+
         if i == max_j && max_i ∉ matched_inds && max_j ∉ matched_inds
-            
+
             id_i = ind_to_ids_dict[max_i]
             id_j = ind_to_ids_dict[max_j]
-            
+
             push!(rbh_gene, id_i)
             push!(rbh_paralog, id_j)
             push!(matched_inds, max_i)
@@ -182,11 +188,16 @@ function rbh(paralog_df::DataFrame; scoring::String="max")
         end
     end
 
-    return DataFrame("GeneID" => rbh_gene, "ParalogID" => rbh_paralog, "perc_1" => perc_i_origs, "perc_2" => perc_j_origs, "max_perc" => max_percs, "mean_perc" => mean_percs)
+    return DataFrame(
+        "GeneID" => rbh_gene,
+        "ParalogID" => rbh_paralog,
+        "perc_1" => perc_i_origs,
+        "perc_2" => perc_j_origs,
+        "max_perc" => max_percs,
+        "mean_perc" => mean_percs,
+    )
 end
 
-export 
-    rbh, 
-    rbh_ds
+export rbh, rbh_ds
 
 end

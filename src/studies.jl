@@ -11,17 +11,17 @@ using SparseArrays
 using ..Reference
 
 mutable struct BedData
-    scaffolds::Dict{String, IntervalMeta64}
+    scaffolds::Dict{String,IntervalMeta64}
 
 end
 
 mutable struct TabularData{T}
     variables::Vector{AbstractString}
-    samples::Vector{Union{Nothing, Tuple{String, UInt32}}}
+    samples::Vector{Union{Nothing,Tuple{String,UInt32}}}
     table::Matrix{T}
 end
 
-const Data = Union{BedData, TabularData}
+const Data = Union{BedData,TabularData}
 
 mutable struct BioSample
     sample_id::String
@@ -63,12 +63,14 @@ NOTE: This functions assumes that the first column is a list of
 sample IDs (e.g., gene accessions or transcript accessions)
 and that all other columns are of the same numeric type.
 """
-function load_table(
-    genome::Genome, 
-    data_frame::DataFrame, 
-    feature::Union{String, Symbol})
-    sample_col_correct = typeof(Vector(data_frame[!, 1])) <: Array{S, 1} where S <: AbstractString
-    data_cols_correct = [typeof(Vector(data_frame[!, i])) <: Array{N, 1} where N <: Number for i in 2:ncol(data_frame)] |> all
+function load_table(genome::Genome, data_frame::DataFrame, feature::Union{String,Symbol})
+    sample_col_correct =
+        typeof(Vector(data_frame[!, 1])) <: Array{S,1} where {S<:AbstractString}
+    data_cols_correct =
+        [
+            typeof(Vector(data_frame[!, i])) <: Array{N,1} where {N<:Number} for
+            i = 2:ncol(data_frame)
+        ] |> all
     if !(sample_col_correct && data_cols_correct)
         if !sample_col_correct
             @warn "Sample column incorrect format"
@@ -84,12 +86,12 @@ function load_table(
 
     # Output vector, parallel to the table rows. A slot stays `nothing` if its
     # sample ID never matches any feature's metadata ID.
-    samples = Vector{Union{Nothing, Tuple{String, UInt32}}}(nothing, length(sample_names))
+    samples = Vector{Union{Nothing,Tuple{String,UInt32}}}(nothing, length(sample_names))
 
     # Samples still awaiting a match: sample_id => original row index. Using a
     # Dict makes each match an O(1) lookup + "pop", so the whole search is
     # O(features) and can stop early once every sample has been matched.
-    remaining = Dict{String, UInt32}()
+    remaining = Dict{String,UInt32}()
     sizehint!(remaining, length(sample_names))
     for (id, idx) in sample_names
         remaining[String(id)] = UInt32(idx)
@@ -132,7 +134,7 @@ Base.getindex(t::TabularData, inds...) = getindex(t.table, inds...)
 
 # Resolve the ID of a single sample by looking its metadata up in `genome`.
 # Returns `nothing` for empty slots or features without metadata.
-function sample_id(genome::Genome, sample::Union{Nothing, Tuple{String, UInt32}})
+function sample_id(genome::Genome, sample::Union{Nothing,Tuple{String,UInt32}})
     isnothing(sample) && return nothing
     return Reference.get_metadata_id(genome, sample[2])
 end
@@ -160,7 +162,11 @@ Look up every sample whose (putative) ID is contained in `ids`, returning a
 rows). IDs with no matching sample are silently skipped; row order follows the
 original table.
 """
-function Base.getindex(t::TabularData, genome::Genome, ids::AbstractVector{<:AbstractString})
+function Base.getindex(
+    t::TabularData,
+    genome::Genome,
+    ids::AbstractVector{<:AbstractString},
+)
     wanted = Set{String}(ids)
     rows = Int[]
     for (row, sample) in enumerate(t.samples)
@@ -180,7 +186,8 @@ unmatched samples become `missing`), followed by one column per entry in
 """
 function DataFrames.DataFrame(t::TabularData, genome::Genome)
     df = DataFrame()
-    df[!, :ID] = Union{Missing, String}[something(sample_id(genome, s), missing) for s in t.samples]
+    df[!, :ID] =
+        Union{Missing,String}[something(sample_id(genome, s), missing) for s in t.samples]
     for (j, variable) in enumerate(t.variables)
         df[!, string(variable)] = t.table[:, j]
     end
@@ -223,11 +230,11 @@ function bed_record_strand(record::BED.Record)
 end
 
 function load_bed(file_path::String)
-    scaffolds = Dict{String, IntervalMeta64}()
+    scaffolds = Dict{String,IntervalMeta64}()
 
     open(file_path) do fh
-        rdr = endswith(file_path, ".gz") ?
-            BED.Reader(GzipDecompressorStream(fh)) :
+        rdr =
+            endswith(file_path, ".gz") ? BED.Reader(GzipDecompressorStream(fh)) :
             BED.Reader(fh)
 
         record = BED.Record()
@@ -241,12 +248,12 @@ function load_bed(file_path::String)
                     # BED uses 0-based half-open [start, end) coordinates;
                     # convert to 1-based closed [start, end] to match gene intervals.
                     # from GFF3 files.
-                    chrom     = BED.chrom(record)
+                    chrom = BED.chrom(record)
                     start_pos = UInt32(BED.chromstart(record))
-                    end_pos   = UInt32(BED.chromend(record))
+                    end_pos = UInt32(BED.chromend(record))
 
                     strand = bed_record_strand(record)
-                    code   = pack_bed_code(strand)
+                    code = pack_bed_code(strand)
 
                     tree = get!(IntervalMeta64, scaffolds, chrom)
                     push!(tree, IntervalValue(start_pos, end_pos, code))
@@ -274,7 +281,7 @@ function intersect(tree_a::IntervalMeta64, tree_b::IntervalMeta64)::IntervalMeta
     for overlap in itr
         a = overlap[1].first:overlap[1].last
         b = overlap[2].first:overlap[2].last
-        a_x_b = Base.intersect(a,b)
+        a_x_b = Base.intersect(a, b)
         new_interval = IntervalValue(first(a_x_b), last(a_x_b), overlap[1].value)
         push!(intersection, new_interval)
     end
@@ -284,7 +291,8 @@ end
 function intersect(
     scaffold::Scaffold,
     bed_data::BedData,
-    feature::Union{AbstractString, Symbol})
+    feature::Union{AbstractString,Symbol},
+)
     if !haskey(bed_data.scaffolds, scaffold.name)
         return nothing
     end
@@ -298,8 +306,9 @@ end
 function intersect(
     genome::Genome,
     bed_data::BedData,
-    feature::Union{AbstractString, Symbol})::Dict{String, IntervalMeta64}
-    scaffolds = Dict{String, IntervalMeta64}()
+    feature::Union{AbstractString,Symbol},
+)::Dict{String,IntervalMeta64}
+    scaffolds = Dict{String,IntervalMeta64}()
     for (scaffold_name, scaffold) in genome.scaffolds
         if haskey(bed_data.scaffolds, scaffold_name)
             intersect_result = intersect(scaffold, bed_data, feature)
@@ -311,7 +320,7 @@ function intersect(
     return scaffolds
 end
 
-function intersect(scaffold::Scaffold, bed_data::BedData)::Union{Nothing, IntervalMeta64}
+function intersect(scaffold::Scaffold, bed_data::BedData)::Union{Nothing,IntervalMeta64}
     if !haskey(bed_data.scaffolds, scaffold.name)
         return nothing
     end
@@ -319,8 +328,8 @@ function intersect(scaffold::Scaffold, bed_data::BedData)::Union{Nothing, Interv
     return intersect(scaffold.features, bed_data.scaffolds[scaffold.name])
 end
 
-function intersect(genome::Genome, bed_data::BedData)::Dict{String, IntervalMeta64}
-    scaffolds = Dict{String, IntervalMeta64}()
+function intersect(genome::Genome, bed_data::BedData)::Dict{String,IntervalMeta64}
+    scaffolds = Dict{String,IntervalMeta64}()
     for (scaffold_name, scaffold) in genome.scaffolds
         if haskey(bed_data.scaffolds, scaffold_name)
             intersect_result = intersect(scaffold, bed_data)
@@ -350,7 +359,7 @@ How intervals are matched is controlled by `on`:
 - `:end`                : match on the end position (`last`).
 - `:interval`           : match only when both `first` and `last` are equal.
 """
-function leftjoin(treeL::IntervalMeta64, treeR::IntervalMeta64, on::Symbol=:metadata)
+function leftjoin(treeL::IntervalMeta64, treeR::IntervalMeta64, on::Symbol = :metadata)
     if on === :metadata
         return _leftjoin(treeL, treeR, iv -> iv.value, UInt64)
     elseif on === :start
@@ -358,17 +367,26 @@ function leftjoin(treeL::IntervalMeta64, treeR::IntervalMeta64, on::Symbol=:meta
     elseif on === :end
         return _leftjoin(treeL, treeR, iv -> iv.last, UInt32)
     elseif on === :interval
-        return _leftjoin(treeL, treeR, iv -> (iv.first, iv.last), Tuple{UInt32, UInt32})
+        return _leftjoin(treeL, treeR, iv -> (iv.first, iv.last), Tuple{UInt32,UInt32})
     else
-        throw(ArgumentError("`on` must be one of :metadata, :start, :end, :interval (got :$on)"))
+        throw(
+            ArgumentError(
+                "`on` must be one of :metadata, :start, :end, :interval (got :$on)",
+            ),
+        )
     end
 end
 
-function _leftjoin(treeL::IntervalMeta64, treeR::IntervalMeta64, keyfn::F, ::Type{KT}) where {F, KT}
+function _leftjoin(
+    treeL::IntervalMeta64,
+    treeR::IntervalMeta64,
+    keyfn::F,
+    ::Type{KT},
+) where {F,KT}
     IV = eltype(treeL)   # IntervalValue{UInt32, UInt64}
 
     # Index the right tree by join key: key => right intervals sharing that key.
-    right_index = Dict{KT, Vector{IV}}()
+    right_index = Dict{KT,Vector{IV}}()
     for r in treeR
         push!(get!(() -> IV[], right_index, keyfn(r)), r)
     end
@@ -378,11 +396,8 @@ function _leftjoin(treeL::IntervalMeta64, treeR::IntervalMeta64, keyfn::F, ::Typ
     # whole thing lazy.
     return Iterators.flatten(
         let matches = get(right_index, keyfn(l), nothing)
-            matches === nothing ?
-                ((l, nothing),) :
-                ((l, r) for r in matches)
-        end
-        for l in treeL
+            matches === nothing ? ((l, nothing),) : ((l, r) for r in matches)
+        end for l in treeL
     )
 end
 
@@ -392,7 +407,7 @@ closed `(start, end)` segments (1-based). Overlapping intervals are combined so
 that each base is covered by at most one resulting segment.
 """
 function merge_segments(tree::IntervalMeta64)
-    segments = Tuple{Int, Int}[]
+    segments = Tuple{Int,Int}[]
     ivs = sort!([(Int(iv.first), Int(iv.last)) for iv in tree])
     for (s, e) in ivs
         if !isempty(segments) && s <= segments[end][2]
@@ -428,7 +443,9 @@ function calculate_frequency(measurements::Vector{BedData}; merge::Bool = true)
     elseif n <= typemax(UInt16)
         UInt16
     else
-        error("calculate_frequency supports at most $(Int(typemax(UInt16))) BedData measurements (received $n)")
+        error(
+            "calculate_frequency supports at most $(Int(typemax(UInt16))) BedData measurements (received $n)",
+        )
     end
 
     # Every scaffold that appears in at least one measurement.
@@ -437,24 +454,25 @@ function calculate_frequency(measurements::Vector{BedData}; merge::Bool = true)
         union!(scaffold_names, keys(measurement.scaffolds))
     end
 
-    genome = Dict{String, SparseVector{T, Int}}()
+    genome = Dict{String,SparseVector{T,Int}}()
 
     for name in scaffold_names
         # Difference array: +1 where a segment starts, -1 just past its end. The
         # running total while sweeping left-to-right is the per-base frequency
         # across measurements.
-        deltas = Dict{Int, Int}()
+        deltas = Dict{Int,Int}()
         scaffold_len = 0
 
         for measurement in measurements
             haskey(measurement.scaffolds, name) || continue
             tree = measurement.scaffolds[name]
-            segments = merge ? merge_segments(tree) :
+            segments =
+                merge ? merge_segments(tree) :
                 [(Int(iv.first), Int(iv.last)) for iv in tree]
             for (s, e) in segments
-                deltas[s]     = get(deltas, s, 0) + 1
-                deltas[e + 1] = get(deltas, e + 1, 0) - 1
-                scaffold_len  = max(scaffold_len, e)
+                deltas[s] = get(deltas, s, 0) + 1
+                deltas[e+1] = get(deltas, e + 1, 0) - 1
+                scaffold_len = max(scaffold_len, e)
             end
         end
 
@@ -463,13 +481,13 @@ function calculate_frequency(measurements::Vector{BedData}; merge::Bool = true)
         # Sweep the breakpoints in order, emitting a value for every covered base.
         breakpoints = sort!(collect(keys(deltas)))
         indices = Int[]
-        values  = T[]
+        values = T[]
         coverage = 0
         for k in eachindex(breakpoints)
             p = breakpoints[k]
             coverage += deltas[p]
             if coverage > 0 && k < length(breakpoints)
-                for base in p:(breakpoints[k + 1] - 1)
+                for base = p:(breakpoints[k+1]-1)
                     push!(indices, base)
                     push!(values, T(coverage))
                 end
@@ -495,7 +513,10 @@ function Base.show(io::IO, t::TabularData)
 end
 
 function Base.show(io::IO, b::BioSample)
-    print(io, "BioSample(\"$(b.sample_id)\", tissue=$(b.tissue_type), species=\"$(b.species.name)\")")
+    print(
+        io,
+        "BioSample(\"$(b.sample_id)\", tissue=$(b.tissue_type), species=\"$(b.species.name)\")",
+    )
 end
 
 Base.show(io::IO, a::AssayMethod) = print(io, "AssayMethod(\"$(a.name)\")")
@@ -510,11 +531,13 @@ end
 
 function Base.show(io::IO, s::Study)
     n = length(s.assays)
-    print(io, "Study(\"$(s.id)\", \"$(s.title)\", $(s.date), $(n) assay$(n == 1 ? "" : "s"))")
+    print(
+        io,
+        "Study(\"$(s.id)\", \"$(s.title)\", $(s.date), $(n) assay$(n == 1 ? "" : "s"))",
+    )
 end
 
-export
-    Study,
+export Study,
     Assay,
     AssayMethod,
     Measurement,

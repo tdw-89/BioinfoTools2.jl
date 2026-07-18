@@ -2,16 +2,16 @@ using BioinfoTools2.Reference
 using Test
 
 const REF_DATA_DIR = joinpath(@__DIR__, "data")
-const GFF_SINGLE  = joinpath(REF_DATA_DIR, "NC_003280.10.gff.gz")  # 4 893 genes, 1 scaffold
-const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 genes, 7 scaffolds
+const GFF_SINGLE = joinpath(REF_DATA_DIR, "NC_003280.10.gff.gz")  # 4 893 genes, 1 scaffold
+const GFF_MULTI = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 genes, 7 scaffolds
 
 @testset "Reference" begin
 
     # -------------------------------------------------------------------------
     @testset "Species constructor" begin
         s = Species("Caenorhabditis elegans")
-        @test s.name      == "Caenorhabditis elegans"
-        @test s.taxon_id  == ""
+        @test s.name == "Caenorhabditis elegans"
+        @test s.taxon_id == ""
         @test isempty(s.genome.scaffolds)
         @test isempty(s.genome.vocab)
         @test isempty(s.genome.vocab_lookup)
@@ -19,7 +19,7 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
         @test isempty(s.genome.meta_blob)
 
         s2 = Species("Homo sapiens"; taxon_id = "9606")
-        @test s2.name     == "Homo sapiens"
+        @test s2.name == "Homo sapiens"
         @test s2.taxon_id == "9606"
         @test isempty(s2.genome.scaffolds)
     end
@@ -38,7 +38,7 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
         #   meta_blob has 3 UInt32 tokens (id, source, biotype) × 4 bytes each per gene
         n_features = 78_407
         @test length(s.genome.meta_offsets) == n_features + 1
-        @test length(s.genome.meta_blob)    == n_features * 12 
+        @test length(s.genome.meta_blob) == n_features * 12
 
         # Vocab is populated (sources and biotypes are interned)
         @test !isempty(s.genome.vocab)
@@ -66,8 +66,13 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
         add_features!(GFF_MULTI, s.genome)
 
         expected_scaffolds = [
-            "NC_001328.1", "NC_003279.8", "NC_003280.10",
-            "NC_003281.10", "NC_003282.8", "NC_003283.11", "NC_003284.9"
+            "NC_001328.1",
+            "NC_003279.8",
+            "NC_003280.10",
+            "NC_003281.10",
+            "NC_003282.8",
+            "NC_003283.11",
+            "NC_003284.9",
         ]
 
         @test length(s.genome.scaffolds) == length(expected_scaffolds)
@@ -78,17 +83,17 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
         # Total gene count across all scaffolds
         n_features = 531872
         @test length(s.genome.meta_offsets) == n_features + 1
-        @test length(s.genome.meta_blob)    == n_features * 12
+        @test length(s.genome.meta_blob) == n_features * 12
 
         # Per-scaffold gene counts (from awk '$3=="gene"' | sort | uniq -c)
         expected_counts = Dict(
-            "NC_001328.1"  => 123,
-            "NC_003279.8"  => 78_407,
+            "NC_001328.1" => 123,
+            "NC_003279.8" => 78_407,
             "NC_003280.10" => 63_135,
             "NC_003281.10" => 118_912,
-            "NC_003282.8"  => 108_998,
+            "NC_003282.8" => 108_998,
             "NC_003283.11" => 89_181,
-            "NC_003284.9"  => 73_116,
+            "NC_003284.9" => 73_116,
         )
         total = sum(values(expected_counts))
         @test total == n_features
@@ -103,10 +108,10 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
         add_features!(GFF_SINGLE, s1.genome)
         add_features!(GFF_SINGLE, s2.genome)
 
-        @test length(s1.genome.meta_blob)    == length(s2.genome.meta_blob)
+        @test length(s1.genome.meta_blob) == length(s2.genome.meta_blob)
         @test length(s1.genome.meta_offsets) == length(s2.genome.meta_offsets)
-        @test length(s1.genome.vocab)        == length(s2.genome.vocab)
-        @test sort(s1.genome.vocab)          == sort(s2.genome.vocab)
+        @test length(s1.genome.vocab) == length(s2.genome.vocab)
+        @test sort(s1.genome.vocab) == sort(s2.genome.vocab)
     end
 
     # -------------------------------------------------------------------------
@@ -114,7 +119,10 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
         gff = tempname() * ".gff3"
         open(gff, "w") do io
             write(io, "##gff-version 3\n")
-            write(io, "chr1\tRefSeq\tgene\t1\t10\t.\t+\t.\tID=gene:transcript:GENE0001;gene_biotype=protein_coding\n")
+            write(
+                io,
+                "chr1\tRefSeq\tgene\t1\t10\t.\t+\t.\tID=gene:transcript:GENE0001;gene_biotype=protein_coding\n",
+            )
         end
 
         @testset "default sanitization (on)" begin
@@ -144,7 +152,7 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
     @testset "get_metadata – all overloads" begin
         s = Species("C. elegans")
         add_features!(GFF_SINGLE, s.genome)
-        scaffold  = s.genome.scaffolds["NC_003280.10"]
+        scaffold = s.genome.scaffolds["NC_003280.10"]
         n_features = 78_407
 
         @testset "get_metadata(genome, UInt32) – valid indices" begin
@@ -153,12 +161,13 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
             @test length(meta1) == 3   # id, source, biotype
 
             # Known record verified in the sibling testset above
-            @test get_metadata(s.genome, UInt32(2)) == ["gene-CELE_2L52.2", "RefSeq", "ncRNA"]
+            @test get_metadata(s.genome, UInt32(2)) ==
+                  ["gene-CELE_2L52.2", "RefSeq", "ncRNA"]
         end
 
         @testset "get_metadata(genome, UInt32) – out-of-range indices" begin
             # length(meta_offsets) == n_features + 1; first invalid index is n_features + 1
-            @test get_metadata(s.genome, UInt32(n_features + 1))   == String[]
+            @test get_metadata(s.genome, UInt32(n_features + 1)) == String[]
             @test get_metadata(s.genome, UInt32(n_features + 100)) == String[]
         end
 
@@ -170,12 +179,13 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
         end
 
         @testset "get_metadata(genome, Scaffold) – delegates to IntervalMeta64" begin
-            @test get_metadata(s.genome, scaffold) == get_metadata(s.genome, scaffold.features)
+            @test get_metadata(s.genome, scaffold) ==
+                  get_metadata(s.genome, scaffold.features)
         end
 
         @testset "get_metadata(genome) – full genome" begin
             all_meta = get_metadata(s.genome)
-            @test all_meta isa Dict{String, Vector{Vector{String}}}
+            @test all_meta isa Dict{String,Vector{Vector{String}}}
             @test length(all_meta) == length(s.genome.scaffolds)
             @test haskey(all_meta, "NC_003280.10")
             @test length(all_meta["NC_003280.10"]) == n_features
@@ -194,7 +204,10 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
             @test !isempty(tree)
             # Every returned interval must carry the same (gene) SO term code
             gene_code = BioinfoTools2.Reference.parse_so_term(first(tree).value)
-            @test all(iv -> BioinfoTools2.Reference.parse_so_term(iv.value) == gene_code, tree)
+            @test all(
+                iv -> BioinfoTools2.Reference.parse_so_term(iv.value) == gene_code,
+                tree,
+            )
         end
 
         @testset "get_feature(scaffold, Symbol) – unknown term" begin
@@ -202,7 +215,8 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
         end
 
         @testset "get_feature(scaffold, AbstractString) – delegates to Symbol" begin
-            @test length(get_feature(scaffold, "gene")) == length(get_feature(scaffold, :gene))
+            @test length(get_feature(scaffold, "gene")) ==
+                  length(get_feature(scaffold, :gene))
         end
 
         @testset "get_feature(genome, Symbol) – known term" begin
@@ -256,9 +270,9 @@ const GFF_MULTI   = joinpath(REF_DATA_DIR, "genomic.gff.gz")        # 44 795 gen
         scaffold = s.genome.scaffolds["NC_003280.10"]
 
         # Grab a real gene interval, its metadata index and its ID.
-        gene_iv  = first(get_feature(scaffold, :gene))
+        gene_iv = first(get_feature(scaffold, :gene))
         gene_idx = BioinfoTools2.Reference.parse_index(gene_iv.value)
-        gene_id  = BioinfoTools2.Reference.get_metadata_id(s.genome, gene_idx)
+        gene_id = BioinfoTools2.Reference.get_metadata_id(s.genome, gene_idx)
 
         @testset "getindex(genome, String) – match / miss" begin
             rec = s.genome[gene_id]

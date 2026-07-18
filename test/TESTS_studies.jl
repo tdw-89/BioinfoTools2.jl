@@ -4,11 +4,11 @@ using DataFrames
 using IntervalTrees
 using Test
 
-const ST_DATA_DIR      = joinpath(@__DIR__, "data")
-const MICRO_BED        = joinpath(ST_DATA_DIR, "micro.bed")
+const ST_DATA_DIR = joinpath(@__DIR__, "data")
+const MICRO_BED = joinpath(ST_DATA_DIR, "micro.bed")
 const MICRO_NARROWPEAK = joinpath(ST_DATA_DIR, "micro.narrowPeak")
-const FULL_NARROWPEAK  = joinpath(ST_DATA_DIR, "full.narrowPeak")
-const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
+const FULL_NARROWPEAK = joinpath(ST_DATA_DIR, "full.narrowPeak")
+const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
 @testset "Studies" begin
 
@@ -53,10 +53,10 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         tree = bd.scaffolds["DDB0215018"]
 
         starts = sort([iv.first for iv in tree])
-        ends   = sort([iv.last  for iv in tree])
+        ends = sort([iv.last for iv in tree])
 
         @test minimum(starts) == UInt32(5)    # 0-based 4  → 1-based 5
-        @test ends[1]         == UInt32(1609) # chromEnd unchanged
+        @test ends[1] == UInt32(1609) # chromEnd unchanged
     end
 
     # -------------------------------------------------------------------------
@@ -65,10 +65,10 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         tree = bd.scaffolds["DDB0215018"]
 
         starts = sort([iv.first for iv in tree])
-        ends   = sort([iv.last  for iv in tree])
+        ends = sort([iv.last for iv in tree])
 
         @test minimum(starts) == UInt32(5)    # 0-based 4  → 1-based 5
-        @test ends[1]         == UInt32(1609) # chromEnd unchanged
+        @test ends[1] == UInt32(1609) # chromEnd unchanged
     end
 
     # -------------------------------------------------------------------------
@@ -103,7 +103,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         # -----------------------------------------------------------------------
         @testset "intersect(IntervalMeta64, IntervalMeta64) – overlap" begin
             tree_a = IntervalMeta64()
-            push!(tree_a, IntervalValue(UInt32(10),  UInt32(50),  UInt64(7)))
+            push!(tree_a, IntervalValue(UInt32(10), UInt32(50), UInt64(7)))
             push!(tree_a, IntervalValue(UInt32(200), UInt32(300), UInt64(0)))
             tree_b = IntervalMeta64()
             push!(tree_b, IntervalValue(UInt32(30), UInt32(100), UInt64(0)))
@@ -112,7 +112,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             ivs = collect(result)
             @test length(ivs) == 1
             @test ivs[1].first == UInt32(30)
-            @test ivs[1].last  == UInt32(50)
+            @test ivs[1].last == UInt32(50)
             @test ivs[1].value == UInt64(7)   # value carried from tree_a
         end
 
@@ -222,8 +222,8 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
         @testset "getindex(Integer...) – row ranges and column slices" begin
             @test tab[1:2, :] == [10.0 11.0; 20.0 21.0]
-            @test tab[:, 1]   == [10.0, 20.0, 30.0, 40.0]
-            @test tab[4, :]   == [40.0, 41.0]
+            @test tab[:, 1] == [10.0, 20.0, 30.0, 40.0]
+            @test tab[4, :] == [40.0, 41.0]
         end
 
         # --- Single-string lookup --------------------------------------------
@@ -277,7 +277,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
         @testset "DataFrame(tab, genome) – unmatched sample becomes missing" begin
             out = DataFrame(tab, sp.genome)
-            @test eltype(out.ID) == Union{Missing, String}
+            @test eltype(out.ID) == Union{Missing,String}
             @test ismissing(out.ID[4])
             @test count(ismissing, out.ID) == 1
         end
@@ -287,7 +287,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
     @testset "calculate_frequency" begin
         # Build a BedData from `scaffold => [(start, end), ...]` pairs.
         make_bed(pairs...) = begin
-            scaffolds = Dict{String, IntervalMeta64}()
+            scaffolds = Dict{String,IntervalMeta64}()
             for (name, ivs) in pairs
                 tree = IntervalMeta64()
                 for (s, e) in ivs
@@ -334,7 +334,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         end
 
         @testset "element type widens to UInt16 past 255 measurements" begin
-            measurements = [make_bed("chr1" => [(1, 2)]) for _ in 1:256]
+            measurements = [make_bed("chr1" => [(1, 2)]) for _ = 1:256]
             freq = calculate_frequency(measurements)
             @test eltype(freq["chr1"]) == UInt16
             @test Vector(freq["chr1"]) == UInt16[256, 256]
@@ -358,7 +358,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         as_pair(p) = (as_triple(p[1]), p[2] === nothing ? nothing : as_triple(p[2]))
 
         @testset "on = :metadata (default)" begin
-            left  = make_tree((10, 20, 100), (30, 40, 200), (50, 60, 300))
+            left = make_tree((10, 20, 100), (30, 40, 200), (50, 60, 300))
             # value 100 matches, 200 has no match, 300 matches twice.
             right = make_tree((11, 21, 100), (35, 45, 999), (55, 65, 300), (70, 80, 300))
 
@@ -375,43 +375,34 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         end
 
         @testset "on = :start" begin
-            left  = make_tree((10, 20, 1), (30, 45, 2))
+            left = make_tree((10, 20, 1), (30, 45, 2))
             # start 10 matches (end/value differ), start 30 has no match.
             right = make_tree((10, 99, 7), (31, 45, 8))
 
             pairs = Set(as_pair(p) for p in Studies.leftjoin(left, right, :start))
-            @test pairs == Set([
-                ((10, 20, 1), (10, 99, 7)),
-                ((30, 45, 2), nothing),
-            ])
+            @test pairs == Set([((10, 20, 1), (10, 99, 7)), ((30, 45, 2), nothing)])
         end
 
         @testset "on = :end" begin
-            left  = make_tree((10, 50, 1), (30, 60, 2))
+            left = make_tree((10, 50, 1), (30, 60, 2))
             # end 50 matches (start/value differ), end 60 has no match.
             right = make_tree((5, 50, 7), (5, 61, 8))
 
             pairs = Set(as_pair(p) for p in Studies.leftjoin(left, right, :end))
-            @test pairs == Set([
-                ((10, 50, 1), (5, 50, 7)),
-                ((30, 60, 2), nothing),
-            ])
+            @test pairs == Set([((10, 50, 1), (5, 50, 7)), ((30, 60, 2), nothing)])
         end
 
         @testset "on = :interval" begin
-            left  = make_tree((10, 20, 1), (30, 40, 2))
+            left = make_tree((10, 20, 1), (30, 40, 2))
             # (10,20) matches on both coords; (30,40) matches only start, so drops.
             right = make_tree((10, 20, 7), (30, 41, 8))
 
             pairs = Set(as_pair(p) for p in Studies.leftjoin(left, right, :interval))
-            @test pairs == Set([
-                ((10, 20, 1), (10, 20, 7)),
-                ((30, 40, 2), nothing),
-            ])
+            @test pairs == Set([((10, 20, 1), (10, 20, 7)), ((30, 40, 2), nothing)])
         end
 
         @testset "all left intervals preserved, unmatched right dropped" begin
-            left  = make_tree((10, 20, 1), (30, 40, 2))
+            left = make_tree((10, 20, 1), (30, 40, 2))
             # No right interval shares a value with any left interval.
             right = make_tree((10, 20, 999), (30, 40, 888))
 
@@ -433,7 +424,7 @@ const ST_GFF_SINGLE    = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         end
 
         @testset "invalid `on` throws ArgumentError" begin
-            left  = make_tree((10, 20, 1))
+            left = make_tree((10, 20, 1))
             right = make_tree((10, 20, 1))
             @test_throws ArgumentError Studies.leftjoin(left, right, :not_valid)
         end

@@ -5,7 +5,7 @@ using DataFrames
 using IntervalTrees
 using Test
 
-const EX_DATA_DIR   = joinpath(@__DIR__, "data")
+const EX_DATA_DIR = joinpath(@__DIR__, "data")
 const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
 @testset "Exploration" begin
@@ -38,7 +38,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         @testset "default (quantiles = 4, merge = mean)" begin
             q = get_quantiles(sp.genome, tab)
 
-            @test q isa Vector{Tuple{FeatureRecord, Float64, Int}}
+            @test q isa Vector{Tuple{FeatureRecord,Float64,Int}}
             # The unmatched NO_SUCH_ID sample is skipped.
             @test length(q) == 8
             @test !any(t -> t[1].id == "NO_SUCH_ID", q)
@@ -59,7 +59,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             end
 
             # Each quartile bin holds exactly two features.
-            for bin in 1:4
+            for bin = 1:4
                 @test count(t -> t[3] == bin, q) == 2
             end
         end
@@ -98,7 +98,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             df_none = DataFrame(sample = ["NO_SUCH_ID"], v1 = [1.0], v2 = [2.0])
             tab_none = load_table(sp.genome, df_none, :gene)
             empty_q = get_quantiles(sp.genome, tab_none)
-            @test empty_q isa Vector{Tuple{FeatureRecord, Float64, Int}}
+            @test empty_q isa Vector{Tuple{FeatureRecord,Float64,Int}}
             @test isempty(empty_q)
         end
     end
@@ -112,17 +112,28 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
         # A BedData whose single interval blankets the whole scaffold, so every
         # gene is fully covered (fraction 1.0).
-        bed_full = BedData(Dict("NC_003280.10" => let t = IntervalMeta64()
-            push!(t, IntervalValue(UInt32(1), UInt32(100_000_000), UInt64(0)))
-            t
-        end))
+        bed_full = BedData(
+            Dict(
+                "NC_003280.10" => let t = IntervalMeta64()
+                    push!(t, IntervalValue(UInt32(1), UInt32(100_000_000), UInt64(0)))
+                    t
+                end,
+            ),
+        )
 
         # A BedData on the right scaffold whose interval sits past every feature,
         # so nothing overlaps and all fractions are 0.0.
-        bed_empty = BedData(Dict("NC_003280.10" => let t = IntervalMeta64()
-            push!(t, IntervalValue(UInt32(200_000_000), UInt32(200_000_001), UInt64(0)))
-            t
-        end))
+        bed_empty = BedData(
+            Dict(
+                "NC_003280.10" => let t = IntervalMeta64()
+                    push!(
+                        t,
+                        IntervalValue(UInt32(200_000_000), UInt32(200_000_001), UInt64(0)),
+                    )
+                    t
+                end,
+            ),
+        )
 
         # A BedData whose only scaffold name has no counterpart in the genome.
         bed_no_match = BedData(Dict("NOMATCH" => IntervalMeta64()))
@@ -130,7 +141,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         @testset "coverage" begin
             @testset "full coverage → gene fractions are 1.0" begin
                 cov = coverage(sp.genome, :gene, bed_full)
-                @test cov isa Dict{String, Vector{Float64}}
+                @test cov isa Dict{String,Vector{Float64}}
                 @test haskey(cov, "NC_003280.10")
                 v = cov["NC_003280.10"]
                 # Only :gene features can match, so fractions are either 0.0
@@ -140,7 +151,8 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             end
 
             @testset "filter_zeros drops uncovered features" begin
-                vfz = coverage(sp.genome, :gene, bed_full; filter_zeros = true)["NC_003280.10"]
+                vfz =
+                    coverage(sp.genome, :gene, bed_full; filter_zeros = true)["NC_003280.10"]
                 @test all(==(1.0), vfz)
                 @test length(vfz) == n_genes
             end
@@ -153,7 +165,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
             @testset "scaffold absent from BedData is omitted" begin
                 cov = coverage(sp.genome, :gene, bed_no_match)
-                @test cov isa Dict{String, Vector{Float64}}
+                @test cov isa Dict{String,Vector{Float64}}
                 @test isempty(cov)
             end
         end
@@ -184,4 +196,3 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         end
     end
 end
-
