@@ -63,7 +63,10 @@ NOTE: This functions assumes that the first column is a list of
 sample IDs (e.g., gene accessions or transcript accessions)
 and that all other columns are of the same numeric type.
 """
-function load_table(genome::Genome, data_frame::DataFrame, feature::Union{String, Symbol})
+function load_table(
+    genome::Genome, 
+    data_frame::DataFrame, 
+    feature::Union{String, Symbol})
     sample_col_correct = typeof(Vector(data_frame[!, 1])) <: Array{S, 1} where S <: AbstractString
     data_cols_correct = [typeof(Vector(data_frame[!, i])) <: Array{N, 1} where N <: Number for i in 2:ncol(data_frame)] |> all
     if !(sample_col_correct && data_cols_correct)
@@ -257,6 +260,14 @@ function load_bed(file_path::String)
     return BedData(scaffolds)
 end
 
+"""
+Given two `IntervalMeta64` trees 'a' and 'b', return the tree representing their intersection,
+with the metadata from tree 'a' kept as the metadata for the intersection.
+
+**NOTE:** multiple intervals from tree 'b' can intersect one interval from tree 'a', and
+therefore multiple intervals in the return tree can have the same metadata (the same feature can
+be present in the return tree multiple times in fragments).
+"""
 function intersect(tree_a::IntervalMeta64, tree_b::IntervalMeta64)::IntervalMeta64
     intersection = IntervalMeta64()
     itr = IntervalTrees.intersect(tree_a, tree_b)

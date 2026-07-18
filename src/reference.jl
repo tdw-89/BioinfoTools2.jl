@@ -103,7 +103,7 @@ function sanitize_id(id::AbstractString)
     return cleaned
 end
 
-function parse_record(record::GFF3.Record, meta_index::UInt32; sanitize_ids::Bool = true)
+function parse_record(record::GFF3.Record, meta_index::UInt32; sanitize_ids::Bool = true)::ParseResult
     # interned
     scaffold = GFF3.seqname(record)
     feature_attr = GFF3.attributes(record) |> Dict
