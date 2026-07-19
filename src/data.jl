@@ -426,15 +426,24 @@ function calculate_frequency(measurements::Vector{BedData}; merge::Bool = true)
         )
     end
 
-    # Every scaffold that appears in at least one measurement.
-    scaffold_names = Set{String}()
+    # Every scaffold that appears in at least one measurement. `Threads.@threads`
+    # needs an indexable collection, so collect the set into a vector.
+    scaffold_names = String[]
+    seen = Set{String}()
     for measurement in measurements
-        union!(scaffold_names, keys(measurement.scaffolds))
+        for name in keys(measurement.scaffolds)
+            name in seen || (push!(seen, name); push!(scaffold_names, name))
+        end
     end
 
-    genome = Dict{String,SparseVector{T,Int}}()
+    # Pre-populate every key so the parallel loop only overwrites existing
+    # entries. Inserting new keys concurrently would race on the Dict's internal
+    # structure; overwriting the value of an existing key does not.
+    genome = Dict{String,SparseVector{T,Int}}(
+        name => spzeros(T, 0) for name in scaffold_names
+    )
 
-    for name in scaffold_names
+    Threads.@threads for name in scaffold_names
         # Difference array: +1 where a segment starts, -1 just past its end. The
         # running total while sweeping left-to-right is the per-base frequency
         # across measurements.
