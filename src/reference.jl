@@ -10,8 +10,6 @@ using ..SOTerms
 const RECORD_BUFFER = 1_000
 const IntervalMeta64 = IntervalTree{UInt32,IntervalValue{UInt32,UInt64}}
 
-##############################= Scaffolds =##############################
-
 """
 - `name`: The name of the scaffold
 - `features`: An interval tree containing the start and end of each feature, along with a 64 bit metadata code (see [below](#metadata-handling)).
@@ -22,6 +20,78 @@ struct Scaffold
 
     # Intervals
     features::IntervalMeta64
+end
+
+struct ParseResult
+    scaffold_id::String
+    start_pos::UInt32
+    end_pos::UInt32
+    code::UInt64
+    id::String
+    source::String
+    biotype::String
+end
+
+"""
+This type is the top level of organization 
+for an in-memory repressentation of a genome.
+
+At the time of writing it has the following components:
+- `vocab`/`vocab_lookup`: The vocabulary and lookup for string interning extended metadata
+- `meta_offsets`/`meta_blobs`: The stored offsets and actual metadata byte blobs
+
+## Metadata handling
+The metadata for each feature is stored using the 64-bit 'code' and the byte ([`UInt8`](@ref)) blob.
+The first 32 bits contains parseable metadata (currently strand and SO term, 8 bits still unused)
+while the second 32 bits are an index into the `meta_offsets` vector which gives the offset into the
+byte blob for that feature.
+"""
+mutable struct Genome
+    scaffolds::Dict{String,Scaffold}
+
+    # String intern pool
+    vocab::Vector{String}
+    vocab_lookup::Dict{String,UInt32}
+
+    # Metadata store
+    meta_offsets::Vector{UInt32}
+    meta_blob::Vector{UInt8}
+end
+
+"""
+A single annotated feature looked up from a `Genome`:
+- `id`: the ID the feature was searched by (first metadata field)
+- `feature_type`: the SO term label (e.g. `:gene`)
+- `chromosome`: the scaffold name the feature lives on
+- `start_pos` / `end_pos`: 1-based closed interval bounds
+- `metadata`: the parsed metadata stored for the feature (ID, source, biotype)
+"""
+struct FeatureRecord
+    id::String
+    feature_type::Symbol
+    chromosome::String
+    start_pos::UInt32
+    end_pos::UInt32
+    metadata::Vector{String}
+end
+
+mutable struct Species
+    name::String
+    taxon_id::String
+    genome::Genome
+end
+
+function Species(name::String; taxon_id::String = "")
+    genome =
+        Genome(Dict{String,Scaffold}(), String[], Dict{String,UInt32}(), UInt32[], UInt8[])
+    return Species(name, taxon_id, genome)
+end
+
+function get_strand(strand::Char)
+  strand == '+' && return GFF3.GenomicFeatures.STRAND_POS
+  strand == '-' && return GFF3.GenomicFeatures.STRAND_NEG
+  strand == '.' && return GFF3.GenomicFeatures.STRAND_BOTH
+  return GFF3.GenomicFeatures.STRAND_NA
 end
 
 function convert_strand(strand::GFF3.GenomicFeatures.Strand)
@@ -76,16 +146,6 @@ end
 
 function parse_so_term(code::UInt64)
     return UInt16(code >> (32 + 8)) & 0xFFFF
-end
-
-struct ParseResult
-    scaffold_id::String
-    start_pos::UInt32
-    end_pos::UInt32
-    code::UInt64
-    id::String
-    source::String
-    biotype::String
 end
 
 """
@@ -144,32 +204,6 @@ function parse_record(
         feature_source,
         gene_biotype,
     )
-end
-
-"""
-This type is the top level of organization 
-for an in-memory repressentation of a genome.
-
-At the time of writing it has the following components:
-- `vocab`/`vocab_lookup`: The vocabulary and lookup for string interning extended metadata
-- `meta_offsets`/`meta_blobs`: The stored offsets and actual metadata byte blobs
-
-## Metadata handling
-The metadata for each feature is stored using the 64-bit 'code' and the byte ([`UInt8`](@ref)) blob.
-The first 32 bits contains parseable metadata (currently strand and SO term, 8 bits still unused)
-while the second 32 bits are an index into the `meta_offsets` vector which gives the offset into the
-byte blob for that feature.
-"""
-mutable struct Genome
-    scaffolds::Dict{String,Scaffold}
-
-    # String intern pool
-    vocab::Vector{String}
-    vocab_lookup::Dict{String,UInt32}
-
-    # Metadata store
-    meta_offsets::Vector{UInt32}
-    meta_blob::Vector{UInt8}
 end
 
 function get_metadata(genome::Genome, meta_index::UInt32)
@@ -284,23 +318,6 @@ function get_so_terms(genome::Genome)
     return sort!(collect(terms))
 end
 
-"""
-A single annotated feature looked up from a `Genome`:
-- `id`: the ID the feature was searched by (first metadata field)
-- `feature_type`: the SO term label (e.g. `:gene`)
-- `chromosome`: the scaffold name the feature lives on
-- `start_pos` / `end_pos`: 1-based closed interval bounds
-- `metadata`: the parsed metadata stored for the feature (ID, source, biotype)
-"""
-struct FeatureRecord
-    id::String
-    feature_type::Symbol
-    chromosome::String
-    start_pos::UInt32
-    end_pos::UInt32
-    metadata::Vector{String}
-end
-
 # Build a FeatureRecord from a scaffold name and one of its interval entries.
 function _feature_record(
     genome::Genome,
@@ -384,18 +401,6 @@ function Base.show(io::IO, f::FeatureRecord)
         io,
         "FeatureRecord(\"$(f.id)\", $(f.feature_type), $(f.chromosome):$(f.start_pos)-$(f.end_pos), metadata=$(f.metadata))",
     )
-end
-
-mutable struct Species
-    name::String
-    taxon_id::String
-    genome::Genome
-end
-
-function Species(name::String; taxon_id::String = "")
-    genome =
-        Genome(Dict{String,Scaffold}(), String[], Dict{String,UInt32}(), UInt32[], UInt8[])
-    return Species(name, taxon_id, genome)
 end
 
 # Interns `s` into the genome's vocab, returning its 1-based UInt32 token.
@@ -523,6 +528,7 @@ export Species,
     add_features!,
     get_metadata,
     get_feature,
-    get_so_terms
+    get_so_terms,
+    get_strand
 
 end

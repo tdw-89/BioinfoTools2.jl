@@ -2,6 +2,7 @@ module Data
 
 using BED
 using BioGenerics
+using CSV
 using CodecZlib
 using DataFrames
 using Dates
@@ -10,16 +11,174 @@ using IntervalTrees
 using SparseArrays
 using ..Reference
 
-mutable struct BedData
-    scaffolds::Dict{String,IntervalMeta64}
+using Base: ImmutableDict
 
+"""
+Interval tree type for BED data. Consists of a single sample's measurements,
+associated with the `genome` the intervals are defined against.
+"""
+struct BedData
+    genome::Genome
+    scaffolds::Dict{String,IntervalMeta64}
 end
 
-mutable struct TabularData{T}
+"""
+Tabular data type. Consists of a matrix of numeric values from an arbitrary
+number of samples, associated with the `genome` its samples are matched against.
+"""
+struct TabularData{T<:Number}
+    genome::Genome
     variables::Vector{AbstractString}
     samples::Vector{Union{Nothing,Tuple{String,UInt32}}}
     table::Matrix{T}
 end
+
+"""
+A variable in an experiment.
+Either it points to a set of covariates (child nodes) or contains data (leaf node). 
+The `value` of the variable is really the name of the incoming edge.
+"""
+struct Variable{T<:Number}
+    value::AbstractString
+    covariates::Union{Nothing, ImmutableDict{String, Variable{T}}}
+    data::Union{Nothing, TabularData{T}, BedData}
+
+    function Variable{T}(
+        value::AbstractString,
+        covariates::Union{Nothing, ImmutableDict{String, Variable{T}}},
+        data::Union{Nothing, TabularData{T}, BedData},
+    ) where {T<:Number}
+        only_one = isnothing(covariates) ⊻ isnothing(data)
+        if !only_one
+            throw(ArgumentError("Exactly one of `covariates` or `data` must be provided."))
+        end
+        new{T}(value, covariates, data)
+    end
+end
+
+# Recursively assemble the variable trie for an `Experiment`.
+#
+# `entries` pairs each sample's ordered variable-column values with its loaded
+# data. `depth` is the 1-based variable column currently being grouped and
+# `nvars` the total number of variable columns. Samples are grouped by their
+# value at `depth` (first-seen order preserved); at the final column each group
+# is a single validated sample and becomes a leaf `Variable` holding data,
+# otherwise the group is recursed into to build that node's covariates.
+function _build_variables(
+    ::Type{T},
+    entries::Vector{Tuple{Vector{String},D}},
+    depth::Int,
+    nvars::Int,
+) where {T<:Number,D}
+    variables = ImmutableDict{String,Variable{T}}()
+    order = String[]
+    groups = Dict{String,Vector{Tuple{Vector{String},D}}}()
+    for entry in entries
+        key = entry[1][depth]
+        haskey(groups, key) || push!(order, key)
+        push!(get!(() -> Tuple{Vector{String},D}[], groups, key), entry)
+    end
+
+    for key in order
+        group = groups[key]
+        node = if depth == nvars
+            # A validated sample sheet guarantees one sample per leaf path.
+            Variable{T}(key, nothing, group[1][2])
+        else
+            Variable{T}(key, _build_variables(T, group, depth + 1, nvars), nothing)
+        end
+        variables = ImmutableDict(variables, key => node)
+    end
+
+    return variables
+end
+
+# Load a single sample's data file, choosing the representation from the file
+# extension: anything ending in `.bed` becomes `BedData`, everything else is
+# read as a table and matched against `genome` as `TabularData{T}` (its numeric
+# columns coerced to `T`). `feature` is the SO term the tabular sample IDs are
+# matched on.
+function _load_sample(
+    ::Type{T},
+    genome::Genome,
+    path::AbstractString,
+    feature::Union{AbstractString,Symbol},
+) where {T<:Number}
+    endswith(lowercase(String(path)), ".bed") && return load_bed(genome, String(path))
+
+    df = CSV.read(path, DataFrame)
+    for col in names(df)[2:end]
+        df[!, col] = convert.(T, df[!, col])
+    end
+    tab = load_table(genome, df, feature)
+    tab === nothing && throw(ArgumentError("Could not load tabular data from \"$path\"."))
+    return tab
+end
+
+"""
+Tree of experimental `Variable`s built from a `sample_sheet`, all associated
+with `genome`.
+
+The last column of `sample_sheet` must hold a path to each sample's data file;
+every preceding column is treated as a categorical variable. Rows are organized
+into a trie keyed by successive variable values, with each leaf holding the data
+loaded from that sample's file. The data representation is chosen by file
+extension: paths ending in `.bed` load as `BedData`, everything else loads as
+`TabularData{T}` (numeric columns coerced to `T`, sample IDs matched on
+`feature`). `T` defaults to `Float64`.
+"""
+struct Experiment{T<:Number}
+    variables::ImmutableDict{String, Variable{T}}
+
+    function Experiment{T}(
+        genome::Genome,
+        sample_sheet::DataFrame;
+        feature::Union{AbstractString,Symbol} = :gene,
+    ) where {T<:Number}
+        ncols = ncol(sample_sheet)
+        ncols >= 2 || throw(
+            ArgumentError(
+                "Sample sheet needs at least one variable column plus a file column.",
+            ),
+        )
+        nvars = ncols - 1
+
+        # 1. Every data file must be unique, and the variable columns must
+        #    identify each sample uniquely (no duplicate variable-value paths).
+        data_paths = sample_sheet[!, end]
+        allunique(data_paths) ||
+            throw(ArgumentError("File paths in the last column must be unique."))
+        allunique(Tuple(row) for row in eachrow(sample_sheet[!, 1:nvars])) || throw(
+            ArgumentError(
+                "Each row must have a unique combination of variable-column values.",
+            ),
+        )
+
+        # 2. Every purported file must exist.
+        all(isfile, data_paths) || throw(
+            ArgumentError(
+                "All paths in the last column of the sample sheet must be valid file paths.",
+            ),
+        )
+
+        # 3. Load each sample's data concurrently (representation inferred from
+        #    the file extension), pairing it with that row's variable values
+        #    (kept as strings regardless of the column type).
+        D = Union{TabularData{T},BedData}
+        tasks = map(eachrow(sample_sheet)) do row
+            path = String(row[end])
+            values = String[string(row[c]) for c = 1:nvars]
+            Threads.@spawn (values, _load_sample(T, genome, path, feature))
+        end
+        entries = Tuple{Vector{String},D}[fetch(task) for task in tasks]
+
+        # 4. Fold the loaded samples into the immutable variable trie.
+        return new{T}(_build_variables(T, entries, 1, nvars))
+    end
+end
+
+Experiment(genome::Genome, sample_sheet::DataFrame; kwargs...) =
+    Experiment{Float64}(genome, sample_sheet; kwargs...)
 
 #= Methods =#
 
@@ -88,7 +247,7 @@ function load_table(genome::Genome, data_frame::DataFrame, feature::Union{String
     variables = Vector{AbstractString}(names(data_frame)[2:end])
     table = Matrix(data_frame[!, 2:end])
 
-    return TabularData(variables, samples, table)
+    return TabularData(genome, variables, samples, table)
 end
 
 #= TabularData indexing =#
@@ -106,16 +265,16 @@ end
 
 """
 Look up a single sample by its (putative) ID string. Every sample's ID is
-resolved from `genome` and compared to `id`; the first match is returned as a
-one-row `TabularData`. Returns `nothing` when no sample matches.
+resolved from the table's own genome and compared to `id`; the first match is
+returned as a one-row `TabularData`. Returns `nothing` when no sample matches.
 
 This is intentionally O(samples) per lookup (it resolves each sample's ID on
 demand) rather than maintaining an ID index.
 """
-function Base.getindex(t::TabularData, genome::Genome, id::AbstractString)
+function Base.getindex(t::TabularData, id::AbstractString)
     for (row, sample) in enumerate(t.samples)
-        if sample_id(genome, sample) == id
-            return TabularData(copy(t.variables), t.samples[row:row], t.table[row:row, :])
+        if sample_id(t.genome, sample) == id
+            return TabularData(t.genome, copy(t.variables), t.samples[row:row], t.table[row:row, :])
         end
     end
     return nothing
@@ -127,25 +286,26 @@ Look up every sample whose (putative) ID is contained in `ids`, returning a
 rows). IDs with no matching sample are silently skipped; row order follows the
 original table.
 """
-function Base.getindex(
-    t::TabularData,
-    genome::Genome,
-    ids::AbstractVector{<:AbstractString},
-)
+function Base.getindex(t::TabularData, ids::AbstractVector{<:AbstractString})
     wanted = Set{String}(ids)
     rows = Int[]
     for (row, sample) in enumerate(t.samples)
-        sid = sample_id(genome, sample)
+        sid = sample_id(t.genome, sample)
         if !isnothing(sid) && sid in wanted
             push!(rows, row)
         end
     end
-    return TabularData(copy(t.variables), t.samples[rows], t.table[rows, :])
+    return TabularData(t.genome, copy(t.variables), t.samples[rows], t.table[rows, :])
 end
 
-function Base.getindex(
+"""
+Select a subset of a `TabularData`'s variables (columns) by name, returning a
+new `TabularData` restricted to the matching variables (or `nothing` when none
+of the requested variables are present).
+"""
+function DataFrames.select(
     t::TabularData,
-    variables::Union{AbstractString, Vector{AbstractString}}
+    variables::Union{AbstractString, AbstractVector{<:AbstractString}}
 )::Union{Nothing, TabularData}
     variables = variables isa AbstractString ? [variables] : variables
     if variables ∩ t.variables |> isempty
@@ -153,19 +313,19 @@ function Base.getindex(
     end
 
     var_indices = findall(v -> v in variables, t.variables)
-    return TabularData(t.variables[var_indices], t.samples, t.table[:, var_indices])
+    return TabularData(t.genome, t.variables[var_indices], t.samples, t.table[:, var_indices])
 end
 
 """
 Convert a `TabularData` back into a `DataFrame`. The first column, `ID`, holds
-the ID that each sample's metadata index points to (resolved from `genome`;
-unmatched samples become `missing`), followed by one column per entry in
-`variables` carrying the corresponding `table` column.
+the ID that each sample's metadata index points to (resolved from the table's
+own genome; unmatched samples become `missing`), followed by one column per
+entry in `variables` carrying the corresponding `table` column.
 """
-function DataFrames.DataFrame(t::TabularData, genome::Genome)
+function DataFrames.DataFrame(t::TabularData)
     df = DataFrame()
     df[!, :ID] =
-        Union{Missing,String}[something(sample_id(genome, s), missing) for s in t.samples]
+        Union{Missing,String}[something(sample_id(t.genome, s), missing) for s in t.samples]
     for (j, variable) in enumerate(t.variables)
         df[!, string(variable)] = t.table[:, j]
     end
@@ -207,7 +367,7 @@ function bed_record_strand(record::BED.Record)
     end
 end
 
-function load_bed(file_path::String)
+function load_bed(genome::Genome, file_path::String)
     scaffolds = Dict{String,IntervalMeta64}()
 
     open(file_path) do fh
@@ -242,7 +402,7 @@ function load_bed(file_path::String)
         end
     end
 
-    return BedData(scaffolds)
+    return BedData(genome, scaffolds)
 end
 
 """

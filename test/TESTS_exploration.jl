@@ -113,6 +113,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         # A BedData whose single interval blankets the whole scaffold, so every
         # gene is fully covered (fraction 1.0).
         bed_full = BedData(
+            sp.genome,
             Dict(
                 "NC_003280.10" => let t = IntervalMeta64()
                     push!(t, IntervalValue(UInt32(1), UInt32(100_000_000), UInt64(0)))
@@ -124,6 +125,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         # A BedData on the right scaffold whose interval sits past every feature,
         # so nothing overlaps and all fractions are 0.0.
         bed_empty = BedData(
+            sp.genome,
             Dict(
                 "NC_003280.10" => let t = IntervalMeta64()
                     push!(
@@ -136,7 +138,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         )
 
         # A BedData whose only scaffold name has no counterpart in the genome.
-        bed_no_match = BedData(Dict("NOMATCH" => IntervalMeta64()))
+        bed_no_match = BedData(sp.genome, Dict("NOMATCH" => IntervalMeta64()))
 
         @testset "coverage" begin
             @testset "full coverage → gene fractions are 1.0" begin

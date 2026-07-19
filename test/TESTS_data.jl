@@ -12,6 +12,10 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
 @testset "Data" begin
 
+    # Empty genome shared by BedData / load_bed cases that don't need real
+    # features (the genome reference is only used for downstream ID lookups).
+    test_genome = Species("test").genome
+
     # -------------------------------------------------------------------------
     @testset "pack_bed_code / parse_bed_strand roundtrip" begin
         @test Data.parse_bed_strand(Data.pack_bed_code(UInt8(0))) == UInt8(0)
@@ -25,7 +29,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
     # -------------------------------------------------------------------------
     @testset "load_bed - micro.narrowPeak (8 records, 1 scaffold)" begin
-        bd = load_bed(MICRO_NARROWPEAK)
+        bd = load_bed(test_genome, MICRO_NARROWPEAK)
 
         @test bd isa Data.BedData
         @test length(bd.scaffolds) == 1
@@ -36,7 +40,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
     # -------------------------------------------------------------------------
     @testset "load_bed - strand encoding in micro.narrowPeak" begin
         # All 8 records in micro.narrowPeak have strand '.' → UInt8(0)
-        bd = load_bed(MICRO_NARROWPEAK)
+        bd = load_bed(test_genome, MICRO_NARROWPEAK)
 
         for (_, tree) in bd.scaffolds
             for iv in tree
@@ -49,7 +53,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
     @testset "load_bed - coordinate conversion in micro.narrowPeak" begin
         # BED is 0-based half-open; BED.jl should convert to 1-based closed.
         # First record: chromStart=4, chromEnd=1609 → start=5, end=1609
-        bd = load_bed(MICRO_NARROWPEAK)
+        bd = load_bed(test_genome, MICRO_NARROWPEAK)
         tree = bd.scaffolds["DDB0215018"]
 
         starts = sort([iv.first for iv in tree])
@@ -61,7 +65,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
     # -------------------------------------------------------------------------
     @testset "load_bed - BED (3 + 3)" begin
-        bd = load_bed(MICRO_BED)
+        bd = load_bed(test_genome, MICRO_BED)
         tree = bd.scaffolds["DDB0215018"]
 
         starts = sort([iv.first for iv in tree])
@@ -73,7 +77,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
     # -------------------------------------------------------------------------
     @testset "load_bed - full.narrowPeak (4448 records total)" begin
-        bd = load_bed(FULL_NARROWPEAK)
+        bd = load_bed(test_genome, FULL_NARROWPEAK)
 
         @test bd isa BedData
         @test !isempty(bd.scaffolds)
@@ -94,11 +98,11 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         bed_nc = let
             tree = IntervalMeta64()
             push!(tree, IntervalValue(UInt32(1), UInt32(100_000_000), UInt64(0)))
-            BedData(Dict("NC_003280.10" => tree))
+            BedData(sp.genome, Dict("NC_003280.10" => tree))
         end
 
         # BedData with a scaffold name that has no match in sp.genome.
-        bed_no_match = BedData(Dict("NOMATCH" => IntervalMeta64()))
+        bed_no_match = BedData(sp.genome, Dict("NOMATCH" => IntervalMeta64()))
 
         # -----------------------------------------------------------------------
         @testset "intersect(IntervalMeta64, IntervalMeta64) – overlap" begin
@@ -227,8 +231,8 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         end
 
         # --- Single-string lookup --------------------------------------------
-        @testset "getindex(genome, String) – match returns 1-row TabularData" begin
-            one = tab[sp.genome, gene_ids[2]]
+        @testset "getindex(String) – match returns 1-row TabularData" begin
+            one = tab[gene_ids[2]]
             @test one isa TabularData
             @test size(one.table) == (1, 2)
             @test one.table == [20.0 21.0]
@@ -237,18 +241,18 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             @test Data.sample_id(sp.genome, one.samples[1]) == gene_ids[2]
         end
 
-        @testset "getindex(genome, String) – no match returns nothing" begin
+        @testset "getindex(String) – no match returns nothing" begin
             # "NO_SUCH_ID" is present in the table but never matched a feature,
             # so its sample slot is `nothing` and cannot be looked up.
-            @test isnothing(tab[sp.genome, "NO_SUCH_ID"])
-            @test isnothing(tab[sp.genome, "totally_absent_id"])
+            @test isnothing(tab["NO_SUCH_ID"])
+            @test isnothing(tab["totally_absent_id"])
         end
 
         # --- Vector-of-strings lookup ----------------------------------------
-        @testset "getindex(genome, Vector{String}) – subset, skipping misses" begin
+        @testset "getindex(Vector{String}) – subset, skipping misses" begin
             # Query order is deliberately scrambled and includes an absent ID;
             # the result must follow the original table's row order.
-            sub = tab[sp.genome, [gene_ids[3], "absent_id", gene_ids[1]]]
+            sub = tab[[gene_ids[3], "absent_id", gene_ids[1]]]
             @test sub isa TabularData
             @test size(sub.table) == (2, 2)
             @test sub.table == [10.0 11.0; 30.0 31.0]
@@ -257,17 +261,33 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             @test Data.sample_id(sp.genome, sub.samples[2]) == gene_ids[3]
         end
 
-        @testset "getindex(genome, Vector{String}) – no matches → empty sub-table" begin
-            sub = tab[sp.genome, ["nope_1", "nope_2"]]
+        @testset "getindex(Vector{String}) – no matches → empty sub-table" begin
+            sub = tab[["nope_1", "nope_2"]]
             @test sub isa TabularData
             @test size(sub.table) == (0, 2)
             @test isempty(sub.samples)
             @test sub.variables == tab.variables
         end
 
+        # --- Variable selection ----------------------------------------------
+        @testset "select – subset of variables (columns)" begin
+            one = select(tab, "v1")
+            @test one isa TabularData
+            @test one.variables == ["v1"]
+            @test one.table == reshape([10.0, 20.0, 30.0, 40.0], 4, 1)
+            @test one.samples == tab.samples
+
+            both = select(tab, ["v2", "v1"])
+            @test both isa TabularData
+            @test Set(both.variables) == Set(["v1", "v2"])
+
+            # No requested variable is present → nothing.
+            @test isnothing(select(tab, "not_a_variable"))
+        end
+
         # --- DataFrame conversion --------------------------------------------
-        @testset "DataFrame(tab, genome) – columns, names and values" begin
-            out = DataFrame(tab, sp.genome)
+        @testset "DataFrame(tab) – columns, names and values" begin
+            out = DataFrame(tab)
             @test names(out) == ["ID", "v1", "v2"]
             @test nrow(out) == 4
             @test out.ID[1:3] == gene_ids
@@ -275,8 +295,8 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             @test out.v2 == [11.0, 21.0, 31.0, 41.0]
         end
 
-        @testset "DataFrame(tab, genome) – unmatched sample becomes missing" begin
-            out = DataFrame(tab, sp.genome)
+        @testset "DataFrame(tab) – unmatched sample becomes missing" begin
+            out = DataFrame(tab)
             @test eltype(out.ID) == Union{Missing,String}
             @test ismissing(out.ID[4])
             @test count(ismissing, out.ID) == 1
@@ -295,7 +315,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
                 end
                 scaffolds[name] = tree
             end
-            BedData(scaffolds)
+            BedData(test_genome, scaffolds)
         end
 
         @testset "per-base counts across measurements (UInt8)" begin
@@ -429,4 +449,105 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             @test_throws ArgumentError Data.leftjoin(left, right, :not_valid)
         end
     end  # leftjoin
+
+    # =========================================================================
+    @testset "Variable (standalone)" begin
+        # A leaf holds data and no covariates.
+        leaf_bed = load_bed(test_genome, MICRO_BED)
+        leaf = Data.Variable{Float64}("Brain", nothing, leaf_bed)
+        @test leaf.value == "Brain"
+        @test leaf.covariates === nothing
+        @test leaf.data === leaf_bed
+
+        # An internal node holds covariates and no data.
+        covs = Base.ImmutableDict("Brain" => leaf)
+        node = Data.Variable{Float64}("Tissue", covs, nothing)
+        @test node.value == "Tissue"
+        @test node.data === nothing
+        @test node.covariates === covs
+        @test node.covariates["Brain"] === leaf
+
+        # Exactly one of `covariates` / `data` must be supplied.
+        @test_throws ArgumentError Data.Variable{Float64}("bad", covs, leaf_bed)
+        @test_throws ArgumentError Data.Variable{Float64}("bad", nothing, nothing)
+    end
+
+    # =========================================================================
+    @testset "Experiment (standalone)" begin
+        @testset "BED samples (dispatched by .bed extension)" begin
+            dir = mktempdir()
+            f1 = joinpath(dir, "s1.bed")
+            f2 = joinpath(dir, "s2.bed")
+            cp(MICRO_BED, f1)
+            cp(MICRO_BED, f2)
+
+            sheet = DataFrame(treatment = ["ctrl", "drug"], file = [f1, f2])
+            exp = Data.Experiment(test_genome, sheet)
+
+            @test exp isa Data.Experiment{Float64}
+            @test Set(keys(exp.variables)) == Set(["ctrl", "drug"])
+            for key in ("ctrl", "drug")
+                v = exp.variables[key]
+                @test v.value == key
+                @test v.covariates === nothing
+                @test v.data isa BedData
+                @test v.data.genome === test_genome
+            end
+        end
+
+        @testset "tabular samples (non-.bed extension)" begin
+            sp = Species("C. elegans")
+            add_features!(ST_GFF_SINGLE, sp.genome)
+            scaffold = sp.genome.scaffolds["NC_003280.10"]
+
+            gene_ids = String[]
+            for iv in get_feature(scaffold, :gene)
+                gid = Reference.get_metadata_id(sp.genome, Reference.parse_index(iv.value))
+                gid !== nothing && push!(gene_ids, gid)
+                length(gene_ids) >= 4 && break
+            end
+            @test length(gene_ids) == 4
+
+            dir = mktempdir()
+            path = joinpath(dir, "expr.csv")
+            open(path, "w") do io
+                println(io, "sample,v1,v2")
+                for (i, gid) in enumerate(gene_ids)
+                    println(io, "$gid,$i,$i")
+                end
+            end
+
+            sheet = DataFrame(condition = ["wt"], file = [path])
+            exp = Data.Experiment(sp.genome, sheet; feature = :gene)
+
+            v = exp.variables["wt"]
+            @test v.covariates === nothing
+            @test v.data isa TabularData{Float64}
+            @test v.data.genome === sp.genome
+        end
+
+        @testset "validation errors" begin
+            dir = mktempdir()
+            f1 = joinpath(dir, "a.bed")
+            f2 = joinpath(dir, "b.bed")
+            cp(MICRO_BED, f1)
+            cp(MICRO_BED, f2)
+
+            # Duplicate file paths in the last column.
+            dup_files = DataFrame(t = ["x", "y"], file = [f1, f1])
+            @test_throws ArgumentError Data.Experiment(test_genome, dup_files)
+
+            # Duplicate variable-value rows.
+            dup_rows = DataFrame(t = ["x", "x"], file = [f1, f2])
+            @test_throws ArgumentError Data.Experiment(test_genome, dup_rows)
+
+            # A path that does not point to an existing file.
+            missing_file = DataFrame(t = ["x"], file = [joinpath(dir, "nope.bed")])
+            @test_throws ArgumentError Data.Experiment(test_genome, missing_file)
+
+            # No variable column (need at least one variable + one file column).
+            one_col = DataFrame(file = [f1])
+            @test_throws ArgumentError Data.Experiment(test_genome, one_col)
+        end
+    end
 end
