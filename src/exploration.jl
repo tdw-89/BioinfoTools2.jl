@@ -83,6 +83,19 @@ function kde(
     return coverage_kde
 end
 
+function kde(
+    data::TabularData;
+    filter_zeros::Bool = false,
+    transform::Function = identity
+)
+    flat = data.table |> vec |> xs -> map(transform, xs)
+    if filter_zeros
+        flat = filter(x -> x != 0, flat)
+    end
+    flat = filter(x -> !isnan(x) && isfinite(x), flat)
+    return isempty(flat) ? nothing : KernelDensity.kde(flat)
+end
+
 # Assign `value` to a 1-based bin in `1:quantiles` given the sorted quantile
 # `edges` (length `quantiles + 1`). Values landing on an edge fall into the
 # lower bin; anything at or above the top edge lands in the last bin.

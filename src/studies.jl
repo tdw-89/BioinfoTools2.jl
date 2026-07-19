@@ -178,6 +178,19 @@ function Base.getindex(
     return TabularData(copy(t.variables), t.samples[rows], t.table[rows, :])
 end
 
+function Base.getindex(
+    t::TabularData,
+    variables::Union{AbstractString, Vector{AbstractString}}
+)::Union{Nothing, TabularData}
+    variables = variables isa AbstractString ? [variables] : variables
+    if variables ∩ t.variables |> isempty
+        return nothing
+    end
+
+    var_indices = findall(v -> v in variables, t.variables)
+    return TabularData(t.variables[var_indices], t.samples, t.table[:, var_indices])
+end
+
 """
 Convert a `TabularData` back into a `DataFrame`. The first column, `ID`, holds
 the ID that each sample's metadata index points to (resolved from `genome`;
