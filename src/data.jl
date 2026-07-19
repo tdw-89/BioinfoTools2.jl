@@ -1,4 +1,4 @@
-module Studies
+module Data
 
 using BED
 using BioGenerics
@@ -19,41 +19,6 @@ mutable struct TabularData{T}
     variables::Vector{AbstractString}
     samples::Vector{Union{Nothing,Tuple{String,UInt32}}}
     table::Matrix{T}
-end
-
-const Data = Union{BedData,TabularData}
-
-mutable struct BioSample
-    sample_id::String
-    tissue_type::String
-    species::Species
-end
-
-mutable struct AssayMethod
-    name::String
-    description::String
-end
-
-mutable struct Measurement
-    file_path::String
-    format::String
-    data::Data
-end
-
-mutable struct Assay
-    id::String
-    type::String
-    description::String
-    measurement::Measurement
-    biosample::BioSample
-    method::AssayMethod
-end
-
-mutable struct Study
-    id::String
-    title::String
-    date::Date
-    assays::Vector{Assay}
 end
 
 #= Methods =#
@@ -525,38 +490,8 @@ function Base.show(io::IO, t::TabularData)
     print(io, "TabularData($(r)×$(c) $(eltype(t.table)))")
 end
 
-function Base.show(io::IO, b::BioSample)
-    print(
-        io,
-        "BioSample(\"$(b.sample_id)\", tissue=$(b.tissue_type), species=\"$(b.species.name)\")",
-    )
-end
-
-Base.show(io::IO, a::AssayMethod) = print(io, "AssayMethod(\"$(a.name)\")")
-
-function Base.show(io::IO, m::Measurement)
-    print(io, "Measurement(\"$(basename(m.file_path))\", format=$(m.format))")
-end
-
-function Base.show(io::IO, a::Assay)
-    print(io, "Assay(\"$(a.id)\", type=$(a.type))")
-end
-
-function Base.show(io::IO, s::Study)
-    n = length(s.assays)
-    print(
-        io,
-        "Study(\"$(s.id)\", \"$(s.title)\", $(s.date), $(n) assay$(n == 1 ? "" : "s"))",
-    )
-end
-
-export Study,
-    Assay,
-    AssayMethod,
-    Measurement,
-    BioSample,
+export
     BedData,
-    Data,
     TabularData,
     intersect,
     leftjoin,

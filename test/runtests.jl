@@ -5,6 +5,6 @@ using Test
     include("TESTS_sofa_lookup.jl")
     include("TESTS_paralogs.jl")
     include("TESTS_reference.jl")
-    include("TESTS_studies.jl")
-    include("TEST_exploration.jl")
+    include("TESTS_data.jl")
+    include("TESTS_exploration.jl")
 end

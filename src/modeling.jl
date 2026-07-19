@@ -6,6 +6,6 @@ using MultipleTesting
 using StatsBase
 
 using ..Reference
-using ..Studies
+using ..Data
 
 end

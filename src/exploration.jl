@@ -5,7 +5,7 @@ using KernelDensity
 using StatsBase
 
 using ..Reference
-using ..Studies
+using ..Data
 
 """
     coverage(genome, feature, data::BedData; filter_zeros = false)
@@ -26,7 +26,7 @@ function coverage(
     filter_zeros::Bool = false,
 )::Dict{String,Vector{Float64}}
 
-    intersection = Studies.intersect(genome, data, feature)
+    intersection = Data.intersect(genome, data, feature)
     scaffolds = Dict{String,Vector{Float64}}()
     for (scaffold_name, scaffold) in genome.scaffolds
         if !haskey(intersection, scaffold_name)

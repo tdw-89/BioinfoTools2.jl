@@ -1,4 +1,4 @@
-using BioinfoTools2.Studies
+using BioinfoTools2.Data
 using BioinfoTools2.Reference
 using DataFrames
 using IntervalTrees
@@ -10,24 +10,24 @@ const MICRO_NARROWPEAK = joinpath(ST_DATA_DIR, "micro.narrowPeak")
 const FULL_NARROWPEAK = joinpath(ST_DATA_DIR, "full.narrowPeak")
 const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
-@testset "Studies" begin
+@testset "Data" begin
 
     # -------------------------------------------------------------------------
     @testset "pack_bed_code / parse_bed_strand roundtrip" begin
-        @test Studies.parse_bed_strand(Studies.pack_bed_code(UInt8(0))) == UInt8(0)
-        @test Studies.parse_bed_strand(Studies.pack_bed_code(UInt8(1))) == UInt8(1)
-        @test Studies.parse_bed_strand(Studies.pack_bed_code(UInt8(2))) == UInt8(2)
+        @test Data.parse_bed_strand(Data.pack_bed_code(UInt8(0))) == UInt8(0)
+        @test Data.parse_bed_strand(Data.pack_bed_code(UInt8(1))) == UInt8(1)
+        @test Data.parse_bed_strand(Data.pack_bed_code(UInt8(2))) == UInt8(2)
 
         # Only bits 33-40 should be set; all other bits must remain zero
-        @test (Studies.pack_bed_code(UInt8(1)) & ~(UInt64(0xFF) << 32)) == UInt64(0)
-        @test (Studies.pack_bed_code(UInt8(2)) & ~(UInt64(0xFF) << 32)) == UInt64(0)
+        @test (Data.pack_bed_code(UInt8(1)) & ~(UInt64(0xFF) << 32)) == UInt64(0)
+        @test (Data.pack_bed_code(UInt8(2)) & ~(UInt64(0xFF) << 32)) == UInt64(0)
     end
 
     # -------------------------------------------------------------------------
     @testset "load_bed - micro.narrowPeak (8 records, 1 scaffold)" begin
         bd = load_bed(MICRO_NARROWPEAK)
 
-        @test bd isa BedData
+        @test bd isa Data.BedData
         @test length(bd.scaffolds) == 1
         @test haskey(bd.scaffolds, "DDB0215018")
         @test length(bd.scaffolds["DDB0215018"]) == 8
@@ -40,7 +40,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
         for (_, tree) in bd.scaffolds
             for iv in tree
-                @test Studies.parse_bed_strand(iv.value) == UInt8(0)
+                @test Data.parse_bed_strand(iv.value) == UInt8(0)
             end
         end
     end
@@ -108,7 +108,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             tree_b = IntervalMeta64()
             push!(tree_b, IntervalValue(UInt32(30), UInt32(100), UInt64(0)))
 
-            result = Studies.intersect(tree_a, tree_b)
+            result = Data.intersect(tree_a, tree_b)
             ivs = collect(result)
             @test length(ivs) == 1
             @test ivs[1].first == UInt32(30)
@@ -121,33 +121,33 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             push!(tree_a, IntervalValue(UInt32(1), UInt32(10), UInt64(0)))
             tree_b = IntervalMeta64()
             push!(tree_b, IntervalValue(UInt32(20), UInt32(30), UInt64(0)))
-            @test isempty(Studies.intersect(tree_a, tree_b))
+            @test isempty(Data.intersect(tree_a, tree_b))
         end
 
         @testset "intersect(IntervalMeta64, IntervalMeta64) – both empty" begin
-            @test isempty(Studies.intersect(IntervalMeta64(), IntervalMeta64()))
+            @test isempty(Data.intersect(IntervalMeta64(), IntervalMeta64()))
         end
 
         # -----------------------------------------------------------------------
         @testset "intersect(Scaffold, BedData) – scaffold not in BedData" begin
-            @test isnothing(Studies.intersect(scaffold_nc, bed_no_match))
+            @test isnothing(Data.intersect(scaffold_nc, bed_no_match))
         end
 
         @testset "intersect(Scaffold, BedData) – scaffold matches" begin
-            result = Studies.intersect(scaffold_nc, bed_nc)
+            result = Data.intersect(scaffold_nc, bed_nc)
             @test !isnothing(result)
             @test !isempty(result)
         end
 
         # -----------------------------------------------------------------------
         @testset "intersect(Genome, BedData) – no matching scaffold" begin
-            result = Studies.intersect(sp.genome, bed_no_match)
+            result = Data.intersect(sp.genome, bed_no_match)
             @test result isa Dict
             @test isempty(result)
         end
 
         @testset "intersect(Genome, BedData) – matching scaffold" begin
-            result = Studies.intersect(sp.genome, bed_nc)
+            result = Data.intersect(sp.genome, bed_nc)
             @test result isa Dict
             @test haskey(result, "NC_003280.10")
             @test !isempty(result["NC_003280.10"])
@@ -155,35 +155,35 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
         # -----------------------------------------------------------------------
         @testset "intersect(Scaffold, BedData, feature) – scaffold not in BedData" begin
-            @test isnothing(Studies.intersect(scaffold_nc, bed_no_match, :gene))
+            @test isnothing(Data.intersect(scaffold_nc, bed_no_match, :gene))
         end
 
         @testset "intersect(Scaffold, BedData, feature) – valid feature, matching scaffold" begin
-            result = Studies.intersect(scaffold_nc, bed_nc, :gene)
+            result = Data.intersect(scaffold_nc, bed_nc, :gene)
             @test !isnothing(result)
             @test !isempty(result)
         end
 
         @testset "intersect(Scaffold, BedData, feature) – unknown feature" begin
-            @test isnothing(Studies.intersect(scaffold_nc, bed_nc, :not_a_real_so_term))
+            @test isnothing(Data.intersect(scaffold_nc, bed_nc, :not_a_real_so_term))
         end
 
         # -----------------------------------------------------------------------
         @testset "intersect(Genome, BedData, feature) – no matching scaffold" begin
-            result = Studies.intersect(sp.genome, bed_no_match, :gene)
+            result = Data.intersect(sp.genome, bed_no_match, :gene)
             @test result isa Dict
             @test isempty(result)
         end
 
         @testset "intersect(Genome, BedData, feature) – valid feature, matching scaffold" begin
-            result = Studies.intersect(sp.genome, bed_nc, :gene)
+            result = Data.intersect(sp.genome, bed_nc, :gene)
             @test result isa Dict
             @test haskey(result, "NC_003280.10")
             @test !isempty(result["NC_003280.10"])
         end
 
         @testset "intersect(Genome, BedData, feature) – unknown feature" begin
-            result = Studies.intersect(sp.genome, bed_nc, :not_a_real_so_term)
+            result = Data.intersect(sp.genome, bed_nc, :not_a_real_so_term)
             @test result isa Dict
             @test isempty(result)
         end
@@ -234,7 +234,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             @test one.table == [20.0 21.0]
             @test one.variables == tab.variables
             @test length(one.samples) == 1
-            @test Studies.sample_id(sp.genome, one.samples[1]) == gene_ids[2]
+            @test Data.sample_id(sp.genome, one.samples[1]) == gene_ids[2]
         end
 
         @testset "getindex(genome, String) – no match returns nothing" begin
@@ -253,8 +253,8 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             @test size(sub.table) == (2, 2)
             @test sub.table == [10.0 11.0; 30.0 31.0]
             @test sub.variables == tab.variables
-            @test Studies.sample_id(sp.genome, sub.samples[1]) == gene_ids[1]
-            @test Studies.sample_id(sp.genome, sub.samples[2]) == gene_ids[3]
+            @test Data.sample_id(sp.genome, sub.samples[1]) == gene_ids[1]
+            @test Data.sample_id(sp.genome, sub.samples[2]) == gene_ids[3]
         end
 
         @testset "getindex(genome, Vector{String}) – no matches → empty sub-table" begin
@@ -362,7 +362,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             # value 100 matches, 200 has no match, 300 matches twice.
             right = make_tree((11, 21, 100), (35, 45, 999), (55, 65, 300), (70, 80, 300))
 
-            pairs = Set(as_pair(p) for p in Studies.leftjoin(left, right))   # default :metadata
+            pairs = Set(as_pair(p) for p in Data.leftjoin(left, right))   # default :metadata
             @test pairs == Set([
                 ((10, 20, 100), (11, 21, 100)),
                 ((30, 40, 200), nothing),
@@ -371,7 +371,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             ])
 
             # Explicitly passing :metadata gives the same result.
-            @test Set(as_pair(p) for p in Studies.leftjoin(left, right, :metadata)) == pairs
+            @test Set(as_pair(p) for p in Data.leftjoin(left, right, :metadata)) == pairs
         end
 
         @testset "on = :start" begin
@@ -379,7 +379,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             # start 10 matches (end/value differ), start 30 has no match.
             right = make_tree((10, 99, 7), (31, 45, 8))
 
-            pairs = Set(as_pair(p) for p in Studies.leftjoin(left, right, :start))
+            pairs = Set(as_pair(p) for p in Data.leftjoin(left, right, :start))
             @test pairs == Set([((10, 20, 1), (10, 99, 7)), ((30, 45, 2), nothing)])
         end
 
@@ -388,7 +388,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             # end 50 matches (start/value differ), end 60 has no match.
             right = make_tree((5, 50, 7), (5, 61, 8))
 
-            pairs = Set(as_pair(p) for p in Studies.leftjoin(left, right, :end))
+            pairs = Set(as_pair(p) for p in Data.leftjoin(left, right, :end))
             @test pairs == Set([((10, 50, 1), (5, 50, 7)), ((30, 60, 2), nothing)])
         end
 
@@ -397,7 +397,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             # (10,20) matches on both coords; (30,40) matches only start, so drops.
             right = make_tree((10, 20, 7), (30, 41, 8))
 
-            pairs = Set(as_pair(p) for p in Studies.leftjoin(left, right, :interval))
+            pairs = Set(as_pair(p) for p in Data.leftjoin(left, right, :interval))
             @test pairs == Set([((10, 20, 1), (10, 20, 7)), ((30, 40, 2), nothing)])
         end
 
@@ -406,27 +406,27 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             # No right interval shares a value with any left interval.
             right = make_tree((10, 20, 999), (30, 40, 888))
 
-            result = collect(Studies.leftjoin(left, right, :metadata))
+            result = collect(Data.leftjoin(left, right, :metadata))
             @test length(result) == 2                       # exactly one row per left
             @test all(p -> p[2] === nothing, result)        # nothing matched
         end
 
         @testset "empty right tree pairs every left with nothing" begin
             left = make_tree((10, 20, 1), (30, 40, 2))
-            result = collect(Studies.leftjoin(left, IntervalMeta64(), :metadata))
+            result = collect(Data.leftjoin(left, IntervalMeta64(), :metadata))
             @test length(result) == 2
             @test all(p -> p[2] === nothing, result)
         end
 
         @testset "empty left tree yields no pairs" begin
             right = make_tree((10, 20, 1))
-            @test isempty(collect(Studies.leftjoin(IntervalMeta64(), right, :metadata)))
+            @test isempty(collect(Data.leftjoin(IntervalMeta64(), right, :metadata)))
         end
 
         @testset "invalid `on` throws ArgumentError" begin
             left = make_tree((10, 20, 1))
             right = make_tree((10, 20, 1))
-            @test_throws ArgumentError Studies.leftjoin(left, right, :not_valid)
+            @test_throws ArgumentError Data.leftjoin(left, right, :not_valid)
         end
     end  # leftjoin
 end

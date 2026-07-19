@@ -1,6 +1,6 @@
 using BioinfoTools2.Exploration
 using BioinfoTools2.Reference
-using BioinfoTools2.Studies
+using BioinfoTools2.Data
 using DataFrames
 using IntervalTrees
 using Test
