@@ -96,20 +96,20 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
         # BedData whose only scaffold name matches the loaded GFF scaffold.
         bed_nc = let
-            tree = IntervalMeta64()
+            tree = IntervalTreeM64()
             push!(tree, IntervalValue(UInt32(1), UInt32(100_000_000), UInt64(0)))
             BedData(sp.genome, Dict("NC_003280.10" => tree))
         end
 
         # BedData with a scaffold name that has no match in sp.genome.
-        bed_no_match = BedData(sp.genome, Dict("NOMATCH" => IntervalMeta64()))
+        bed_no_match = BedData(sp.genome, Dict("NOMATCH" => IntervalTreeM64()))
 
         # -----------------------------------------------------------------------
-        @testset "intersect(IntervalMeta64, IntervalMeta64) – overlap" begin
-            tree_a = IntervalMeta64()
+        @testset "intersect(IntervalTreeM64, IntervalTreeM64) – overlap" begin
+            tree_a = IntervalTreeM64()
             push!(tree_a, IntervalValue(UInt32(10), UInt32(50), UInt64(7)))
             push!(tree_a, IntervalValue(UInt32(200), UInt32(300), UInt64(0)))
-            tree_b = IntervalMeta64()
+            tree_b = IntervalTreeM64()
             push!(tree_b, IntervalValue(UInt32(30), UInt32(100), UInt64(0)))
 
             result = Data.intersect(tree_a, tree_b)
@@ -120,16 +120,16 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             @test ivs[1].value == UInt64(7)   # value carried from tree_a
         end
 
-        @testset "intersect(IntervalMeta64, IntervalMeta64) – no overlap" begin
-            tree_a = IntervalMeta64()
+        @testset "intersect(IntervalTreeM64, IntervalTreeM64) – no overlap" begin
+            tree_a = IntervalTreeM64()
             push!(tree_a, IntervalValue(UInt32(1), UInt32(10), UInt64(0)))
-            tree_b = IntervalMeta64()
+            tree_b = IntervalTreeM64()
             push!(tree_b, IntervalValue(UInt32(20), UInt32(30), UInt64(0)))
             @test isempty(Data.intersect(tree_a, tree_b))
         end
 
-        @testset "intersect(IntervalMeta64, IntervalMeta64) – both empty" begin
-            @test isempty(Data.intersect(IntervalMeta64(), IntervalMeta64()))
+        @testset "intersect(IntervalTreeM64, IntervalTreeM64) – both empty" begin
+            @test isempty(Data.intersect(IntervalTreeM64(), IntervalTreeM64()))
         end
 
         # -----------------------------------------------------------------------
@@ -215,7 +215,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             v1 = [10.0, 20.0, 30.0, 40.0],
             v2 = [11.0, 21.0, 31.0, 41.0],
         )
-        tab = load_table(sp.genome, df, :gene)
+        tab = load_table(sp.genome, df)
 
         # --- Integer / cartesian indexing ------------------------------------
         @testset "getindex(Integer...) – scalar elements" begin
@@ -304,68 +304,10 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
     end  # TabularData indexing & DataFrame conversion
 
     # =========================================================================
-    @testset "calculate_frequency" begin
-        # Build a BedData from `scaffold => [(start, end), ...]` pairs.
-        make_bed(pairs...) = begin
-            scaffolds = Dict{String,IntervalMeta64}()
-            for (name, ivs) in pairs
-                tree = IntervalMeta64()
-                for (s, e) in ivs
-                    push!(tree, IntervalValue(UInt32(s), UInt32(e), UInt64(0)))
-                end
-                scaffolds[name] = tree
-            end
-            BedData(test_genome, scaffolds)
-        end
-
-        @testset "per-base counts across measurements (UInt8)" begin
-            m1 = make_bed("chr1" => [(1, 5), (10, 12)])
-            m2 = make_bed("chr1" => [(3, 11)])
-            freq = calculate_frequency([m1, m2])
-
-            @test freq isa Dict
-            @test haskey(freq, "chr1")
-            v = freq["chr1"]
-            @test eltype(v) == UInt8
-            @test length(v) == 12
-            # base:      1  2  3  4  5  6  7  8  9 10 11 12
-            @test Vector(v) == UInt8[1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 2, 1]
-        end
-
-        @testset "merge default merges within-measurement overlaps" begin
-            m = make_bed("chr1" => [(1, 5), (3, 8)])
-
-            merged = calculate_frequency([m])                # merge = true (default)
-            @test Vector(merged["chr1"]) == UInt8[1, 1, 1, 1, 1, 1, 1, 1]
-            @test maximum(merged["chr1"]) == 1
-
-            unmerged = calculate_frequency([m]; merge = false)
-            @test Vector(unmerged["chr1"]) == UInt8[1, 1, 2, 2, 2, 1, 1, 1]
-        end
-
-        @testset "multiple scaffolds with independent coverage" begin
-            m1 = make_bed("chrA" => [(1, 3)], "chrB" => [(5, 6)])
-            m2 = make_bed("chrA" => [(2, 4)])
-            freq = calculate_frequency([m1, m2])
-
-            @test Set(keys(freq)) == Set(["chrA", "chrB"])
-            @test Vector(freq["chrA"]) == UInt8[1, 2, 2, 1]        # length 4
-            @test Vector(freq["chrB"]) == UInt8[0, 0, 0, 0, 1, 1]  # length 6
-        end
-
-        @testset "element type widens to UInt16 past 255 measurements" begin
-            measurements = [make_bed("chr1" => [(1, 2)]) for _ = 1:256]
-            freq = calculate_frequency(measurements)
-            @test eltype(freq["chr1"]) == UInt16
-            @test Vector(freq["chr1"]) == UInt16[256, 256]
-        end
-    end  # calculate_frequency
-
-    # =========================================================================
     @testset "leftjoin" begin
-        # Build an IntervalMeta64 tree from `(start, end, value)` triples.
+        # Build an IntervalTreeM64 tree from `(start, end, value)` triples.
         make_tree(triples...) = begin
-            tree = IntervalMeta64()
+            tree = IntervalTreeM64()
             for (s, e, v) in triples
                 push!(tree, IntervalValue(UInt32(s), UInt32(e), UInt64(v)))
             end
@@ -433,14 +375,14 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
         @testset "empty right tree pairs every left with nothing" begin
             left = make_tree((10, 20, 1), (30, 40, 2))
-            result = collect(Data.leftjoin(left, IntervalMeta64(), :metadata))
+            result = collect(Data.leftjoin(left, IntervalTreeM64(), :metadata))
             @test length(result) == 2
             @test all(p -> p[2] === nothing, result)
         end
 
         @testset "empty left tree yields no pairs" begin
             right = make_tree((10, 20, 1))
-            @test isempty(collect(Data.leftjoin(IntervalMeta64(), right, :metadata)))
+            @test isempty(collect(Data.leftjoin(IntervalTreeM64(), right, :metadata)))
         end
 
         @testset "invalid `on` throws ArgumentError" begin
@@ -518,7 +460,7 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
             end
 
             sheet = DataFrame(condition = ["wt"], file = [path])
-            exp = Data.Experiment(sp.genome, sheet; feature = :gene)
+            exp = Data.Experiment(sp.genome, sheet)
 
             v = exp.variables["wt"]
             @test v.covariates === nothing

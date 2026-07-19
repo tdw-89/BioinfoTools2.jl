@@ -2,6 +2,7 @@ module Exploration
 
 using Distributions
 using KernelDensity
+using SparseArrays
 using StatsBase
 
 using ..Reference
@@ -107,7 +108,7 @@ function _quantile_bin(edges::AbstractVector, value::Real, quantiles::Int)
 end
 
 """
-    get_quantiles(genome, data::TabularData; quantiles = 4, merge = mean)
+    quantiles(genome, data::TabularData; quantiles = 4, merge = mean)
 
 Assign each sample in `data` to one of `quantiles` bins by a scalar summary of
 its row.
@@ -123,7 +124,7 @@ metadata index; unmatched samples and unresolvable features are skipped.
 - `quantiles::Int = 4`: number of quantile bins (throws `ArgumentError` if `< 1`).
 - `merge = mean`: function collapsing a row of variable values to a scalar.
 """
-function get_quantiles(genome::Genome, data::TabularData; quantiles::Int = 4, merge = mean)
+function quantiles(genome::Genome, data::TabularData; quantiles::Int = 4, merge = mean)
     quantiles >= 1 ||
         throw(ArgumentError("`quantiles` must be a positive integer (got $quantiles)"))
 
@@ -132,7 +133,7 @@ function get_quantiles(genome::Genome, data::TabularData; quantiles::Int = 4, me
     merged = Float64[]
     for (row, sample) in enumerate(data.samples)
         sample === nothing && continue
-        push!(indices, sample[2])
+        push!(indices, Reference.parse_index(sample[2].value))
         push!(merged, Float64(merge(data.table[row, :])))
     end
 
@@ -151,6 +152,171 @@ function get_quantiles(genome::Genome, data::TabularData; quantiles::Int = 4, me
     return result
 end
 
-export coverage, kde, get_quantiles
+"""
+Given a set of `BedData` measurements, compute how many of them cover each base
+of the genome. The genome is returned as a dictionary keyed by scaffold name,
+whose values are sparse arrays holding the per-base frequency (length = the
+largest interval end seen on that scaffold).
+
+When `merge` is `true` (the default), overlapping intervals *within a single
+measurement* are merged first (via [`merge_segments`](@ref)), so each measurement
+contributes at most 1 to a given base and the maximum possible value is the
+number of measurements. Set `merge = false` to skip this step when the intervals
+are already disjoint (e.g. ChIP-seq peak calls), in which case any within-measurement
+overlaps will stack.
+
+The element type is chosen to fit the measurement count: `UInt8` for up to 255
+measurements and `UInt16` for up to 65535. More measurements raise an error.
+"""
+function calculate_frequency(measurements::Vector{BedData}; merge::Bool = true)
+    n = length(measurements)
+    T = if n <= typemax(UInt8)
+        UInt8
+    elseif n <= typemax(UInt16)
+        UInt16
+    else
+        error(
+            "calculate_frequency supports at most $(Int(typemax(UInt16))) BedData measurements (received $n)",
+        )
+    end
+
+    # Every scaffold that appears in at least one measurement. `Threads.@threads`
+    # needs an indexable collection, so collect the set into a vector.
+    scaffold_names = String[]
+    seen = Set{String}()
+    for measurement in measurements
+        for name in keys(measurement.scaffolds)
+            name in seen || (push!(seen, name); push!(scaffold_names, name))
+        end
+    end
+
+    # Pre-populate every key so the parallel loop only overwrites existing
+    # entries. Inserting new keys concurrently would race on the Dict's internal
+    # structure; overwriting the value of an existing key does not.
+    genome = Dict{String,SparseVector{T,Int}}(
+        name => spzeros(T, 0) for name in scaffold_names
+    )
+
+    Threads.@threads for name in scaffold_names
+        # Difference array: +1 where a segment starts, -1 just past its end. The
+        # running total while sweeping left-to-right is the per-base frequency
+        # across measurements.
+        deltas = Dict{Int,Int}()
+        scaffold_len = 0
+
+        for measurement in measurements
+            haskey(measurement.scaffolds, name) || continue
+            tree = measurement.scaffolds[name]
+            segments =
+                merge ? merge_segments(tree) :
+                [(Int(iv.first), Int(iv.last)) for iv in tree]
+            for (s, e) in segments
+                deltas[s] = get(deltas, s, 0) + 1
+                deltas[e+1] = get(deltas, e + 1, 0) - 1
+                scaffold_len = max(scaffold_len, e)
+            end
+        end
+
+        isempty(deltas) && continue
+
+        # Sweep the breakpoints in order, emitting a value for every covered base.
+        breakpoints = sort!(collect(keys(deltas)))
+        indices = Int[]
+        values = T[]
+        coverage = 0
+        for k in eachindex(breakpoints)
+            p = breakpoints[k]
+            coverage += deltas[p]
+            if coverage > 0 && k < length(breakpoints)
+                for base = p:(breakpoints[k+1]-1)
+                    push!(indices, base)
+                    push!(values, T(coverage))
+                end
+            end
+        end
+
+        genome[name] = sparsevec(indices, values, scaffold_len)
+    end
+
+    return genome
+end
+
+"""
+Per-feature, per-base coverage counts across a set of `BedData` measurements,
+together with the number of measurements (`n`) they were computed from.
+
+`features` maps a feature ID to a `SparseVector{UInt32}` of raw overlap counts —
+one entry per base of the (flanked) feature, oriented in the direction of
+transcription (index 1 is the feature's 5' end). Dividing a count by `n` gives
+the fraction of measurements covering that base; the raw count is kept so it can
+be stored exactly in 32 bits.
+"""
+struct FeatureFrequency
+    n::Int
+    features::Dict{String,SparseVector{UInt32,Int}}
+end
+
+"""
+    feature_frequency(genome, feature, frequency, n; flank = 500)
+
+Project a per-base `frequency` dictionary (as returned by
+[`calculate_frequency`](@ref)) onto every `feature`-type feature of `genome`.
+
+For each feature, the padded region `[first - flank, last + flank]` is sliced out
+of its scaffold's frequency vector and re-indexed to a 1-based position within
+the region. Features on the negative strand are reversed so index 1 always lands
+at the feature's 5' end. The result is returned as a [`FeatureFrequency`](@ref):
+a mapping from feature ID to a `SparseVector{UInt32}` of raw overlap counts, plus
+the measurement count `n` so per-base frequencies can be recovered by division.
+Features whose metadata ID cannot be resolved are skipped.
+"""
+function feature_frequency(
+    genome::Genome,
+    feature::Union{AbstractString,Symbol},
+    frequency::AbstractDict{String,<:AbstractVector},
+    n::Integer;
+    flank::Integer = 500,
+)
+    feature_intervals = get_feature(genome, feature)
+    features = Dict{String,SparseVector{UInt32,Int}}()
+
+    for (scaffold, tree) in feature_intervals
+        counts = get(frequency, scaffold, nothing)
+        # Nonzero (base, count) pairs for this scaffold, ascending by position.
+        nzi, nzv = counts === nothing ? (Int[], UInt32[]) : findnz(counts)
+
+        for iv in tree
+            code = iv.value
+            feature_id = Reference.get_metadata_id(genome, Reference.parse_index(code))
+            feature_id === nothing && continue
+            negative = Reference.parse_strand(code) == get_strand('-')
+
+            region_start = max(1, Int(iv.first) - flank)
+            region_end = Int(iv.last) + flank
+            region_len = region_end - region_start + 1
+
+            # Slice of nonzero bases falling inside the padded region.
+            lo = searchsortedfirst(nzi, region_start)
+            hi = searchsortedlast(nzi, region_end)
+            len = max(hi - lo + 1, 0)
+            idxs = Vector{Int}(undef, len)
+            vals = Vector{UInt32}(undef, len)
+            for (j, k) in enumerate(lo:hi)
+                base = nzi[k]
+                # Map genomic base to a 1-based position within the region,
+                # reversing for negative-strand features so index 1 stays at the
+                # 5' end.
+                idxs[j] = negative ? region_end - base + 1 : base - region_start + 1
+                vals[j] = UInt32(nzv[k])
+            end
+            features[feature_id] = sparsevec(idxs, vals, region_len)
+        end
+    end
+
+    return FeatureFrequency(n, features)
+end
+
+export coverage, kde, quantiles, calculate_frequency, feature_frequency, FeatureFrequency
+
 
 end

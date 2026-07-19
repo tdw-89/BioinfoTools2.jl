@@ -8,7 +8,7 @@ using IntervalTrees
 using ..SOTerms
 
 const RECORD_BUFFER = 1_000
-const IntervalMeta64 = IntervalTree{UInt32,IntervalValue{UInt32,UInt64}}
+const IntervalTreeM64 = IntervalTree{UInt32,IntervalValue{UInt32,UInt64}}
 
 """
 - `name`: The name of the scaffold
@@ -19,7 +19,7 @@ struct Scaffold
     name::String
 
     # Intervals
-    features::IntervalMeta64
+    features::IntervalTreeM64
 end
 
 struct ParseResult
@@ -252,7 +252,7 @@ function get_metadata_id(genome::Genome, meta_index::UInt32)
     return genome.vocab[token]
 end
 
-function get_metadata(genome::Genome, features::IntervalMeta64)
+function get_metadata(genome::Genome, features::IntervalTreeM64)
     metadata_list = Vector{Vector{String}}(undef, length(features))
     for (i, interval) in enumerate(features)
         meta_idx = parse_index(interval.value)
@@ -271,12 +271,12 @@ function get_metadata(genome::Genome)
     return scaffolds
 end
 
-function get_feature(scaffold::Scaffold, feature::Symbol)::Union{Nothing,IntervalMeta64}
+function get_feature(scaffold::Scaffold, feature::Symbol)::Union{Nothing,IntervalTreeM64}
     result = SO_TERMS[feature]
     isnothing(result) && return nothing
     feature_bit_mask, _ = result
 
-    tree = IntervalMeta64()
+    tree = IntervalTreeM64()
     for interval in scaffold.features
         if parse_so_term(interval.value) == feature_bit_mask
             push!(tree, interval)
@@ -285,14 +285,14 @@ function get_feature(scaffold::Scaffold, feature::Symbol)::Union{Nothing,Interva
     return tree
 end
 
-get_feature(scaffold::Scaffold, feature::AbstractString)::Union{Nothing,IntervalMeta64} =
+get_feature(scaffold::Scaffold, feature::AbstractString)::Union{Nothing,IntervalTreeM64} =
     get_feature(scaffold, Symbol(feature))
 
 function get_feature(genome::Genome, feature::Symbol)
     result = SO_TERMS[feature]
-    isnothing(result) && return Dict{String,IntervalMeta64}()
+    isnothing(result) && return Dict{String,IntervalTreeM64}()
 
-    scaffolds = Dict{String,IntervalMeta64}()
+    scaffolds = Dict{String,IntervalTreeM64}()
     for (scaffold_name, scaffold) in genome.scaffolds
         scaffolds[scaffold_name] = get_feature(scaffold, feature)
     end
@@ -419,7 +419,7 @@ function build_genome!(ch::Channel{Vector{ParseResult}}, genome::Genome)
         for result in batch
             # Ensure the scaffold exists, creating it lazily if not
             scaffold = get!(genome.scaffolds, result.scaffold_id) do
-                Scaffold(result.scaffold_id, IntervalMeta64())
+                Scaffold(result.scaffold_id, IntervalTreeM64())
             end
 
             # 1. Add the feature interval (start, end, 64-bit code) to the scaffold tree
@@ -521,7 +521,7 @@ function Base.show(io::IO, sp::Species)
 end
 
 export Species,
-    IntervalMeta64,
+    IntervalTreeM64,
     Genome,
     Scaffold,
     FeatureRecord,

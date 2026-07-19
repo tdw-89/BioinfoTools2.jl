@@ -284,14 +284,14 @@ end
             @test get_metadata(s.genome, UInt32(n_features + 100)) == String[]
         end
 
-        @testset "get_metadata(genome, IntervalMeta64)" begin
+        @testset "get_metadata(genome, IntervalTreeM64)" begin
             results = get_metadata(s.genome, scaffold.features)
             @test results isa Vector{Vector{String}}
             @test length(results) == n_features
             @test all(r -> length(r) == 3, results)
         end
 
-        @testset "get_metadata(genome, Scaffold) – delegates to IntervalMeta64" begin
+        @testset "get_metadata(genome, Scaffold) – delegates to IntervalTreeM64" begin
             @test get_metadata(s.genome, scaffold) ==
                   get_metadata(s.genome, scaffold.features)
         end

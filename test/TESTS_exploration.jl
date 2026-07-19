@@ -3,6 +3,7 @@ using BioinfoTools2.Reference
 using BioinfoTools2.Data
 using DataFrames
 using IntervalTrees
+using SparseArrays
 using Test
 
 const EX_DATA_DIR = joinpath(@__DIR__, "data")
@@ -10,7 +11,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
 @testset "Exploration" begin
 
-    @testset "get_quantiles" begin
+    @testset "quantiles" begin
         # Load a real genome and grab 8 real gene IDs to build a TabularData with
         # fully predictable per-row means (row i has both columns == i, so the
         # merged mean is exactly i).
@@ -32,11 +33,11 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             v1 = Float64[1, 2, 3, 4, 5, 6, 7, 8, 99],
             v2 = Float64[1, 2, 3, 4, 5, 6, 7, 8, 99],
         )
-        tab = load_table(sp.genome, df, :gene)
+        tab = load_table(sp.genome, df)
 
         # ---------------------------------------------------------------------
         @testset "default (quantiles = 4, merge = mean)" begin
-            q = get_quantiles(sp.genome, tab)
+            q = quantiles(sp.genome, tab)
 
             @test q isa Vector{Tuple{FeatureRecord,Float64,Int}}
             # The unmatched NO_SUCH_ID sample is skipped.
@@ -66,7 +67,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
         # ---------------------------------------------------------------------
         @testset "custom quantiles count" begin
-            q2 = get_quantiles(sp.genome, tab; quantiles = 2)
+            q2 = quantiles(sp.genome, tab; quantiles = 2)
             byid = Dict(rec.id => qi for (rec, _, qi) in q2)
             for (i, gid) in enumerate(gene_ids)
                 # 1..4 → bin 1, 5..8 → bin 2.
@@ -78,7 +79,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         @testset "custom merge function" begin
             # sum of two identical columns == 2i; monotone in i, so the bins are
             # unchanged but the paired value now reflects the merge.
-            qs = get_quantiles(sp.genome, tab; merge = sum)
+            qs = quantiles(sp.genome, tab; merge = sum)
             byid = Dict(rec.id => (val, qi) for (rec, val, qi) in qs)
             for (i, gid) in enumerate(gene_ids)
                 val, qi = byid[gid]
@@ -89,15 +90,15 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
         # ---------------------------------------------------------------------
         @testset "invalid quantiles throws" begin
-            @test_throws ArgumentError get_quantiles(sp.genome, tab; quantiles = 0)
-            @test_throws ArgumentError get_quantiles(sp.genome, tab; quantiles = -3)
+            @test_throws ArgumentError quantiles(sp.genome, tab; quantiles = 0)
+            @test_throws ArgumentError quantiles(sp.genome, tab; quantiles = -3)
         end
 
         # ---------------------------------------------------------------------
         @testset "no matched samples → empty result" begin
             df_none = DataFrame(sample = ["NO_SUCH_ID"], v1 = [1.0], v2 = [2.0])
-            tab_none = load_table(sp.genome, df_none, :gene)
-            empty_q = get_quantiles(sp.genome, tab_none)
+            tab_none = load_table(sp.genome, df_none)
+            empty_q = quantiles(sp.genome, tab_none)
             @test empty_q isa Vector{Tuple{FeatureRecord,Float64,Int}}
             @test isempty(empty_q)
         end
@@ -115,7 +116,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         bed_full = BedData(
             sp.genome,
             Dict(
-                "NC_003280.10" => let t = IntervalMeta64()
+                "NC_003280.10" => let t = IntervalTreeM64()
                     push!(t, IntervalValue(UInt32(1), UInt32(100_000_000), UInt64(0)))
                     t
                 end,
@@ -127,7 +128,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         bed_empty = BedData(
             sp.genome,
             Dict(
-                "NC_003280.10" => let t = IntervalMeta64()
+                "NC_003280.10" => let t = IntervalTreeM64()
                     push!(
                         t,
                         IntervalValue(UInt32(200_000_000), UInt32(200_000_001), UInt64(0)),
@@ -138,7 +139,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         )
 
         # A BedData whose only scaffold name has no counterpart in the genome.
-        bed_no_match = BedData(sp.genome, Dict("NOMATCH" => IntervalMeta64()))
+        bed_no_match = BedData(sp.genome, Dict("NOMATCH" => IntervalTreeM64()))
 
         @testset "coverage" begin
             @testset "full coverage → gene fractions are 1.0" begin
@@ -197,4 +198,119 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             end
         end
     end
+
+    # =========================================================================
+    @testset "calculate_frequency" begin
+        test_genome = Species("test").genome
+
+        # Build a BedData from `scaffold => [(start, end), ...]` pairs.
+        make_bed(pairs...) = begin
+            scaffolds = Dict{String,IntervalTreeM64}()
+            for (name, ivs) in pairs
+                tree = IntervalTreeM64()
+                for (s, e) in ivs
+                    push!(tree, IntervalValue(UInt32(s), UInt32(e), UInt64(0)))
+                end
+                scaffolds[name] = tree
+            end
+            BedData(test_genome, scaffolds)
+        end
+
+        @testset "per-base counts across measurements (UInt8)" begin
+            m1 = make_bed("chr1" => [(1, 5), (10, 12)])
+            m2 = make_bed("chr1" => [(3, 11)])
+            freq = calculate_frequency([m1, m2])
+
+            @test freq isa Dict
+            @test haskey(freq, "chr1")
+            v = freq["chr1"]
+            @test eltype(v) == UInt8
+            @test length(v) == 12
+            # base:      1  2  3  4  5  6  7  8  9 10 11 12
+            @test Vector(v) == UInt8[1, 1, 2, 2, 2, 1, 1, 1, 1, 2, 2, 1]
+        end
+
+        @testset "merge default merges within-measurement overlaps" begin
+            m = make_bed("chr1" => [(1, 5), (3, 8)])
+
+            merged = calculate_frequency([m])                # merge = true (default)
+            @test Vector(merged["chr1"]) == UInt8[1, 1, 1, 1, 1, 1, 1, 1]
+            @test maximum(merged["chr1"]) == 1
+
+            unmerged = calculate_frequency([m]; merge = false)
+            @test Vector(unmerged["chr1"]) == UInt8[1, 1, 2, 2, 2, 1, 1, 1]
+        end
+
+        @testset "multiple scaffolds with independent coverage" begin
+            m1 = make_bed("chrA" => [(1, 3)], "chrB" => [(5, 6)])
+            m2 = make_bed("chrA" => [(2, 4)])
+            freq = calculate_frequency([m1, m2])
+
+            @test Set(keys(freq)) == Set(["chrA", "chrB"])
+            @test Vector(freq["chrA"]) == UInt8[1, 2, 2, 1]        # length 4
+            @test Vector(freq["chrB"]) == UInt8[0, 0, 0, 0, 1, 1]  # length 6
+        end
+
+        @testset "element type widens to UInt16 past 255 measurements" begin
+            measurements = [make_bed("chr1" => [(1, 2)]) for _ = 1:256]
+            freq = calculate_frequency(measurements)
+            @test eltype(freq["chr1"]) == UInt16
+            @test Vector(freq["chr1"]) == UInt16[256, 256]
+        end
+    end  # calculate_frequency
+
+    # =========================================================================
+    @testset "feature_frequency" begin
+        sp = Species("C. elegans")
+        add_features!(EX_GFF_SINGLE, sp.genome)
+        scaffold = sp.genome.scaffolds["NC_003280.10"]
+        genes = get_feature(scaffold, :gene)
+
+        flank = 500
+        # A gene comfortably past the scaffold start so its left flank is not clipped.
+        iv = first(x for x in genes if Int(x.first) > flank)
+        gene_id = Reference.get_metadata_id(sp.genome, Reference.parse_index(iv.value))
+        negative = Reference.parse_strand(iv.value) == get_strand('-')
+
+        region_start = Int(iv.first) - flank
+        region_end = Int(iv.last) + flank
+        region_len = region_end - region_start + 1
+
+        # Place a known raw count at each end of the padded region so the result's
+        # orientation and values can be checked exactly.
+        counts = spzeros(UInt16, region_end + 10)
+        counts[region_start] = 3
+        counts[region_end] = 7
+        frequency = Dict("NC_003280.10" => counts)
+
+        ff = feature_frequency(sp.genome, :gene, frequency, 4; flank = flank)
+
+        @test ff isa FeatureFrequency
+        @test ff.n == 4                       # measurement count stored, not divided out
+        @test haskey(ff.features, gene_id)
+
+        v = ff.features[gene_id]
+        @test eltype(v) == UInt32
+        @test length(v) == region_len
+
+        if negative
+            # Reversed so index 1 stays at the 5' end.
+            @test v[region_len] == 3
+            @test v[1] == 7
+        else
+            @test v[1] == 3
+            @test v[region_len] == 7
+        end
+
+        @testset "unresolved scaffolds contribute nothing" begin
+            empty_ff = feature_frequency(
+                sp.genome,
+                :gene,
+                Dict{String,SparseVector{UInt16,Int}}(),
+                2,
+            )
+            @test empty_ff.n == 2
+            @test all(v -> nnz(v) == 0, values(empty_ff.features))
+        end
+    end  # feature_frequency
 end
