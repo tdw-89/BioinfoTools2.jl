@@ -22,15 +22,14 @@ mapping scaffold name to its vector of fractions; scaffolds absent from `data`
 are omitted. Set `filter_zeros = true` to drop the uncovered (`0.0`) entries.
 """
 function coverage(
-    genome::Genome,
-    feature::Union{String,Symbol},
-    data::BedData;
+    data::BedData,
+    feature::Union{String,Symbol};
     filter_zeros::Bool = false,
 )::Dict{String,Vector{Float64}}
 
-    intersection = Data.intersect(genome, data, feature)
+    intersection = Data.intersect(data.genome, data, feature)
     scaffolds = Dict{String,Vector{Float64}}()
-    for (scaffold_name, scaffold) in genome.scaffolds
+    for (scaffold_name, scaffold) in data.genome.scaffolds
         if !haskey(intersection, scaffold_name)
             continue
         end
@@ -71,12 +70,11 @@ name to a `UnivariateKDE`, or to `nothing` when the scaffold has no fractions to
 fit (for example when `filter_zeros` removed them all).
 """
 function kde(
-    genome::Genome,
-    feature::Union{String,Symbol},
-    data::BedData;
+    data::BedData,
+    feature::Union{String,Symbol};
     filter_zeros::Bool = false,
 )
-    frac_coverage = coverage(genome, feature, data, filter_zeros = filter_zeros)
+    frac_coverage = coverage(data, feature, filter_zeros = filter_zeros)
     coverage_kde = Dict{String,Union{Nothing,UnivariateKDE}}()
     for k in keys(frac_coverage)
         coverage_kde[k] =
@@ -125,7 +123,7 @@ metadata index; unmatched samples and unresolvable features are skipped.
 - `quantiles::Int = 4`: number of quantile bins (throws `ArgumentError` if `< 1`).
 - `merge = mean`: function collapsing a row of variable values to a scalar.
 """
-function quantiles(genome::Genome, data::TabularData; quantiles::Int = 4, merge = mean)
+function quantiles(data::TabularData; quantiles::Int = 4, merge = mean)
     quantiles >= 1 ||
         throw(ArgumentError("`quantiles` must be a positive integer (got $quantiles)"))
 
@@ -145,7 +143,7 @@ function quantiles(genome::Genome, data::TabularData; quantiles::Int = 4, merge 
     edges = quantile(merged, range(0, 1; length = quantiles + 1))
 
     for (meta_idx, value) in zip(indices, merged)
-        record = genome[meta_idx]
+        record = data.genome[meta_idx]
         record === nothing && continue
         push!(result, (record, value, _quantile_bin(edges, value, quantiles)))
     end

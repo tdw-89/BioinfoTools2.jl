@@ -3,6 +3,7 @@ using BioinfoTools2.Reference
 using BioinfoTools2.Data
 using DataFrames
 using IntervalTrees
+using KernelDensity
 using SparseArrays
 using Test
 
@@ -37,7 +38,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
         # ---------------------------------------------------------------------
         @testset "default (quantiles = 4, merge = mean)" begin
-            q = quantiles(sp.genome, tab)
+            q = quantiles(tab)
 
             @test q isa Vector{Tuple{FeatureRecord,Float64,Int}}
             # The unmatched NO_SUCH_ID sample is skipped.
@@ -67,7 +68,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
         # ---------------------------------------------------------------------
         @testset "custom quantiles count" begin
-            q2 = quantiles(sp.genome, tab; quantiles = 2)
+            q2 = quantiles(tab; quantiles = 2)
             byid = Dict(rec.id => qi for (rec, _, qi) in q2)
             for (i, gid) in enumerate(gene_ids)
                 # 1..4 → bin 1, 5..8 → bin 2.
@@ -79,7 +80,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         @testset "custom merge function" begin
             # sum of two identical columns == 2i; monotone in i, so the bins are
             # unchanged but the paired value now reflects the merge.
-            qs = quantiles(sp.genome, tab; merge = sum)
+            qs = quantiles(tab; merge = sum)
             byid = Dict(rec.id => (val, qi) for (rec, val, qi) in qs)
             for (i, gid) in enumerate(gene_ids)
                 val, qi = byid[gid]
@@ -90,15 +91,15 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
         # ---------------------------------------------------------------------
         @testset "invalid quantiles throws" begin
-            @test_throws ArgumentError quantiles(sp.genome, tab; quantiles = 0)
-            @test_throws ArgumentError quantiles(sp.genome, tab; quantiles = -3)
+            @test_throws ArgumentError quantiles(tab; quantiles = 0)
+            @test_throws ArgumentError quantiles(tab; quantiles = -3)
         end
 
         # ---------------------------------------------------------------------
         @testset "no matched samples → empty result" begin
             df_none = DataFrame(sample = ["NO_SUCH_ID"], v1 = [1.0], v2 = [2.0])
             tab_none = load_table(sp.genome, df_none)
-            empty_q = quantiles(sp.genome, tab_none)
+            empty_q = quantiles(tab_none)
             @test empty_q isa Vector{Tuple{FeatureRecord,Float64,Int}}
             @test isempty(empty_q)
         end
@@ -143,7 +144,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
         @testset "coverage" begin
             @testset "full coverage → gene fractions are 1.0" begin
-                cov = coverage(sp.genome, :gene, bed_full)
+                cov = coverage(bed_full, :gene)
                 @test cov isa Dict{String,Vector{Float64}}
                 @test haskey(cov, "NC_003280.10")
                 v = cov["NC_003280.10"]
@@ -155,19 +156,19 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
             @testset "filter_zeros drops uncovered features" begin
                 vfz =
-                    coverage(sp.genome, :gene, bed_full; filter_zeros = true)["NC_003280.10"]
+                    coverage(bed_full, :gene; filter_zeros = true)["NC_003280.10"]
                 @test all(==(1.0), vfz)
                 @test length(vfz) == n_genes
             end
 
             @testset "non-overlapping BedData → all zeros" begin
-                v = coverage(sp.genome, :gene, bed_empty)["NC_003280.10"]
+                v = coverage(bed_empty, :gene)["NC_003280.10"]
                 @test !isempty(v)
                 @test all(==(0.0), v)
             end
 
             @testset "scaffold absent from BedData is omitted" begin
-                cov = coverage(sp.genome, :gene, bed_no_match)
+                cov = coverage(bed_no_match, :gene)
                 @test cov isa Dict{String,Vector{Float64}}
                 @test isempty(cov)
             end
@@ -175,8 +176,8 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
 
         @testset "kde" begin
             @testset "non-empty coverage → KDE per scaffold" begin
-                k = kde(sp.genome, :gene, bed_full)
-                @test k isa Dict{String}
+                k = Exploration.kde(bed_full, :gene)
+                @test k isa Dict{String,Union{Nothing,UnivariateKDE}}
                 @test haskey(k, "NC_003280.10")
                 fit = k["NC_003280.10"]
                 # A fitted UnivariateKDE exposes matching grid/density vectors.
@@ -188,13 +189,13 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             @testset "empty coverage vector → nothing" begin
                 # All fractions are 0.0 and filter_zeros removes them, leaving an
                 # empty vector that cannot be fit.
-                k = kde(sp.genome, :gene, bed_empty; filter_zeros = true)
+                k = Exploration.kde(bed_empty, :gene; filter_zeros = true)
                 @test haskey(k, "NC_003280.10")
                 @test isnothing(k["NC_003280.10"])
             end
 
             @testset "scaffold absent from BedData is omitted" begin
-                @test isempty(kde(sp.genome, :gene, bed_no_match))
+                @test isempty(Exploration.kde(bed_no_match, :gene))
             end
         end
     end
