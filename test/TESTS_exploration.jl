@@ -313,4 +313,61 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             @test all(v -> nnz(v) == 0, values(empty_ff.features))
         end
     end  # feature_frequency
+
+    # =========================================================================
+    @testset "gene_profile" begin
+        # flank = 2, body_bins = 3 keeps the arithmetic checkable by hand.
+        counts = [2.0, 4.0, 0.0, 6.0, 12.0, 0.0, 8.0, 10.0]  # length 8
+        profile = gene_profile(counts, 2; flank = 2, body_bins = 3)
+
+        @test length(profile) == 2 * 2 + 3
+        # freq = counts ./ 2 = [1,2, 0,3,6,0, 4,5]; flanks kept, body [0,3,6,0]
+        # interpolated onto 3 points ([0, 0.5, 1]) → [0, 4.5, 0].
+        @test profile ≈ [1.0, 2.0, 0.0, 4.5, 0.0, 4.0, 5.0]
+
+        @testset "counts divided by n_measurements" begin
+            @test gene_profile(counts, 4; flank = 2, body_bins = 3) ≈ profile ./ 2
+        end
+
+        @testset "too-short vectors return nothing" begin
+            # Need at least 2*flank + 2 entries to fit a >=2 bp body.
+            @test gene_profile(zeros(2 * 2 + 1), 1; flank = 2, body_bins = 3) === nothing
+            @test gene_profile(zeros(2 * 2 + 2), 1; flank = 2, body_bins = 3) !== nothing
+        end
+
+        @testset "works on sparse count vectors" begin
+            sparse_counts = sparsevec([1, 8], [2.0, 10.0], 8)
+            sparse_profile = gene_profile(sparse_counts, 2; flank = 2, body_bins = 3)
+            @test length(sparse_profile) == 7
+            @test sparse_profile[1] == 1.0     # 2 / 2
+            @test sparse_profile[end] == 5.0   # 10 / 2
+        end
+    end  # gene_profile
+
+    # =========================================================================
+    @testset "mean_gene_profile" begin
+        flank, body_bins = 2, 3
+        gene_a = sparsevec([1, 8], UInt32[4, 8], 8)
+        gene_b = sparsevec([1, 8], UInt32[8, 4], 8)
+        short = spzeros(UInt32, 3)               # too short → always skipped
+        ff = FeatureFrequency(2, Dict("a" => gene_a, "b" => gene_b, "short" => short))
+
+        profile_a = gene_profile(gene_a, ff.n; flank, body_bins)
+        profile_b = gene_profile(gene_b, ff.n; flank, body_bins)
+
+        mean_all = mean_gene_profile(ff; flank, body_bins)
+        @test length(mean_all) == 2 * flank + body_bins
+        @test mean_all ≈ (profile_a .+ profile_b) ./ 2
+
+        @testset "exclude skips genes" begin
+            only_b = mean_gene_profile(ff; exclude = Set(["a"]), flank, body_bins)
+            @test only_b ≈ profile_b
+        end
+
+        @testset "no qualifying genes → all zeros" begin
+            empty_ff = FeatureFrequency(2, Dict("short" => short))
+            @test mean_gene_profile(empty_ff; flank, body_bins) ==
+                  zeros(2 * flank + body_bins)
+        end
+    end  # mean_gene_profile
 end

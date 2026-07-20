@@ -1,6 +1,7 @@
 module Exploration
 
 using Distributions
+using Interpolations
 using KernelDensity
 using SparseArrays
 using StatsBase
@@ -316,7 +317,66 @@ function feature_frequency(
     return FeatureFrequency(n, features)
 end
 
-export coverage, kde, quantiles, calculate_frequency, feature_frequency, FeatureFrequency
+"""
+    gene_profile(counts, n_measurements; flank = 500, body_bins = 100)
+
+Reduce one feature's per-base overlap `counts` — `flank` bp upstream, the feature
+body, then `flank` bp downstream — to a frequency profile of length
+`2 * flank + body_bins`. The flanks are kept per base while the body is
+interpolated onto `body_bins` evenly spaced points, and every value is divided by
+`n_measurements` to give a frequency. Returns `nothing` when `counts` is shorter
+than `2 * flank + 2` (no room for a body of at least two bases).
+"""
+function gene_profile(
+    counts::AbstractVector,
+    n_measurements::Integer;
+    flank::Integer = 500,
+    body_bins::Integer = 100,
+)
+    length(counts) < 2 * flank + 2 && return nothing
+    frequency = Vector{Float64}(counts) ./ n_measurements
+    body = frequency[flank+1:end-flank]
+    body_binned =
+        linear_interpolation(range(0, 1; length = length(body)), body).(
+            range(0, 1; length = body_bins)
+        )
+    return vcat(frequency[1:flank], body_binned, frequency[end-flank+1:end])
+end
+
+"""
+    mean_gene_profile(feature_frequency; exclude = Set{String}(), flank = 500, body_bins = 100)
+
+Average the per-gene [`gene_profile`](@ref)s in `feature_frequency` into a single
+metagene profile of length `2 * flank + body_bins`. Genes listed in `exclude`, or
+whose stored vector is too short for a body, are skipped. Returns an all-zero
+profile when no gene qualifies.
+"""
+function mean_gene_profile(
+    feature_frequency::FeatureFrequency;
+    exclude = Set{String}(),
+    flank::Integer = 500,
+    body_bins::Integer = 100,
+)
+    accumulator = zeros(Float64, 2 * flank + body_bins)
+    n_genes = 0
+    for (gene_id, counts) in feature_frequency.features
+        gene_id in exclude && continue
+        profile = gene_profile(counts, feature_frequency.n; flank, body_bins)
+        profile === nothing && continue
+        accumulator .+= profile
+        n_genes += 1
+    end
+    return accumulator ./ max(n_genes, 1)
+end
+
+export coverage,
+    kde,
+    quantiles,
+    calculate_frequency,
+    feature_frequency,
+    FeatureFrequency,
+    gene_profile,
+    mean_gene_profile
 
 
 end
