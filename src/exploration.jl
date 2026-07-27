@@ -69,11 +69,7 @@ fit to each scaffold's vector of fractions. Returns a `Dict` mapping scaffold
 name to a `UnivariateKDE`, or to `nothing` when the scaffold has no fractions to
 fit (for example when `filter_zeros` removed them all).
 """
-function kde(
-    data::BedData,
-    feature::Union{String,Symbol};
-    filter_zeros::Bool = false,
-)
+function kde(data::BedData, feature::Union{String,Symbol}; filter_zeros::Bool = false)
     frac_coverage = coverage(data, feature, filter_zeros = filter_zeros)
     coverage_kde = Dict{String,Union{Nothing,UnivariateKDE}}()
     for k in keys(frac_coverage)
@@ -83,11 +79,7 @@ function kde(
     return coverage_kde
 end
 
-function kde(
-    data::TabularData;
-    filter_zeros::Bool = false,
-    transform::Function = identity
-)
+function kde(data::TabularData; filter_zeros::Bool = false, transform::Function = identity)
     flat = data.table |> vec |> xs -> map(transform, xs)
     if filter_zeros
         flat = filter(x -> x != 0, flat)
@@ -192,9 +184,8 @@ function calculate_frequency(measurements::Vector{BedData}; merge::Bool = true)
     # Pre-populate every key so the parallel loop only overwrites existing
     # entries. Inserting new keys concurrently would race on the Dict's internal
     # structure; overwriting the value of an existing key does not.
-    genome = Dict{String,SparseVector{T,Int}}(
-        name => spzeros(T, 0) for name in scaffold_names
-    )
+    genome =
+        Dict{String,SparseVector{T,Int}}(name => spzeros(T, 0) for name in scaffold_names)
 
     Threads.@threads for name in scaffold_names
         # Difference array: +1 where a segment starts, -1 just past its end. The
@@ -333,12 +324,11 @@ function gene_profile(
 )
     length(counts) < 2 * flank + 2 && return nothing
     frequency = Vector{Float64}(counts) ./ n_measurements
-    body = frequency[flank+1:end-flank]
-    body_binned =
-        linear_interpolation(range(0, 1; length = length(body)), body).(
-            range(0, 1; length = body_bins)
-        )
-    return vcat(frequency[1:flank], body_binned, frequency[end-flank+1:end])
+    body = frequency[(flank+1):(end-flank)]
+    body_binned = linear_interpolation(range(0, 1; length = length(body)), body).(
+        range(0, 1; length = body_bins),
+    )
+    return vcat(frequency[1:flank], body_binned, frequency[(end-flank+1):end])
 end
 
 """

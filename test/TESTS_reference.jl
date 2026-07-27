@@ -82,8 +82,7 @@ end
             @test result.start_pos == UInt32(5)
             @test result.end_pos == UInt32(20)
             @test Reference.parse_index(result.code) == UInt32(7)
-            @test Reference.parse_strand(result.code) ==
-                  GFF3.GenomicFeatures.STRAND_POS
+            @test Reference.parse_strand(result.code) == GFF3.GenomicFeatures.STRAND_POS
             @test Reference.parse_so_term(result.code) == Reference.convert_so_term("gene")
             @test result.id == "GENE0001"
             @test result.source == "RefSeq"
@@ -95,11 +94,7 @@ end
                 "chr1\tRefSeq\tmRNA\t10\t30\t.\t-\t.\tID=transcript:TX0001;gene_biotype=ncRNA",
             )
 
-            result = Reference.parse_record(
-                record,
-                UInt32(8);
-                sanitize_ids = false,
-            )
+            result = Reference.parse_record(record, UInt32(8); sanitize_ids = false)
 
             @test result.id == "transcript:TX0001"
             @test Reference.parse_strand(result.code) == GFF3.GenomicFeatures.STRAND_NEG

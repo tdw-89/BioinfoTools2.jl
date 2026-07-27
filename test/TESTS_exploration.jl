@@ -155,8 +155,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             end
 
             @testset "filter_zeros drops uncovered features" begin
-                vfz =
-                    coverage(bed_full, :gene; filter_zeros = true)["NC_003280.10"]
+                vfz = coverage(bed_full, :gene; filter_zeros = true)["NC_003280.10"]
                 @test all(==(1.0), vfz)
                 @test length(vfz) == n_genes
             end
