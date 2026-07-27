@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Tom Wolfe <thomas_wolfe@student.uml.edu>"]
 
 [deps]
+Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
 BED = "8e4a8c10-cb6b-11e8-08d2-83478d609d67"
 BioGenerics = "47718e42-2ac5-11e9-14af-e5595289c2ea"
 BioSequences = "7e6ae17a-c86d-528c-b3b9-7f778a29fe59"
@@ -25,8 +26,10 @@ MultipleTesting = "f8716d33-7c4a-5097-896f-ce0ecbd3ef6b"
 OhMyREPL = "5fb14364-9ced-5910-84b2-373655c76a03"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
 StatsBase = "2913bbd2-ae8a-5f71-8c99-4fb6c76f3a91"
+StructArrays = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
 
 [compat]
+Arrow = "2.8.1"
 BED = "0.3.1"
 BioGenerics = "0.1.5"
 BioSequences = "3.5.1"
@@ -47,3 +50,4 @@ KernelDensity = "0.6.12"
 MultipleTesting = "0.6.0"
 OhMyREPL = "0.5.32"
 StatsBase = "0.34.12"
+StructArrays = "0.7.3"

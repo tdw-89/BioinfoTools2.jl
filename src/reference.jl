@@ -5,9 +5,19 @@ using CodecZlib
 using GFF3
 using IntervalTrees
 
+using ..BitCodes
 using ..SOTerms
 
 const RECORD_BUFFER = 1_000
+
+# Field layout of the 64-bit feature metadata code (see `Genome` and
+# `pack_metadata`). Offsets are 0-based bit positions.
+const INDEX_SHIFT = 0
+const INDEX_WIDTH = 32
+const STRAND_SHIFT = 32
+const STRAND_FIELD_WIDTH = 8
+const SO_SHIFT = 40
+const SO_WIDTH = 16
 const IntervalTreeM64 = IntervalTree{UInt32,IntervalValue{UInt32,UInt64}}
 
 """
@@ -87,24 +97,12 @@ function Species(name::String; taxon_id::String = "")
     return Species(name, taxon_id, genome)
 end
 
-function get_strand(strand::Char)
-  strand == '+' && return GFF3.GenomicFeatures.STRAND_POS
-  strand == '-' && return GFF3.GenomicFeatures.STRAND_NEG
-  strand == '.' && return GFF3.GenomicFeatures.STRAND_BOTH
-  return GFF3.GenomicFeatures.STRAND_NA
-end
-
-function convert_strand(strand::GFF3.GenomicFeatures.Strand)
-    if strand == GFF3.GenomicFeatures.STRAND_POS
-        UInt8(1)
-    elseif strand == GFF3.GenomicFeatures.STRAND_NEG
-        UInt8(2)
-    elseif strand == GFF3.GenomicFeatures.STRAND_BOTH
-        UInt8(3)
-    else
-        UInt8(0)
-    end
-end
+"""
+Encode a `GenomicFeatures.Strand` using the package-wide 2-bit strand codes
+(see `BitCodes`). Kept as an alias so `Reference`'s own call sites read the same
+as they did before the encoding was centralised.
+"""
+convert_strand(strand::GFF3.GenomicFeatures.Strand) = BitCodes.strand_code(strand)
 
 """Get the 16-bit code for a given SO term label"""
 function convert_so_term(label::String)
@@ -118,34 +116,28 @@ end
 """
 |-<NULL>-|-----SO-Term-----|-Strand-|---------------Index---------------|
 |00000000|00000000|00000000|00000000|00000000|00000000|00000000|00000000|
+
+`strand` uses the package-wide 2-bit strand codes (see `BitCodes`); the field is
+8 bits wide, so its upper 6 bits are always zero.
 """
 function pack_metadata(index::UInt32, strand::UInt8, so_term::UInt16)
     code = UInt64(0)
-    code = code | UInt64(index)
-    code = code | (UInt64(strand) << 32)
-    code = code | (UInt64(so_term) << (32 + 8))
+    code = set_field(code, index, INDEX_SHIFT, INDEX_WIDTH)
+    code = set_field(code, strand, STRAND_SHIFT, STRAND_FIELD_WIDTH)
+    code = set_field(code, so_term, SO_SHIFT, SO_WIDTH)
     return code
 end
 
 function parse_index(code::UInt64)
-    return UInt32(code & 0x00000000FFFFFFFF)
+    return UInt32(get_field(code, INDEX_SHIFT, INDEX_WIDTH))
 end
 
 function parse_strand(code::UInt64)
-    bit_code = UInt8((code >> 32) & 0xFF)
-    if bit_code == 1
-        return GFF3.GenomicFeatures.STRAND_POS
-    elseif bit_code == 2
-        return GFF3.GenomicFeatures.STRAND_NEG
-    elseif bit_code == 3
-        return GFF3.GenomicFeatures.STRAND_BOTH
-    else
-        return GFF3.GenomicFeatures.STRAND_NA
-    end
+    return decode_strand(get_field(code, STRAND_SHIFT, STRAND_FIELD_WIDTH))
 end
 
 function parse_so_term(code::UInt64)
-    return UInt16(code >> (32 + 8)) & 0xFFFF
+    return UInt16(get_field(code, SO_SHIFT, SO_WIDTH))
 end
 
 """
@@ -167,7 +159,7 @@ function parse_record(
     record::GFF3.Record,
     meta_index::UInt32;
     sanitize_ids::Bool = true,
-)::Union{Nothing, ParseResult}
+)::Union{Nothing,ParseResult}
     # interned
     scaffold = GFF3.seqname(record)
     feature_attr = GFF3.attributes(record) |> Dict

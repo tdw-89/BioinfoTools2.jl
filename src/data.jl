@@ -8,9 +8,14 @@ using DataFrames
 using Dates
 using GFF3
 using IntervalTrees
+using ..BitCodes
 using ..Reference
 
 using Base: ImmutableDict
+
+# Field layout of the 64-bit BED metadata code (see `pack_bed_code`).
+const BED_STRAND_SHIFT = 32
+const BED_STRAND_WIDTH = 8
 
 """
 Interval tree type for BED data. Consists of a single sample's measurements,
@@ -39,13 +44,13 @@ The `value` of the variable is really the name of the incoming edge.
 """
 struct Variable{T<:Number}
     value::AbstractString
-    covariates::Union{Nothing, ImmutableDict{String, Variable{T}}}
-    data::Union{Nothing, TabularData{T}, BedData}
+    covariates::Union{Nothing,ImmutableDict{String,Variable{T}}}
+    data::Union{Nothing,TabularData{T},BedData}
 
     function Variable{T}(
         value::AbstractString,
-        covariates::Union{Nothing, ImmutableDict{String, Variable{T}}},
-        data::Union{Nothing, TabularData{T}, BedData},
+        covariates::Union{Nothing,ImmutableDict{String,Variable{T}}},
+        data::Union{Nothing,TabularData{T},BedData},
     ) where {T<:Number}
         only_one = isnothing(covariates) ⊻ isnothing(data)
         if !only_one
@@ -96,11 +101,7 @@ end
 # extension: anything ending in `.bed` becomes `BedData`, everything else is
 # read as a table and matched against `genome` as `TabularData{T}` (its numeric
 # columns coerced to `T`).
-function _load_sample(
-    ::Type{T},
-    genome::Genome,
-    path::AbstractString,
-) where {T<:Number}
+function _load_sample(::Type{T}, genome::Genome, path::AbstractString) where {T<:Number}
     endswith(lowercase(String(path)), ".bed") && return load_bed(genome, String(path))
 
     df = CSV.read(path, DataFrame)
@@ -124,12 +125,9 @@ extension: paths ending in `.bed` load as `BedData`, everything else loads as
 `TabularData{T}` (numeric columns coerced to `T`). `T` defaults to `Float64`.
 """
 struct Experiment{T<:Number}
-    variables::ImmutableDict{String, Variable{T}}
+    variables::ImmutableDict{String,Variable{T}}
 
-    function Experiment{T}(
-        genome::Genome,
-        sample_sheet::DataFrame,
-    ) where {T<:Number}
+    function Experiment{T}(genome::Genome, sample_sheet::DataFrame) where {T<:Number}
         ncols = ncol(sample_sheet)
         ncols >= 2 || throw(
             ArgumentError(
@@ -275,7 +273,12 @@ demand) rather than maintaining an ID index.
 function Base.getindex(t::TabularData, id::AbstractString)
     for (row, sample) in enumerate(t.samples)
         if sample_id(t.genome, sample) == id
-            return TabularData(t.genome, copy(t.variables), t.samples[row:row], t.table[row:row, :])
+            return TabularData(
+                t.genome,
+                copy(t.variables),
+                t.samples[row:row],
+                t.table[row:row, :],
+            )
         end
     end
     return nothing
@@ -306,15 +309,20 @@ of the requested variables are present).
 """
 function DataFrames.select(
     t::TabularData,
-    variables::Union{AbstractString, AbstractVector{<:AbstractString}}
-)::Union{Nothing, TabularData}
+    variables::Union{AbstractString,AbstractVector{<:AbstractString}},
+)::Union{Nothing,TabularData}
     variables = variables isa AbstractString ? [variables] : variables
     if variables ∩ t.variables |> isempty
         return nothing
     end
 
     var_indices = findall(v -> v in variables, t.variables)
-    return TabularData(t.genome, t.variables[var_indices], t.samples, t.table[:, var_indices])
+    return TabularData(
+        t.genome,
+        t.variables[var_indices],
+        t.samples,
+        t.table[:, var_indices],
+    )
 end
 
 """
@@ -342,30 +350,25 @@ Bits 33-40 encode strand using the same scheme as gene intervals in `Scaffold`.
 | <NULL>  | <NULL>  | Strand |        <NULL>          |
 
 - Bits  1-32 : reserved
-- Bits 33-40 : strand (0 = unknown/unstranded, 1 = +, 2 = -)
+- Bits 33-40 : strand, as the package-wide 2-bit strand codes (see `BitCodes`:
+  0 = `+`, 1 = `-`, 2 = both, 3 = unknown/NA)
 - Bits 41-64 : reserved
 """
 function pack_bed_code(strand::UInt8)
-    return UInt64(strand) << 32
+    return set_field(UInt64(0), strand, BED_STRAND_SHIFT, BED_STRAND_WIDTH)
 end
 
 function parse_bed_strand(code::UInt64)
-    return UInt8((code >> 32) & 0xFF)
+    return UInt8(get_field(code, BED_STRAND_SHIFT, BED_STRAND_WIDTH))
 end
 
 """
-Convert a BED record's strand field to the same UInt8 encoding used by genes.
+Convert a BED record's strand field to the package-wide 2-bit strand code
+(see `BitCodes`). Records without a strand field are encoded as `STRAND_NA`.
 """
 function bed_record_strand(record::BED.Record)
-    BED.hasstrand(record) || return UInt8(0)
-    s = BED.strand(record)
-    if s == GFF3.GenomicFeatures.STRAND_POS
-        UInt8(1)
-    elseif s == GFF3.GenomicFeatures.STRAND_NEG
-        UInt8(2)
-    else
-        UInt8(0)
-    end
+    BED.hasstrand(record) || return STRAND_NA
+    return strand_code(BED.strand(record))
 end
 
 function load_bed(genome::Genome, file_path::String)
@@ -571,13 +574,6 @@ function Base.show(io::IO, t::TabularData)
     print(io, "TabularData($(r)×$(c) $(eltype(t.table)))")
 end
 
-export
-    BedData,
-    TabularData,
-    intersect,
-    leftjoin,
-    load_bed,
-    load_table,
-    merge_segments
+export BedData, TabularData, intersect, leftjoin, load_bed, load_table, merge_segments
 
 end

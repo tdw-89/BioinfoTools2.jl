@@ -1,9 +1,12 @@
 [deps]
+Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
 BioGenerics = "47718e42-2ac5-11e9-14af-e5595289c2ea"
 CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 GFF3 = "af1dc308-cb6b-11e8-32f0-31192efa90f6"
 IntervalTrees = "524e6230-43b7-53ae-be76-1e9e4d08d11b"
 KernelDensity = "5ab0869b-81aa-558d-bb23-cbf5423bbe9b"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+StructArrays = "09ab397b-f2b6-538f-b94a-2f83cf4a842a"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"

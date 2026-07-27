@@ -1,6 +1,8 @@
+using BioinfoTools2.BitCodes
 using BioinfoTools2.Data
 using BioinfoTools2.Reference
 using DataFrames
+using GFF3
 using IntervalTrees
 using Test
 
@@ -18,13 +20,14 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
     # -------------------------------------------------------------------------
     @testset "pack_bed_code / parse_bed_strand roundtrip" begin
-        @test Data.parse_bed_strand(Data.pack_bed_code(UInt8(0))) == UInt8(0)
-        @test Data.parse_bed_strand(Data.pack_bed_code(UInt8(1))) == UInt8(1)
-        @test Data.parse_bed_strand(Data.pack_bed_code(UInt8(2))) == UInt8(2)
+        # BED intervals use the package-wide strand codes (see BitCodes).
+        for strand in (STRAND_FWD, STRAND_REV, STRAND_BOTH, STRAND_NA)
+            @test Data.parse_bed_strand(Data.pack_bed_code(strand)) == strand
+        end
 
         # Only bits 33-40 should be set; all other bits must remain zero
-        @test (Data.pack_bed_code(UInt8(1)) & ~(UInt64(0xFF) << 32)) == UInt64(0)
-        @test (Data.pack_bed_code(UInt8(2)) & ~(UInt64(0xFF) << 32)) == UInt64(0)
+        @test (Data.pack_bed_code(STRAND_REV) & ~(UInt64(0xFF) << 32)) == UInt64(0)
+        @test (Data.pack_bed_code(STRAND_BOTH) & ~(UInt64(0xFF) << 32)) == UInt64(0)
     end
 
     # -------------------------------------------------------------------------
@@ -39,12 +42,14 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
     # -------------------------------------------------------------------------
     @testset "load_bed - strand encoding in micro.narrowPeak" begin
-        # All 8 records in micro.narrowPeak have strand '.' → UInt8(0)
+        # All 8 records in micro.narrowPeak have strand '.' → STRAND_BOTH
         bd = load_bed(test_genome, MICRO_NARROWPEAK)
 
         for (_, tree) in bd.scaffolds
             for iv in tree
-                @test Data.parse_bed_strand(iv.value) == UInt8(0)
+                @test Data.parse_bed_strand(iv.value) == STRAND_BOTH
+                @test Data.parse_bed_strand(iv.value) |> decode_strand ==
+                      GFF3.GenomicFeatures.STRAND_BOTH
             end
         end
     end
