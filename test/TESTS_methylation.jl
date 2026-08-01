@@ -9,6 +9,7 @@ using Test
 
 const MT_DATA_DIR = joinpath(@__DIR__, "data")
 const MICRO_BISMARK = joinpath(MT_DATA_DIR, "micro_CpG_OT.txt")
+const MICRO_COV = joinpath(MT_DATA_DIR, "micro.cov")
 
 # Reference counts for micro_CpG_OT.txt (chromosome 15, 406 records over 76
 # sites), computed independently of the loader by scanning the fixture here.
@@ -20,6 +21,18 @@ function reference_counts(path)
         pos = parse(UInt32, fields[4])
         meth, unmeth = get(counts, pos, (0, 0))
         counts[pos] = fields[5] == "Z" ? (meth + 1, unmeth) : (meth, unmeth + 1)
+    end
+    return counts
+end
+
+# Reference counts for micro.cov (the same chromosome-15 window as
+# micro_CpG_OT.txt, 151 cytosines on both strands), read straight out of the
+# fixture's count columns rather than through the loader.
+function reference_cov_counts(path)
+    counts = Dict{UInt32,Tuple{Int,Int}}()
+    for line in eachline(path)
+        fields = split(line, '\t')
+        counts[parse(UInt32, fields[2])] = (parse(Int, fields[5]), parse(Int, fields[6]))
     end
     return counts
 end
@@ -357,6 +370,201 @@ end
         end
 
         @test n_sites(load_bismark(String[])) == 0
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "load_bismark_cov - micro.cov" begin
+        data = load_bismark_cov(MICRO_COV)
+
+        @test data isa MethylationData
+        @test collect(keys(data)) == ["15"]
+
+        calls = data["15"]
+        @test calls isa StructArray{AggregatedCall}
+        @test length(calls) == 151
+        @test n_sites(data) == 151
+        @test issorted(calls.pos)
+        @test allunique(calls.pos)
+
+        # Coverage files carry counts, not per-read calls, so the total depth is
+        # the sum of the two count columns.
+        @test sum(Int(get_depth(c)) for c in calls) == 776
+        @test sum(Int(get_meth(c)) for c in calls) == 656
+
+        # Neither context nor strand is recorded in a .cov file: the context
+        # comes from the default and the strand stays NA for this file name.
+        @test all(c -> get_context(c) == CTX_CPG, calls)
+        @test all(c -> Methylation.get_strand_code(c) == STRAND_NA, calls)
+        @test all(c -> get_strand(c) == GFF3.GenomicFeatures.STRAND_NA, calls)
+
+        # Per-site counts match an independent read of the fixture.
+        expected = reference_cov_counts(MICRO_COV)
+        @test length(expected) == 151
+        for call in calls
+            meth, unmeth = expected[call.pos]
+            @test get_meth(call) == meth
+            @test get_unmeth(call) == unmeth
+        end
+
+        # Coordinates are already 1-based, so they line up with the
+        # methylation-extractor fixture covering the same window: every one of
+        # its 76 forward-strand sites appears in the coverage file with exactly
+        # the same counts.
+        extractor = load_bismark(MICRO_BISMARK)["15"]
+        @test length(extractor) == 76
+        for call in extractor
+            hit = find_calls_in_range(calls, call.pos, call.pos)
+            @test length(hit) == 1
+            @test get_meth(hit[1]) == get_meth(call)
+            @test get_unmeth(hit[1]) == get_unmeth(call)
+        end
+
+        window = find_calls_in_range(data, "15", 31971000, 31971100)
+        @test [Int(c.pos) for c in window] == [
+            31971008,
+            31971009,
+            31971022,
+            31971023,
+            31971030,
+            31971031,
+            31971047,
+            31971048,
+            31971069,
+            31971070,
+            31971077,
+            31971078,
+        ]
+        @test find_calls_in_range(data, "no_such_scaffold", 1, 100) === nothing
+
+        # Explicit context / strand override the defaults.
+        typed = load_bismark_cov(MICRO_COV; context = CTX_CHH, strand = STRAND_FWD)
+        @test all(c -> get_context(c) == CTX_CHH, typed["15"])
+        @test all(is_forward, typed["15"])
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "load_bismark_cov - parsing rules" begin
+        data = load_bismark_cov(
+            IOBuffer(
+                "chr1\t100\t100\t75\t3\t1\n" *
+                "chr1\t200\t200\t0\t0\t5\n" *
+                "chr2\t50\t50\t100\t2\t0\n",
+            ),
+        )
+        @test sort(collect(keys(data))) == ["chr1", "chr2"]
+        @test data["chr1"][1] == AggregatedCall(100, 3, 1, CTX_CPG, STRAND_NA)
+        @test data["chr1"][2] == AggregatedCall(200, 0, 5, CTX_CPG, STRAND_NA)
+        @test meth_fraction(data["chr1"][1]) ≈ 0.75
+        # The percentage column is ignored; the counts are authoritative.
+        @test data["chr2"][1] == AggregatedCall(50, 2, 0, CTX_CPG, STRAND_NA)
+
+        # Unsorted input comes out sorted, and repeated positions are summed.
+        messy = load_bismark_cov(
+            IOBuffer(
+                "c\t30\t30\t100\t2\t0\n" *
+                "c\t10\t10\t50\t1\t1\n" *
+                "c\t30\t30\t100\t4\t3\n" *
+                "c\t20\t20\t0\t0\t9\n",
+            ),
+        )
+        calls = messy["c"]
+        @test [Int(c.pos) for c in calls] == [10, 20, 30]
+        @test calls[3] == AggregatedCall(30, 6, 3, CTX_CPG, STRAND_NA)
+
+        # Blank, truncated and unparseable lines are skipped; extra trailing
+        # columns are tolerated.
+        skipped = load_bismark_cov(
+            IOBuffer(
+                "\n" *
+                "chr1\t100\t100\n" *                  # too few fields
+                "chr1\tnotanumber\t100\t50\t1\t1\n" * # unparseable position
+                "chr1\t300\t300\t50\tone\t1\n" *      # unparseable count
+                "chr1\t400\t400\t50\t1\t\n" *         # empty count
+                "\t500\t500\t50\t1\t1\n" *            # empty scaffold name
+                "chr1\t600\t600\t50\t3\t3\textra\n",
+            ),
+        )
+        @test n_sites(skipped) == 1
+        @test skipped["chr1"][1] == AggregatedCall(600, 3, 3, CTX_CPG, STRAND_NA)
+
+        # A file with no usable records yields an empty dataset.
+        @test n_sites(load_bismark_cov(IOBuffer(""))) == 0
+
+        # Counts above the 12-bit field saturate rather than wrapping, and only
+        # after repeated lines for a site have been summed.
+        big = load_bismark_cov(
+            IOBuffer(
+                "c\t1\t1\t100\t9000\t20\n" *
+                "c\t2\t2\t50\t3000\t2000\nc\t2\t2\t50\t3000\t2000\n",
+            ),
+        )
+        @test get_meth(big["c"][1]) == MAX_COUNT
+        @test get_unmeth(big["c"][1]) == 20
+        @test get_meth(big["c"][2]) == MAX_COUNT
+        @test get_unmeth(big["c"][2]) == 4000
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "load_bismark_cov - gzipped input" begin
+        plain = load_bismark_cov(MICRO_COV)
+
+        gz_path = joinpath(mktempdir(), "micro.cov.gz")
+        open(GzipCompressorStream, gz_path, "w") do io
+            write(io, read(MICRO_COV))
+        end
+
+        gzipped = load_bismark_cov(gz_path)
+        @test n_sites(gzipped) == n_sites(plain)
+        @test all(gzipped["15"][i] == plain["15"][i] for i in eachindex(plain["15"]))
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "load_bismark_cov - multiple files merged" begin
+        dir = mktempdir()
+        ob_path = joinpath(dir, "CpG_OB_micro.cov")
+        cp(MICRO_COV, ob_path)
+
+        # The strand of each file is inferred from its name by default, so the
+        # copy lands on the reverse strand and stays separate from the original.
+        merged = load_bismark_cov([MICRO_COV, ob_path])
+        @test n_sites(merged) == 302
+        @test issorted(merged["15"].pos)
+        @test count(c -> Methylation.get_strand_code(c) == STRAND_NA, merged["15"]) == 151
+        @test count(
+            c -> !is_forward(c) && get_strand(c) == GFF3.GenomicFeatures.STRAND_NEG,
+            merged["15"],
+        ) == 151
+
+        # A fixed strand instead makes the two files sum into one set of sites.
+        doubled = load_bismark_cov([MICRO_COV, ob_path]; strand = STRAND_FWD)
+        single = load_bismark_cov(MICRO_COV)
+        @test n_sites(doubled) == 151
+        for (a, b) in zip(doubled["15"], single["15"])
+            @test a.pos == b.pos
+            @test get_meth(a) == 2 * get_meth(b)
+            @test get_unmeth(a) == 2 * get_unmeth(b)
+        end
+
+        # `context` accepts a function of the path too.
+        by_name = load_bismark_cov(
+            [MICRO_COV, ob_path];
+            context = p -> occursin("OB", basename(p)) ? CTX_CHG : CTX_CPG,
+        )
+        @test count(c -> get_context(c) == CTX_CHG, by_name["15"]) == 151
+        @test count(c -> get_context(c) == CTX_CPG, by_name["15"]) == 151
+
+        @test n_sites(load_bismark_cov(String[])) == 0
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "load_bismark_cov - Arrow round-trip" begin
+        data = load_bismark_cov(MICRO_COV)
+        dir = joinpath(mktempdir(), "cov")
+        write_methylation(dir, data)
+
+        restored = read_methylation(dir)
+        @test collect(keys(restored)) == ["15"]
+        @test all(restored["15"][i] == data["15"][i] for i in eachindex(data["15"]))
     end
 
     # -------------------------------------------------------------------------

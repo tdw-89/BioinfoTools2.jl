@@ -368,6 +368,7 @@ function aggregate_keys!(keys::Vector{UInt64})
         site = keys[i] >>> 1
         meth = 0
         unmeth = 0
+
         # Walk the run of raw calls belonging to this (pos, context, strand).
         while i <= n && (keys[i] >>> 1) == site
             key_meth(keys[i]) ? (meth += 1) : (unmeth += 1)
@@ -438,10 +439,18 @@ explicitly for files whose names don't follow the convention.
 The version header, blank lines, and any malformed line are skipped.
 """
 function load_bismark(path::AbstractString; strand::Integer = infer_strand(path))
+    return open_maybe_gzip(path) do io
+        load_bismark(io; strand = strand)
+    end
+end
+
+# Open `path` for reading and hand the stream to `f`, transparently
+# decompressing it when the name ends in ".gz".
+function open_maybe_gzip(f, path::AbstractString)
     return open(path) do fh
         io = endswith(path, ".gz") ? GzipDecompressorStream(fh) : fh
         try
-            load_bismark(io; strand = strand)
+            f(io)
         finally
             io === fh || close(io)
         end
@@ -464,6 +473,218 @@ function load_bismark(paths::AbstractVector{<:AbstractString}; strand = infer_st
     return merge_calls(
         load_bismark(path; strand = strand isa Function ? strand(path) : strand) for
         path in paths
+    )
+end
+
+#= Bismark coverage (.cov) parsing =#
+
+# Parse one Bismark coverage line into (chrom, pos, meth, unmeth).
+#
+# Expected layout (tab separated):
+#   <chromosome> <start> <end> <methylation %> <count meth> <count unmeth>
+#
+# Unlike the methylation-extractor format this is already aggregated: one line
+# per cytosine, carrying counts rather than a single read's call. `start` is
+# 1-based (and equals `end` for a single cytosine), so it is used as-is; the
+# percentage is redundant with the two counts and is skipped. Trailing columns
+# beyond the sixth are tolerated and ignored.
+#
+# Returns `nothing` for blank lines and anything without the six expected
+# fields, so those are skipped rather than aborting a load. Field boundaries are
+# located by index so the chromosome is read as a `SubString`, without
+# allocating per record.
+@inline function parse_cov_line(line::AbstractString)
+    isempty(line) && return nothing
+
+    t1 = findfirst('\t', line)
+    t1 === nothing && return nothing
+    t2 = findnext('\t', line, t1 + 1)
+    t2 === nothing && return nothing
+    t3 = findnext('\t', line, t2 + 1)
+    t3 === nothing && return nothing
+    t4 = findnext('\t', line, t3 + 1)
+    t4 === nothing && return nothing
+    t5 = findnext('\t', line, t4 + 1)
+    t5 === nothing && return nothing
+
+    t1 > firstindex(line) || return nothing
+    lastindex(line) >= t5 + 1 || return nothing
+
+    chrom = SubString(line, firstindex(line), t1 - 1)
+    pos = tryparse(UInt32, SubString(line, t1 + 1, t2 - 1))
+    pos === nothing && return nothing
+    meth = tryparse(UInt32, SubString(line, t4 + 1, t5 - 1))
+    meth === nothing && return nothing
+
+    t6 = findnext('\t', line, t5 + 1)
+    unmeth =
+        tryparse(UInt32, SubString(line, t5 + 1, t6 === nothing ? lastindex(line) : t6 - 1))
+    unmeth === nothing && return nothing
+
+    return (chrom, pos, meth, unmeth)
+end
+
+# One scaffold's coverage records in file order. The counts arrive already
+# aggregated, so unlike the extractor path there is nothing to tally — the three
+# columns are just accumulated and then collapsed by `collapse_cov!`.
+struct CovBuffer
+    pos::Vector{UInt32}
+    meth::Vector{UInt32}
+    unmeth::Vector{UInt32}
+end
+
+CovBuffer() = CovBuffer(UInt32[], UInt32[], UInt32[])
+
+@inline function push_cov!(buf::CovBuffer, pos::UInt32, meth::UInt32, unmeth::UInt32)
+    push!(buf.pos, pos)
+    push!(buf.meth, meth)
+    push!(buf.unmeth, unmeth)
+    return buf
+end
+
+# Collapse one scaffold's coverage records into position-sorted per-site calls.
+#
+# A `.cov` file is normally already sorted and holds one line per cytosine, so
+# both the sort and the duplicate-summing scan are usually no-ops — but neither
+# is guaranteed (concatenated or re-ordered files repeat sites), and
+# `find_calls_in_range` needs the sort, so both are done regardless. Counts are
+# summed as `Int` and only saturate once, when the payload is packed.
+function collapse_cov!(buf::CovBuffer, context::UInt8, strand::UInt8)
+    positions, meth, unmeth = buf.pos, buf.meth, buf.unmeth
+
+    if !issorted(positions)
+        order = sortperm(positions)
+        permute!(positions, order)
+        permute!(meth, order)
+        permute!(unmeth, order)
+    end
+
+    n = length(positions)
+    out_pos = UInt32[]
+    out_payload = UInt32[]
+    sizehint!(out_pos, n)
+    sizehint!(out_payload, n)
+
+    i = 1
+    while i <= n
+        site = positions[i]
+        m = Int(meth[i])
+        u = Int(unmeth[i])
+        i += 1
+        while i <= n && positions[i] == site
+            m += Int(meth[i])
+            u += Int(unmeth[i])
+            i += 1
+        end
+        push!(out_pos, site)
+        push!(out_payload, pack_payload(m, u, context, strand))
+    end
+
+    return aggregated_calls(out_pos, out_payload)
+end
+
+"""
+    load_bismark_cov(io; context = CTX_CPG, strand = STRAND_NA)
+
+Read Bismark coverage records from `io` and pack them into per-site calls (see
+[`load_bismark_cov(::AbstractString)`](@ref) for the file-based method, which
+also infers `strand` from the file name).
+"""
+function load_bismark_cov(io::IO; context::Integer = CTX_CPG, strand::Integer = STRAND_NA)
+    context_bits = UInt8(context) & 0x03
+    strand_bits = UInt8(strand) & 0x03
+    raw = Dict{String,CovBuffer}()
+
+    for line in eachline(io)
+        record = parse_cov_line(line)
+        record === nothing && continue
+        chrom, pos, meth, unmeth = record
+
+        # `get` with a SubString key hits the same hash as the interned String,
+        # so a scaffold name is only materialised the first time it is seen.
+        buf = get(raw, chrom, nothing)
+        if buf === nothing
+            buf = CovBuffer()
+            raw[String(chrom)] = buf
+        end
+        push_cov!(buf, pos, meth, unmeth)
+    end
+
+    scaffolds = Dict{String,StructArray{AggregatedCall}}()
+    for (chrom, buf) in raw
+        scaffolds[chrom] = collapse_cov!(buf, context_bits, strand_bits)
+    end
+    return MethylationData(scaffolds)
+end
+
+"""
+    load_bismark_cov(path; context = CTX_CPG, strand = infer_strand(path))
+
+Load a Bismark coverage file (`.cov`, optionally gzipped) into a
+[`MethylationData`](@ref) of per-site counts.
+
+This is Bismark's *aggregated* output — what `bismark2bedGraph`/
+`coverage2cytosine` write, as opposed to the per-read methylation-extractor
+records [`load_bismark`](@ref) reads. Each line is one cytosine:
+
+```
+<chromosome>	<start>	<end>	<methylation %>	<count methylated>	<count unmethylated>
+```
+
+Coordinates are already 1-based and `start == end` for a single cytosine, so
+`start` is taken as the position and `end` ignored. The percentage column is
+redundant with the two counts and is ignored as well; the counts are packed
+straight into an [`AggregatedCall`](@ref), saturating at [`MAX_COUNT`](@ref).
+Repeated lines for the same position (concatenated files) are summed, and each
+scaffold's calls are sorted by position.
+
+A `.cov` file records **neither the context nor the strand**, so both are
+supplied by the caller:
+
+- `context` defaults to [`CTX_CPG`](@ref) because Bismark's default coverage
+  output is CpG-only. Pass the right code for a single-context `--CX` run, or
+  [`CTX_UNKNOWN`](@ref) for a mixed-context one — a mixed file cannot be split
+  by context after the fact, since the information simply is not in it.
+- `strand` defaults to whatever [`infer_strand`](@ref) makes of the file name,
+  which is [`STRAND_NA`](@ref) for the usual whole-sample coverage file (its
+  counts are pooled across strands anyway). Pass a code explicitly for coverage
+  generated from one strand's extractor output.
+
+Blank lines and any line without the six expected fields are skipped.
+"""
+function load_bismark_cov(
+    path::AbstractString;
+    context::Integer = CTX_CPG,
+    strand::Integer = infer_strand(path),
+)
+    return open_maybe_gzip(path) do io
+        load_bismark_cov(io; context = context, strand = strand)
+    end
+end
+
+"""
+    load_bismark_cov(paths; context = CTX_CPG, strand = infer_strand)
+
+Load several Bismark coverage files and merge them into a single
+[`MethylationData`](@ref), summing the counts of entries that share a position,
+context and strand.
+
+`context` and `strand` may each be a fixed code applied to every file, or a
+function mapping a path to a code (`strand` defaults to inferring it from each
+file's name).
+"""
+function load_bismark_cov(
+    paths::AbstractVector{<:AbstractString};
+    context = CTX_CPG,
+    strand = infer_strand,
+)
+    isempty(paths) && return MethylationData()
+    return merge_calls(
+        load_bismark_cov(
+            path;
+            context = context isa Function ? context(path) : context,
+            strand = strand isa Function ? strand(path) : strand,
+        ) for path in paths
     )
 end
 
@@ -701,6 +922,7 @@ export AggregatedCall,
     infer_strand,
     is_forward,
     load_bismark,
+    load_bismark_cov,
     merge_calls,
     meth_fraction,
     n_sites,
