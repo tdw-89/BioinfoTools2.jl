@@ -1,29 +1,53 @@
+"""
+Single-base methylation calls.
+
+A submodule of [`Data`](@ref) because methylation is just another per-sample
+signal sitting on top of a reference sequence. It is, however, the one such
+signal that is purely *positional*: nothing here touches a `Genome`, a
+`Scaffold` or any of `Data`'s interval types, and the only thing it shares with
+the rest of the package is the `BitCodes` packing vocabulary. Keep it that way —
+the independence is what lets a whole-genome call set stay an 8-byte-per-site,
+memory-mappable block.
+"""
 module Methylation
 
 using Arrow
 using CodecZlib
 using StructArrays
 
-using ..BitCodes
+# Nested one level deeper than the other modules, so `BitCodes` is three dots up.
+using ...BitCodes
 
 #= Bit layout =#
 
 # Field layout of the 32-bit call payload (see `AggregatedCall`). Offsets are
 # 0-based bit positions.
-const METH_SHIFT = 0
-const METH_WIDTH = 12
-const UNMETH_SHIFT = 12
-const UNMETH_WIDTH = 12
+const DEPTH_SHIFT = 0
+const DEPTH_WIDTH = 16
+const PERCENT_SHIFT = 16
+const PERCENT_WIDTH = 8
 const CONTEXT_SHIFT = 24
 const CONTEXT_WIDTH = 2
 const STRAND_SHIFT = 26
 const STRAND_FIELD_WIDTH = STRAND_WIDTH   # 2 bits; bits 28-31 stay reserved
 
 """
-Largest read count a 12-bit coverage field can hold. Counts above this saturate
-here rather than wrapping into a neighbouring field.
+Largest total read depth the 16-bit depth field can hold. Depths above this
+saturate here rather than wrapping into a neighbouring field.
+
+Saturating the depth does **not** corrupt the methylation level: the percentage
+is encoded from the true counts before the depth is clamped, so a site covered
+by a million reads still reports its level accurately and only its depth is
+recorded as "at least [`MAX_COUNT`](@ref)".
 """
-const MAX_COUNT = UInt32(4095)
+const MAX_COUNT = UInt32(65535)
+
+"""
+Largest value of the 8-bit methylation-percentage field, i.e. the code for 100%
+methylated. The field is a plain linear map of `[0, 100]` percent onto
+`[0, 255]` — see [`encode_percent`](@ref) / [`decode_percent`](@ref).
+"""
+const MAX_PERCENT_CODE = UInt8(255)
 
 """
 Cytosine sequence contexts, as stored in the 2-bit `context` field of an
@@ -48,19 +72,33 @@ A single genomic cytosine's aggregated methylation calls, packed into 8 bytes.
 
 - `pos`: 1-based genomic coordinate. Positions are partitioned by scaffold (see
   [`MethylationData`](@ref)), so 32 bits is ample for any single sequence.
-- `payload`: bit-packed counts and metadata:
+- `payload`: a bit-packed methylation *level* and read depth, plus metadata:
 
 ```
-|-Rsvd-|-St-|-Cx-|------unmeth_count------|-------meth_count-------|
-| 31-28| 27 | 25 |          23-12         |          11-0          |
-|  26  | 24 |
+|-Rsvd-|--St-|--Cx-|--percent--|------------depth------------|
+| 31-28|27-26|25-24|   23-16   |             15-0            |
 ```
 
-- Bits  0-11 : methylated read count (0-4095, saturating)
-- Bits 12-23 : unmethylated read count (0-4095, saturating)
+- Bits  0-15 : total read depth (0-65535, saturating — see [`MAX_COUNT`](@ref))
+- Bits 16-23 : methylation percentage, linearly mapped from `[0, 100]` onto
+  `[0, 255]` (see [`encode_percent`](@ref))
 - Bits 24-25 : cytosine context (see [`CTX_CPG`](@ref))
 - Bits 26-27 : strand, as the package-wide 2-bit strand codes (see `BitCodes`)
 - Bits 28-31 : reserved for future quality/SNP flags
+
+**A level plus a depth, not two counts.** Splitting the 24 payload bits into two
+12-bit counts would cap each at 4095 and lose the true depth of any site above
+that — precisely the deep sites whose statistics are most trustworthy. Storing
+the depth whole instead keeps it exact to 65535, sixteen times further out, and
+spends the remaining byte on the level, which only ever needs enough resolution
+to name a percentage.
+
+The methylated and unmethylated counts are therefore *reconstructed* rather than
+stored (see [`get_meth`](@ref)), and the reconstruction is exact for every site
+with a depth of 255 or less — that is, for essentially every site in a real
+bisulfite library. Deeper than that the counts can be off by a read or two,
+while the depth itself stays exact and the level stays within half a
+quantization step (0.196 percentage points).
 
 Read IDs from the source alignment are deliberately discarded: only positional
 counts are kept, which is what makes the fixed 8-byte-per-site footprint (and
@@ -89,11 +127,66 @@ MethylationData() = MethylationData(Dict{String,StructArray{AggregatedCall}}())
 #= Encoding / decoding =#
 
 """
+    encode_percent(percent)
+
+Map a methylation percentage in `[0, 100]` onto the payload's 8-bit field, a
+plain linear scaling onto `[0, MAX_PERCENT_CODE]` rounded (half up) to the
+nearest code. Values outside `[0, 100]` clamp to the ends of the range, and
+`NaN` — the level [`meth_percent`](@ref) reports for an uncovered site — encodes
+as `0`, which is what an uncovered site stores anyway.
+"""
+@inline function encode_percent(percent::Real)
+    (isnan(percent) || percent <= 0) && return UInt8(0)
+    percent >= 100 && return MAX_PERCENT_CODE
+    return floor(UInt8, percent * MAX_PERCENT_CODE / 100 + 0.5)
+end
+
+"""
+    decode_percent(code)
+
+Inverse of [`encode_percent`](@ref): the percentage a stored 8-bit code stands
+for, as a `Float64` in `[0, 100]`. Codes are `100 / 255` ≈ 0.392 percentage
+points apart, so a decoded level is within half of that of the true one.
+"""
+@inline decode_percent(code::Integer) = (code % Int) * 100 / MAX_PERCENT_CODE
+
+# Encode a pair of non-negative counts as a percentage code, staying in integer
+# arithmetic: `round(MAX_PERCENT_CODE * m / (m + u))`, half up, matching
+# `encode_percent`.
+@inline function percent_code(m::Int64, u::Int64)
+    m == 0 && u == 0 && return UInt8(0)
+    # The exact form needs `510 * m` and `2 * (m + u)` to fit in an Int64.
+    # Counts that large cannot come from a real library, so rather than risk an
+    # overflow, fall back to floating point for them.
+    (m > typemax(Int32) || u > typemax(Int32)) &&
+        return encode_percent(100 * (Float64(m) / (Float64(m) + Float64(u))))
+    total = m + u
+    return UInt8(div(2 * Int64(MAX_PERCENT_CODE) * m + total, 2 * total))
+end
+
+# Inverse of `percent_code` given a depth: `round(depth * code / 255)`, half up.
+# Exact for any depth <= 255; see the `AggregatedCall` docstring.
+@inline function count_from_percent(code::UInt8, depth::UInt32)
+    scale = Int64(MAX_PERCENT_CODE)
+    return UInt32(div(2 * Int64(depth) * Int64(code) + scale, 2 * scale))
+end
+
+# `m + u` without ever overflowing: the depth field tops out at MAX_COUNT, so if
+# either count alone already reaches it the sum saturates regardless.
+@inline saturating_sum(m::Int64, u::Int64) =
+    (m >= Int64(MAX_COUNT) || u >= Int64(MAX_COUNT)) ? Int64(MAX_COUNT) : m + u
+
+"""
     pack_payload(meth, unmeth, context, strand)
 
-Pack read counts and metadata into an [`AggregatedCall`](@ref) payload. Counts
-above [`MAX_COUNT`](@ref) are clamped (they saturate rather than wrapping into
-the neighbouring field), as are negative counts (to zero).
+Pack read counts and metadata into an [`AggregatedCall`](@ref) payload.
+
+The counts are stored as a total depth plus a methylation percentage rather than
+verbatim (see [`AggregatedCall`](@ref)), so they are recovered by
+[`get_meth`](@ref)/[`get_unmeth`](@ref) exactly whenever their sum is 255 or
+less. The percentage is computed from the counts as given, so it stays accurate
+even when the depth itself saturates at [`MAX_COUNT`](@ref); negative counts are
+floored at zero.
 """
 function pack_payload(
     meth::Integer,
@@ -101,15 +194,40 @@ function pack_payload(
     context::Integer = CTX_CPG,
     strand::Integer = STRAND_NA,
 )
+    m = max(Int64(meth), Int64(0))
+    u = max(Int64(unmeth), Int64(0))
+    return pack_fields(percent_code(m, u), saturating_sum(m, u), context, strand)
+end
+
+"""
+    pack_percent_payload(percent, depth, context, strand)
+
+Pack a methylation *level* and a read depth into an [`AggregatedCall`](@ref)
+payload directly — the natural constructor when the level is what you have (a
+model fit, a smoothed estimate, a percentage column) rather than a pair of
+counts. `percent` is clamped to `[0, 100]` and `depth` to
+`[0, MAX_COUNT]`.
+"""
+function pack_percent_payload(
+    percent::Real,
+    depth::Integer,
+    context::Integer = CTX_CPG,
+    strand::Integer = STRAND_NA,
+)
+    return pack_fields(encode_percent(percent), depth, context, strand)
+end
+
+# Shared tail of both packers: lay an already-encoded percentage code, a depth
+# and the metadata into the 32-bit payload.
+@inline function pack_fields(code::UInt8, depth::Integer, context::Integer, strand::Integer)
     payload = UInt32(0)
-    payload =
-        set_field(payload, clamp_field(meth, UInt32, METH_WIDTH), METH_SHIFT, METH_WIDTH)
     payload = set_field(
         payload,
-        clamp_field(unmeth, UInt32, UNMETH_WIDTH),
-        UNMETH_SHIFT,
-        UNMETH_WIDTH,
+        clamp_field(depth, UInt32, DEPTH_WIDTH),
+        DEPTH_SHIFT,
+        DEPTH_WIDTH,
     )
+    payload = set_field(payload, code, PERCENT_SHIFT, PERCENT_WIDTH)
     payload = set_field(payload, context, CONTEXT_SHIFT, CONTEXT_WIDTH)
     payload = set_field(payload, strand, STRAND_SHIFT, STRAND_FIELD_WIDTH)
     return payload
@@ -129,18 +247,44 @@ AggregatedCall(
     strand::Integer = STRAND_NA,
 ) = AggregatedCall(UInt32(pos), pack_payload(meth, unmeth, context, strand))
 
-"""Methylated read count carried by a payload."""
-@inline get_meth(payload::UInt32) = get_field(payload, METH_SHIFT, METH_WIDTH)
+"""
+Total read depth at a site, exact up to [`MAX_COUNT`](@ref). A depth of exactly
+`MAX_COUNT` means the field saturated and the true depth is only known to be at
+least that; the methylation level is unaffected either way.
+"""
+@inline get_depth(payload::UInt32) = get_field(payload, DEPTH_SHIFT, DEPTH_WIDTH)
 
-"""Unmethylated read count carried by a payload."""
-@inline get_unmeth(payload::UInt32) = get_field(payload, UNMETH_SHIFT, UNMETH_WIDTH)
+"""Raw 8-bit methylation-percentage code carried by a payload."""
+@inline get_percent_code(payload::UInt32) =
+    UInt8(get_field(payload, PERCENT_SHIFT, PERCENT_WIDTH))
 
 """
-Total read depth at a site: methylated plus unmethylated. Each count saturates
-at [`MAX_COUNT`](@ref) independently, so a depth of `2 * MAX_COUNT` means both
-fields are saturated and the true depth is only known to be at least that.
+Methylation level at a site as a percentage in `[0, 100]`, or `NaN` when the
+site has no coverage at all. This is the value the payload actually stores —
+prefer it (or [`meth_fraction`](@ref)) over the reconstructed counts.
 """
-@inline get_depth(payload::UInt32) = get_meth(payload) + get_unmeth(payload)
+@inline function meth_percent(payload::UInt32)
+    get_depth(payload) == 0 && return NaN
+    return decode_percent(get_percent_code(payload))
+end
+
+"""
+Methylated read count at a site.
+
+**Reconstructed, not stored**: the payload holds a depth and a percentage, and
+this is `round(depth * percent)`. It is exact for any site whose depth is 255 or
+less, and off by at most a read or two beyond that. `get_meth(p) +
+get_unmeth(p) == get_depth(p)` holds for every payload, since
+[`get_unmeth`](@ref) is defined as the remainder.
+"""
+@inline get_meth(payload::UInt32) =
+    count_from_percent(get_percent_code(payload), get_depth(payload))
+
+"""
+Unmethylated read count at a site: the depth less the reconstructed methylated
+count (see [`get_meth`](@ref)).
+"""
+@inline get_unmeth(payload::UInt32) = get_depth(payload) - get_meth(payload)
 
 """Cytosine context code carried by a payload (see [`CTX_CPG`](@ref))."""
 @inline get_context(payload::UInt32) =
@@ -160,12 +304,13 @@ fields are saturated and the true depth is only known to be at least that.
 @inline is_forward(payload::UInt32) = get_strand_code(payload) == STRAND_FWD
 
 """
-Fraction of reads at a site that were methylated, or `NaN` when the site has no
-coverage at all.
+Fraction of reads at a site that were methylated, in `[0, 1]`, or `NaN` when the
+site has no coverage at all. The stored level rescaled — see
+[`meth_percent`](@ref).
 """
 @inline function meth_fraction(payload::UInt32)
-    depth = get_depth(payload)
-    return depth == 0 ? NaN : get_meth(payload) / depth
+    get_depth(payload) == 0 && return NaN
+    return get_percent_code(payload) / MAX_PERCENT_CODE
 end
 
 # Every accessor also works directly on a call.
@@ -173,10 +318,12 @@ for f in (
     :get_meth,
     :get_unmeth,
     :get_depth,
+    :get_percent_code,
     :get_context,
     :context_label,
     :get_strand_code,
     :is_forward,
+    :meth_percent,
     :meth_fraction,
 )
     @eval @inline $f(call::AggregatedCall) = $f(call.payload)
@@ -586,9 +733,7 @@ end
 """
     load_bismark_cov(io; context = CTX_CPG, strand = STRAND_NA)
 
-Read Bismark coverage records from `io` and pack them into per-site calls (see
-[`load_bismark_cov(::AbstractString)`](@ref) for the file-based method, which
-also infers `strand` from the file name).
+Read Bismark coverage records from `io` and pack them into per-site calls.
 """
 function load_bismark_cov(io::IO; context::Integer = CTX_CPG, strand::Integer = STRAND_NA)
     context_bits = UInt8(context) & 0x03
@@ -633,10 +778,11 @@ records [`load_bismark`](@ref) reads. Each line is one cytosine:
 
 Coordinates are already 1-based and `start == end` for a single cytosine, so
 `start` is taken as the position and `end` ignored. The percentage column is
-redundant with the two counts and is ignored as well; the counts are packed
-straight into an [`AggregatedCall`](@ref), saturating at [`MAX_COUNT`](@ref).
-Repeated lines for the same position (concatenated files) are summed, and each
-scaffold's calls are sorted by position.
+ignored as well — it is derivable from the two counts, which are the more
+precise source — and the counts go straight into an [`AggregatedCall`](@ref),
+whose depth saturates at [`MAX_COUNT`](@ref). Repeated lines for the same
+position (concatenated files) are summed, and each scaffold's calls are sorted
+by position.
 
 A `.cov` file records **neither the context nor the strand**, so both are
 supplied by the caller:
@@ -691,9 +837,13 @@ end
 """
     merge_calls(datasets)
 
-Merge several [`MethylationData`](@ref) into one, summing the counts of entries
-that share a position, context and strand. Counts still saturate at
-[`MAX_COUNT`](@ref).
+Merge several [`MethylationData`](@ref) into one, combining entries that share a
+position, context and strand: their depths add (saturating at
+[`MAX_COUNT`](@ref)) and their levels are pooled in proportion to those depths.
+
+Merging goes through the reconstructed counts (see [`get_meth`](@ref)), so it is
+exact for the depths those are exact at, and merging is not perfectly
+associative once a site is deep enough for the level's quantization to bite.
 """
 function merge_calls(datasets)
     scaffolds = Dict{String,StructArray{AggregatedCall}}()
@@ -879,15 +1029,19 @@ sanitize_name(name::AbstractString) = replace(String(name), r"[^A-Za-z0-9._-]" =
 #= Base.show overloads =#
 
 function Base.show(io::IO, call::AggregatedCall)
+    depth = Int(get_depth(call))
+    # Show what is actually stored — a level over a depth — rather than the
+    # reconstructed counts.
+    level =
+        depth == 0 ? "no coverage" :
+        "$(round(meth_percent(call), digits = 1))% meth over $(depth) read$(depth == 1 ? "" : "s")"
     print(
         io,
         "AggregatedCall(",
         Int(call.pos),
         ", ",
-        Int(get_meth(call)),
-        "/",
-        Int(get_depth(call)),
-        " meth, ",
+        level,
+        ", ",
         context_label(call),
         ", ",
         strand_char(get_strand_code(call)),
@@ -911,9 +1065,12 @@ export AggregatedCall,
     CTX_CHH,
     CTX_UNKNOWN,
     MAX_COUNT,
+    MAX_PERCENT_CODE,
     aggregated_calls,
     alloc_calls,
     context_label,
+    decode_percent,
+    encode_percent,
     find_calls_in_range,
     get_context,
     get_depth,
@@ -925,8 +1082,10 @@ export AggregatedCall,
     load_bismark_cov,
     merge_calls,
     meth_fraction,
+    meth_percent,
     n_sites,
     pack_payload,
+    pack_percent_payload,
     read_methylation,
     read_methylation_arrow,
     write_methylation,

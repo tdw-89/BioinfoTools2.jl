@@ -13,6 +13,13 @@ using ..Reference
 
 using Base: ImmutableDict
 
+# Methylation is a sample-level signal like the rest of this module, but a
+# positional one that needs no `Genome`, so it stays a self-contained submodule
+# rather than being folded in here. Re-exported below, so both
+# `BioinfoTools2.Data.Methylation` and `BioinfoTools2.Methylation` reach it.
+include("data/methylation.jl")
+using .Methylation
+
 # Field layout of the 64-bit BED metadata code (see `pack_bed_code`).
 const BED_STRAND_SHIFT = 32
 const BED_STRAND_WIDTH = 8
@@ -574,6 +581,7 @@ function Base.show(io::IO, t::TabularData)
     print(io, "TabularData($(r)×$(c) $(eltype(t.table)))")
 end
 
-export BedData, TabularData, intersect, leftjoin, load_bed, load_table, merge_segments
+export BedData,
+    Methylation, TabularData, intersect, leftjoin, load_bed, load_table, merge_segments
 
 end

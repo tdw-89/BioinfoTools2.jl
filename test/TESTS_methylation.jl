@@ -11,6 +11,13 @@ const MT_DATA_DIR = joinpath(@__DIR__, "data")
 const MICRO_BISMARK = joinpath(MT_DATA_DIR, "micro_CpG_OT.txt")
 const MICRO_COV = joinpath(MT_DATA_DIR, "micro.cov")
 
+# The payload stores an 8-bit methylation level, so a decoded level sits within
+# half a quantization step of the truth. The slack is the exact half-step plus a
+# hair, since the two sides of a comparison are computed differently and can
+# land an ulp apart at an exact tie.
+const PCT_TOL = 100 / 255 / 2 + 1e-9
+const FRAC_TOL = 1 / 255 / 2 + 1e-12
+
 # Reference counts for micro_CpG_OT.txt (chromosome 15, 406 records over 76
 # sites), computed independently of the loader by scanning the fixture here.
 function reference_counts(path)
@@ -40,16 +47,37 @@ end
 @testset "Methylation" begin
 
     # -------------------------------------------------------------------------
+    @testset "module placement" begin
+        # Methylation lives inside Data, but stays reachable by its old
+        # top-level name — both must denote the same module, and `using
+        # BioinfoTools2.Methylation` (as at the head of this file) must resolve
+        # through the re-export.
+        @test BioinfoTools2.Data.Methylation === Methylation
+        @test BioinfoTools2.Methylation === Methylation
+        @test parentmodule(Methylation) === BioinfoTools2.Data
+        @test load_bismark_cov === BioinfoTools2.Data.Methylation.load_bismark_cov
+
+        # It must not have picked up a dependency on Data's genome-anchored
+        # types: methylation is positional and needs no Genome.
+        @test !isdefined(Methylation, :BedData)
+        @test !isdefined(Methylation, :Genome)
+    end
+
+    # -------------------------------------------------------------------------
     @testset "payload encoding / decoding" begin
         payload = pack_payload(10, 5, CTX_CPG, STRAND_FWD)
+        @test get_depth(payload) == 15
         @test get_meth(payload) == 10
         @test get_unmeth(payload) == 5
-        @test get_depth(payload) == 15
         @test get_context(payload) == CTX_CPG
         @test context_label(payload) == :CpG
         @test is_forward(payload)
         @test get_strand(payload) == GFF3.GenomicFeatures.STRAND_POS
-        @test meth_fraction(payload) ≈ 10 / 15
+        # The level is what is stored, quantized to one of 256 codes.
+        @test Methylation.get_percent_code(payload) == round(UInt8, 255 * 10 / 15)
+        @test meth_fraction(payload) ≈ Methylation.get_percent_code(payload) / 255
+        @test meth_percent(payload) ≈ 100 * meth_fraction(payload)
+        @test abs(meth_percent(payload) - 100 * 10 / 15) < PCT_TOL
 
         # An AggregatedCall is exactly 8 bytes: two UInt32s, no padding.
         @test sizeof(AggregatedCall) == 8
@@ -57,33 +85,114 @@ end
     end
 
     # -------------------------------------------------------------------------
+    @testset "percentage field" begin
+        # The field is a plain linear map of [0, 100] onto [0, 255].
+        @test encode_percent(0) == 0
+        @test encode_percent(100) == MAX_PERCENT_CODE == 255
+        @test encode_percent(50) == round(UInt8, 127.5)
+        @test decode_percent(0) == 0.0
+        @test decode_percent(MAX_PERCENT_CODE) == 100.0
+        @test decode_percent(128) ≈ 128 * 100 / 255
+
+        # Out-of-range percentages clamp rather than wrapping.
+        @test encode_percent(-10) == 0
+        @test encode_percent(140) == MAX_PERCENT_CODE
+        @test encode_percent(NaN) == 0
+
+        # Every code decodes into [0, 100] and re-encodes to itself.
+        for code = 0:255
+            pct = decode_percent(code)
+            @test 0 <= pct <= 100
+            @test encode_percent(pct) == code
+        end
+
+        # Packing a level and a depth directly is the same as packing the
+        # equivalent counts.
+        @test pack_percent_payload(100, 8, CTX_CPG, STRAND_FWD) ==
+              pack_payload(8, 0, CTX_CPG, STRAND_FWD)
+        @test pack_percent_payload(0, 8, CTX_CPG, STRAND_FWD) ==
+              pack_payload(0, 8, CTX_CPG, STRAND_FWD)
+        @test pack_percent_payload(25, 8, CTX_CHG, STRAND_REV) ==
+              pack_payload(2, 6, CTX_CHG, STRAND_REV)
+
+        direct = pack_percent_payload(37.5, 1000, CTX_CHH, STRAND_BOTH)
+        @test get_depth(direct) == 1000
+        @test abs(meth_percent(direct) - 37.5) < PCT_TOL
+        @test get_context(direct) == CTX_CHH
+        @test Methylation.get_strand_code(direct) == STRAND_BOTH
+        # Depth clamps here too.
+        @test get_depth(pack_percent_payload(50, 10^9)) == MAX_COUNT
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "counts round-trip exactly up to depth 255" begin
+        # The whole point of storing a level plus a depth: for any site shallow
+        # enough that 8 bits can name its level unambiguously — which is every
+        # realistic bisulfite site — the counts come back exactly as they went
+        # in. This is exhaustive over all (meth, unmeth) with a depth <= 255.
+        worst_percent_error = 0.0
+        for depth = 1:255, meth = 0:depth
+            payload = pack_payload(meth, depth - meth, CTX_CPG, STRAND_FWD)
+            @test get_depth(payload) == depth
+            @test get_meth(payload) == meth
+            @test get_unmeth(payload) == depth - meth
+            worst_percent_error =
+                max(worst_percent_error, abs(meth_percent(payload) - 100 * meth / depth))
+        end
+        # ...and the level is always within half a quantization step.
+        @test worst_percent_error <= PCT_TOL
+
+        # Beyond 255 the depth stays exact and the level stays within half a
+        # step, while the counts may drift by a read or two.
+        rng = Random.MersenneTwister(451)
+        for _ = 1:2000
+            depth = rand(rng, 256:65535)
+            meth = rand(rng, 0:depth)
+            payload = pack_payload(meth, depth - meth, CTX_CPG, STRAND_FWD)
+            @test get_depth(payload) == depth
+            @test abs(meth_percent(payload) - 100 * meth / depth) <= PCT_TOL
+            @test abs(Int(get_meth(payload)) - meth) <= cld(depth, 510) + 1
+            # The two reconstructed counts always partition the depth exactly.
+            @test get_meth(payload) + get_unmeth(payload) == depth
+        end
+    end
+
+    # -------------------------------------------------------------------------
     @testset "encoding edge cases" begin
-        # Zero counts
+        # Zero coverage
         zero_payload = pack_payload(0, 0, CTX_CPG, STRAND_FWD)
         @test get_meth(zero_payload) == 0
         @test get_unmeth(zero_payload) == 0
         @test get_depth(zero_payload) == 0
         @test isnan(meth_fraction(zero_payload))
+        @test isnan(meth_percent(zero_payload))
 
-        # Exactly at the 12-bit maximum
-        max_payload = pack_payload(4095, 4095, CTX_CHH, STRAND_REV)
-        @test get_meth(max_payload) == 4095
-        @test get_unmeth(max_payload) == 4095
-        @test get_depth(max_payload) == 8190
+        # Exactly at the 16-bit depth maximum
+        max_payload = pack_payload(MAX_COUNT, 0, CTX_CHH, STRAND_REV)
+        @test get_depth(max_payload) == MAX_COUNT == 65535
+        @test get_meth(max_payload) == MAX_COUNT
+        @test get_unmeth(max_payload) == 0
+        @test meth_percent(max_payload) == 100.0
         @test get_context(max_payload) == CTX_CHH
         @test !is_forward(max_payload)
 
-        # Overflow clamps instead of wrapping into the neighbouring field
-        for (meth, unmeth) in ((4096, 0), (0, 4096), (100_000, 999_999), (typemax(Int), 7))
+        # Depth saturates instead of wrapping into the neighbouring field — and
+        # crucially, the level stays accurate even when it does, because it is
+        # computed from the counts as given.
+        for (meth, unmeth) in
+            ((65536, 0), (0, 65536), (100_000, 900_000), (typemax(Int32), 7))
             clamped = pack_payload(meth, unmeth, CTX_CHG, STRAND_BOTH)
-            @test get_meth(clamped) == min(meth, MAX_COUNT)
-            @test get_unmeth(clamped) == min(unmeth, MAX_COUNT)
+            @test get_depth(clamped) == min(Int128(meth) + unmeth, MAX_COUNT)
+            @test abs(
+                meth_percent(clamped) - 100 * Int128(meth) / (Int128(meth) + unmeth),
+            ) <= PCT_TOL
             # The fields must not have bled into context/strand.
             @test get_context(clamped) == CTX_CHG
             @test Methylation.get_strand_code(clamped) == STRAND_BOTH
         end
 
-        # Negative counts floor at zero rather than wrapping to 4095
+        # Negative counts floor at zero rather than wrapping
+        @test get_depth(pack_payload(-5, 3, CTX_CPG, STRAND_FWD)) == 3
         @test get_meth(pack_payload(-5, 3, CTX_CPG, STRAND_FWD)) == 0
         @test get_unmeth(pack_payload(-5, 3, CTX_CPG, STRAND_FWD)) == 3
 
@@ -93,8 +202,8 @@ end
             strand in (STRAND_FWD, STRAND_REV, STRAND_BOTH, STRAND_NA)
 
             payload = pack_payload(1234, 2345, context, strand)
-            @test get_meth(payload) == 1234
-            @test get_unmeth(payload) == 2345
+            @test get_depth(payload) == 3579
+            @test abs(meth_percent(payload) - 100 * 1234 / 3579) <= PCT_TOL
             @test get_context(payload) == context
             @test Methylation.get_strand_code(payload) == strand
             @test get_strand(payload) == decode_strand(strand)
@@ -115,7 +224,11 @@ end
         @test context_label(call) == :CHG
         @test !is_forward(call)
         @test get_strand(call) == GFF3.GenomicFeatures.STRAND_NEG
-        @test meth_fraction(call) ≈ 0.25
+        # The level is quantized to one of 256 codes, so it lands within half a
+        # step of 25% rather than exactly on it — while the counts, at this
+        # depth, come back exactly.
+        @test meth_fraction(call) ≈ 0.25 atol = FRAC_TOL
+        @test meth_percent(call) ≈ 25 atol = PCT_TOL
 
         # Positions near the top of the UInt32 range are representable
         @test AggregatedCall(typemax(UInt32), 1, 1).pos == typemax(UInt32)
@@ -327,7 +440,8 @@ end
 
     # -------------------------------------------------------------------------
     @testset "load_bismark - saturating aggregation" begin
-        # More than 4095 reads at one site must clamp, not wrap.
+        # 5000 reads at one site is well past the old 12-bit count ceiling but
+        # comfortably inside the 16-bit depth field, so the depth is now exact.
         io = IOBuffer()
         println(io, "Bismark methylation extractor version v0.25.1")
         for i = 1:5000
@@ -337,10 +451,25 @@ end
         data = load_bismark(io; strand = STRAND_FWD)
 
         call = data["chr1"][1]
-        @test get_meth(call) == MAX_COUNT
+        @test get_depth(call) == 5000
+        @test get_meth(call) == 5000
         @test get_unmeth(call) == 0
+        @test meth_percent(call) == 100.0
         @test get_context(call) == CTX_CPG
         @test is_forward(call)
+
+        # Past 65535 the depth does saturate — but the level survives intact,
+        # which is the whole reason for spending the bits this way.
+        io = IOBuffer()
+        println(io, "Bismark methylation extractor version v0.25.1")
+        for i = 1:80_000
+            println(io, "read$i\t+\tchr1\t42\t", isodd(i) ? "Z" : "z")
+        end
+        seekstart(io)
+        deep = load_bismark(io; strand = STRAND_FWD)["chr1"][1]
+        @test get_depth(deep) == MAX_COUNT
+        @test meth_percent(deep) ≈ 50 atol = PCT_TOL
+        @test get_meth(deep) + get_unmeth(deep) == MAX_COUNT
     end
 
     # -------------------------------------------------------------------------
@@ -454,7 +583,7 @@ end
         @test sort(collect(keys(data))) == ["chr1", "chr2"]
         @test data["chr1"][1] == AggregatedCall(100, 3, 1, CTX_CPG, STRAND_NA)
         @test data["chr1"][2] == AggregatedCall(200, 0, 5, CTX_CPG, STRAND_NA)
-        @test meth_fraction(data["chr1"][1]) ≈ 0.75
+        @test meth_fraction(data["chr1"][1]) ≈ 0.75 atol = FRAC_TOL
         # The percentage column is ignored; the counts are authoritative.
         @test data["chr2"][1] == AggregatedCall(50, 2, 0, CTX_CPG, STRAND_NA)
 
@@ -490,18 +619,26 @@ end
         # A file with no usable records yields an empty dataset.
         @test n_sites(load_bismark_cov(IOBuffer(""))) == 0
 
-        # Counts above the 12-bit field saturate rather than wrapping, and only
-        # after repeated lines for a site have been summed.
+        # Deep sites: the 16-bit depth field swallows counts that the old 12-bit
+        # count fields would have clipped, and repeated lines are summed before
+        # anything saturates.
         big = load_bismark_cov(
             IOBuffer(
                 "c\t1\t1\t100\t9000\t20\n" *
-                "c\t2\t2\t50\t3000\t2000\nc\t2\t2\t50\t3000\t2000\n",
+                "c\t2\t2\t50\t3000\t2000\nc\t2\t2\t50\t3000\t2000\n" *
+                "c\t3\t3\t50\t60000\t60000\n",
             ),
         )
-        @test get_meth(big["c"][1]) == MAX_COUNT
-        @test get_unmeth(big["c"][1]) == 20
-        @test get_meth(big["c"][2]) == MAX_COUNT
+        @test get_depth(big["c"][1]) == 9020
+        @test meth_percent(big["c"][1]) ≈ 100 * 9000 / 9020 atol = PCT_TOL
+        @test get_depth(big["c"][2]) == 10_000
+        @test meth_percent(big["c"][2]) == 60.0
+        @test get_meth(big["c"][2]) == 6000
         @test get_unmeth(big["c"][2]) == 4000
+
+        # Only past 65535 does the depth saturate, with the level intact.
+        @test get_depth(big["c"][3]) == MAX_COUNT
+        @test meth_percent(big["c"][3]) ≈ 50 atol = PCT_TOL
     end
 
     # -------------------------------------------------------------------------

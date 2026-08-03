@@ -29,29 +29,29 @@ function rbh_ds(paralog_df::DataFrame)
 
     rbh_gene, rbh_paralog = String[], String[]
     matched_inds = Int[]
-    score_i_origs, score_j_origs, max_scores, mean_scores =
+    score_i_origs, score_j_origs, min_scores, mean_scores =
         Float64[], Float64[], Float64[], Float64[]
     for i = 1:size(rbh_matrix)[1]
 
-        _, max_i = findmax(rbh_matrix[i, :])[1:2]
-        _, max_j = findmax(rbh_matrix[:, max_i])[1:2]
-        score_i_orig = orig_mat[i, max_i]
-        score_j_orig = orig_mat[max_i, i]
-        max_score = max(score_i_orig, score_j_orig)
+        _, min_i = findmin(rbh_matrix[i, :])[1:2]
+        _, min_j = findmin(rbh_matrix[:, min_i])[1:2]
+        score_i_orig = orig_mat[i, min_i]
+        score_j_orig = orig_mat[min_i, i]
+        min_score = min(score_i_orig, score_j_orig)
         mean_score = (score_i_orig + score_j_orig) / 2
 
-        if i == max_j && max_i ∉ matched_inds && max_j ∉ matched_inds
+        if i == min_j && min_i ∉ matched_inds && min_j ∉ matched_inds
 
-            id_i = ind_to_ids_dict[max_i]
-            id_j = ind_to_ids_dict[max_j]
+            id_i = ind_to_ids_dict[min_i]
+            id_j = ind_to_ids_dict[min_j]
 
             push!(rbh_gene, id_i)
             push!(rbh_paralog, id_j)
-            push!(matched_inds, max_i)
-            push!(matched_inds, max_j)
+            push!(matched_inds, min_i)
+            push!(matched_inds, min_j)
             push!(score_i_origs, score_i_orig)
             push!(score_j_origs, score_j_orig)
-            push!(max_scores, max_score)
+            push!(min_scores, min_score)
             push!(mean_scores, mean_score)
         end
     end
@@ -60,6 +60,7 @@ function rbh_ds(paralog_df::DataFrame)
         "GeneID" => rbh_gene,
         "ParalogID" => rbh_paralog,
         "ds" => score_i_origs,
+        "min_ds" => min_scores,
     )
 end
 
