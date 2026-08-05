@@ -24,6 +24,12 @@ struct Scaffold
     features::IntervalTreeM64
 end
 
+struct IntervalSimple
+    start_pos::UInt32
+    end_pos::UInt32
+    code::UInt64
+end
+
 struct ParseResult
     scaffold_id::String
     start_pos::UInt32
@@ -67,6 +73,7 @@ A single annotated feature looked up from a `Genome`:
 - `chromosome`: the scaffold name the feature lives on
 - `start_pos` / `end_pos`: 1-based closed interval bounds
 - `metadata`: the parsed metadata stored for the feature (ID, source, biotype)
+- `code`: the raw 64-bit metadata code (strand, SO term, metadata index)
 """
 struct FeatureRecord
     id::String
@@ -75,6 +82,7 @@ struct FeatureRecord
     start_pos::UInt32
     end_pos::UInt32
     metadata::Vector{String}
+    code::UInt64
 end
 
 mutable struct Species
@@ -293,6 +301,7 @@ function feature_record(
         interval.first,
         interval.last,
         metadata,
+        code,
     )
 end
 

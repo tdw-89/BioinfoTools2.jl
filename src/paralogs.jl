@@ -3,6 +3,198 @@ module Paralogs
 using DataFrames
 using Graphs
 using SparseArrays
+using StructArrays
+
+using ..Reference
+
+function _match_relation(colname)
+    key = lowercase(String(colname))
+    return key == "dn" ? :dN :
+           key == "ds" ? :dS :
+           key == "id_subject_query" ? :id_subject_query :
+           key == "id_query_subject" ? :id_query_subject : nothing
+end
+
+struct GeneFamily
+    # The gene coordinates keyed by scaffold name/id
+    intervals::Dict{String, StructArray{Reference.IntervalSimple}}
+
+    # The linear index ranges (inclusive) spanned by each scaffold
+    scaffold_ranges::Dict{String, UnitRange{Int}}
+
+    topology::SparseMatrixCSC{Bool, UInt32}
+
+    dN::Union{Nothing, SparseMatrixCSC{Float64, UInt32}}
+    dS::Union{Nothing, SparseMatrixCSC{Float64, UInt32}}
+    id_subject_query::Union{Nothing, SparseMatrixCSC{Float64, UInt32}}
+    id_query_subject::Union{Nothing, SparseMatrixCSC{Float64, UInt32}}
+
+    """
+        GeneFamily(genome::Reference.Genome, pairs::DataFrame)
+
+    Build a `GeneFamily` from a reference `genome` and a paralog-pair table.
+
+    `pairs` has 2-6 columns; the first two are required and taken by position,
+    the rest optional and matched to the relation matrices *by name*
+    (case-insensitive):
+
+    1. Query ID (`String`)
+    2. Subject ID (`String`)
+    3. `dN`               → pairwise dN
+    4. `dS`               → pairwise dS
+    5. `id_subject_query` → % identity subject → query
+    6. `id_query_subject` → % identity query → subject
+
+    With only the two ID columns just `topology` is populated; every recognised
+    value column adds its matrix and the rest stay `nothing`.
+
+    Each gene is placed by looking its ID up in `genome`, inheriting the
+    feature's 1-based bounds and full 64-bit metadata code (strand, SO term,
+    metadata index). Genes are grouped by scaffold and handed contiguous linear
+    indices — `scaffold_ranges[name]` is that block. IDs absent from `genome`,
+    and any pair row referencing one, are skipped.
+
+    Every matrix is `n_genes × n_genes` over those indices, oriented so the axis
+    you look up by is the (column-major) fast axis:
+
+    - `topology`         — symmetric `Bool` adjacency; a pair sets both `[a, b]`
+      and `[b, a]`, so the relation is undirected.
+    - `dN`, `dS`         — symmetric by definition, so stored **once** in the
+      upper triangle: the value for genes `a`, `b` is at `[min(a, b), max(a, b)]`.
+    - `id_subject_query` — %ID subject → query with **subjects on the columns**
+      (`[query, subject]`), so `M[:, s]` gathers subject `s`'s scores in O(nnz).
+    - `id_query_subject` — %ID query → subject with **queries on the columns**
+      (`[subject, query]`), so `M[:, q]` gathers query `q`'s scores in O(nnz).
+
+    Repeated or reciprocal entries for a cell collapse to one value.
+
+    This is the only constructor, so `intervals` and `scaffold_ranges` are always
+    concordant by construction.
+    """
+    function GeneFamily(genome::Reference.Genome, pairs::DataFrame)
+        ncol(pairs) >= 2 ||
+            throw(ArgumentError("`pairs` needs at least a query and a subject column"))
+
+        query_ids = string.(pairs[:, 1])
+        subject_ids = string.(pairs[:, 2])
+
+        # Resolve every ID to its feature.
+        records = genome[unique(vcat(query_ids, subject_ids))]
+
+        # Group the found features by scaffold, discarding repeated IDs.
+        scaffold_intervals = Dict{String, Vector{Reference.IntervalSimple}}()
+        scaffold_id_lists = Dict{String, Vector{String}}()
+        seen = Set{String}()
+        for record in records
+            record.id in seen && continue
+            push!(seen, record.id)
+            push!(
+                get!(scaffold_intervals, record.chromosome, Reference.IntervalSimple[]),
+                Reference.IntervalSimple(record.start_pos, record.end_pos, record.code),
+            )
+            push!(get!(scaffold_id_lists, record.chromosome, String[]), record.id)
+        end
+
+        # Lay the scaffolds out end to end, ordering the genes within each by
+        # position, and remember where every gene lands in the linear indexing.
+        intervals = Dict{String, StructArray{Reference.IntervalSimple}}()
+        scaffold_ranges = Dict{String, UnitRange{Int}}()
+        id_to_index = Dict{String, Int}()
+        cursor = 1
+        for name in sort!(collect(keys(scaffold_intervals)))
+            ivs = scaffold_intervals[name]
+            ids = scaffold_id_lists[name]
+            order = collect(1:length(ivs))
+            sort!(order; by = k -> (ivs[k].start_pos, ivs[k].end_pos, ids[k]))
+            ivs, ids = ivs[order], ids[order]
+
+            n = length(ivs)
+            scaffold_ranges[name] = cursor:(cursor + n - 1)
+            intervals[name] = StructArray(ivs)
+            for (offset, id) in enumerate(ids)
+                id_to_index[id] = cursor + offset - 1
+            end
+            cursor += n
+        end
+        n_genes = cursor - 1
+
+        # Match the optional value columns to their target matrices by name.
+        value_columns = Dict{Symbol, Int}()
+        for c = 3:ncol(pairs)
+            field = _match_relation(names(pairs)[c])
+            isnothing(field) || (value_columns[field] = c)
+        end
+
+        has(field) = haskey(value_columns, field)
+
+        # Per-matrix coordinates/values, each oriented so the axis you look up
+        # by is the (fast) column axis; dN/dS are symmetric and fold into a
+        # single upper triangle. See the docstring for the exact conventions.
+        topo_i, topo_j = UInt32[], UInt32[]
+        tri_i, tri_j = UInt32[], UInt32[]          # shared upper-triangle coords
+        dN_v, dS_v = Float64[], Float64[]
+        sq_i, sq_j, sq_v = UInt32[], UInt32[], Float64[]
+        qs_i, qs_j, qs_v = UInt32[], UInt32[], Float64[]
+
+        want_tri = has(:dN) || has(:dS)
+        for r = 1:nrow(pairs)
+            q, s = query_ids[r], subject_ids[r]
+            (haskey(id_to_index, q) && haskey(id_to_index, s)) || continue
+            iq, is = id_to_index[q], id_to_index[s]
+
+            push!(topo_i, iq)
+            push!(topo_j, is)
+
+            if want_tri
+                lo, hi = minmax(iq, is)
+                push!(tri_i, lo)
+                push!(tri_j, hi)
+                has(:dN) && push!(dN_v, Float64(pairs[r, value_columns[:dN]]))
+                has(:dS) && push!(dS_v, Float64(pairs[r, value_columns[:dS]]))
+            end
+
+            if has(:id_subject_query)
+                push!(sq_i, iq)               # subjects on the column axis
+                push!(sq_j, is)
+                push!(sq_v, Float64(pairs[r, value_columns[:id_subject_query]]))
+            end
+            if has(:id_query_subject)
+                push!(qs_i, is)               # queries on the column axis
+                push!(qs_j, iq)
+                push!(qs_v, Float64(pairs[r, value_columns[:id_query_subject]]))
+            end
+        end
+
+        # `max` collapses repeated/reciprocal writes to one value rather than
+        # summing them; topology is symmetrised (both directions) and ORed.
+        topology = sparse(
+            vcat(topo_i, topo_j),
+            vcat(topo_j, topo_i),
+            trues(2 * length(topo_i)),
+            n_genes,
+            n_genes,
+            |,
+        )
+        dN = has(:dN) ? sparse(tri_i, tri_j, dN_v, n_genes, n_genes, max) : nothing
+        dS = has(:dS) ? sparse(tri_i, tri_j, dS_v, n_genes, n_genes, max) : nothing
+        id_subject_query =
+            has(:id_subject_query) ? sparse(sq_i, sq_j, sq_v, n_genes, n_genes, max) :
+            nothing
+        id_query_subject =
+            has(:id_query_subject) ? sparse(qs_i, qs_j, qs_v, n_genes, n_genes, max) :
+            nothing
+
+        return new(
+            intervals,
+            scaffold_ranges,
+            topology,
+            dN,
+            dS,
+            id_subject_query,
+            id_query_subject,
+        )
+    end
+end
 
 function rbh_ds(paralog_df::DataFrame)
     @assert typeof(paralog_df[1, 1]) <: AbstractString
