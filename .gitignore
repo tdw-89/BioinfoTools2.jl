@@ -33,6 +33,3 @@ JuliaLocalPreferences.toml
 # Test data (uncompressed)
 test/data/*
 !test/data/test_data.tar.gz
-
-# Temp folder
-test/bkup

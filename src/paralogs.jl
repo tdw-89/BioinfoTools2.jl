@@ -15,19 +15,27 @@ function _match_relation(colname)
            key == "id_query_subject" ? :id_query_subject : nothing
 end
 
+# Marker distinguishing the raw-fields constructor (below) from the public
+# `GeneFamily(genome, pairs)` one; kept unexported so ordinary callers can't
+# reach it and reintroduce arbitrary construction.
+struct _RawFields end
+
 struct GeneFamily
     # The gene coordinates keyed by scaffold name/id
-    intervals::Dict{String, StructArray{Reference.IntervalSimple}}
+    intervals::Dict{String,StructArray{Reference.IntervalSimple}}
 
     # The linear index ranges (inclusive) spanned by each scaffold
-    scaffold_ranges::Dict{String, UnitRange{Int}}
+    scaffold_ranges::Dict{String,UnitRange{Int}}
 
-    topology::SparseMatrixCSC{Bool, UInt32}
+    # Reverse lookup from gene ID to its linear index, for string-based `getindex`
+    id_to_index::Dict{String,Int}
 
-    dN::Union{Nothing, SparseMatrixCSC{Float64, UInt32}}
-    dS::Union{Nothing, SparseMatrixCSC{Float64, UInt32}}
-    id_subject_query::Union{Nothing, SparseMatrixCSC{Float64, UInt32}}
-    id_query_subject::Union{Nothing, SparseMatrixCSC{Float64, UInt32}}
+    topology::SparseMatrixCSC{Bool,UInt32}
+
+    dN::Union{Nothing,SparseMatrixCSC{Float64,UInt32}}
+    dS::Union{Nothing,SparseMatrixCSC{Float64,UInt32}}
+    id_subject_query::Union{Nothing,SparseMatrixCSC{Float64,UInt32}}
+    id_query_subject::Union{Nothing,SparseMatrixCSC{Float64,UInt32}}
 
     """
         GeneFamily(genome::Reference.Genome, pairs::DataFrame)
@@ -54,7 +62,7 @@ struct GeneFamily
     indices — `scaffold_ranges[name]` is that block. IDs absent from `genome`,
     and any pair row referencing one, are skipped.
 
-    Every matrix is `n_genes × n_genes` over those indices, oriented so the axis
+    Every matrix is `n_genes x n_genes` over those indices, oriented so the axis
     you look up by is the (column-major) fast axis:
 
     - `topology`         — symmetric `Bool` adjacency; a pair sets both `[a, b]`
@@ -68,12 +76,28 @@ struct GeneFamily
 
     Repeated or reciprocal entries for a cell collapse to one value.
 
-    This is the only constructor, so `intervals` and `scaffold_ranges` are always
-    concordant by construction.
+    This is the only public constructor, so `intervals`, `scaffold_ranges` and
+    `id_to_index` are always concordant by construction. Query/subject ID
+    columns must hold `AbstractString`s and every matched value column must
+    hold `Real`s; anything else raises an informative `ArgumentError`.
+
+    See `getindex` for per-gene (`gf[i]`/`gf["id"]`) and sub-family
+    (`gf[indices]`/`gf[ids]`) indexing.
     """
     function GeneFamily(genome::Reference.Genome, pairs::DataFrame)
         ncol(pairs) >= 2 ||
             throw(ArgumentError("`pairs` needs at least a query and a subject column"))
+
+        eltype(pairs[:, 1]) <: AbstractString || throw(
+            ArgumentError(
+                "Query ID column (column 1, \"$(names(pairs)[1])\") must contain strings, got element type $(eltype(pairs[:, 1]))",
+            ),
+        )
+        eltype(pairs[:, 2]) <: AbstractString || throw(
+            ArgumentError(
+                "Subject ID column (column 2, \"$(names(pairs)[2])\") must contain strings, got element type $(eltype(pairs[:, 2]))",
+            ),
+        )
 
         query_ids = string.(pairs[:, 1])
         subject_ids = string.(pairs[:, 2])
@@ -82,8 +106,8 @@ struct GeneFamily
         records = genome[unique(vcat(query_ids, subject_ids))]
 
         # Group the found features by scaffold, discarding repeated IDs.
-        scaffold_intervals = Dict{String, Vector{Reference.IntervalSimple}}()
-        scaffold_id_lists = Dict{String, Vector{String}}()
+        scaffold_intervals = Dict{String,Vector{Reference.IntervalSimple}}()
+        scaffold_id_lists = Dict{String,Vector{String}}()
         seen = Set{String}()
         for record in records
             record.id in seen && continue
@@ -97,9 +121,9 @@ struct GeneFamily
 
         # Lay the scaffolds out end to end, ordering the genes within each by
         # position, and remember where every gene lands in the linear indexing.
-        intervals = Dict{String, StructArray{Reference.IntervalSimple}}()
-        scaffold_ranges = Dict{String, UnitRange{Int}}()
-        id_to_index = Dict{String, Int}()
+        intervals = Dict{String,StructArray{Reference.IntervalSimple}}()
+        scaffold_ranges = Dict{String,UnitRange{Int}}()
+        id_to_index = Dict{String,Int}()
         cursor = 1
         for name in sort!(collect(keys(scaffold_intervals)))
             ivs = scaffold_intervals[name]
@@ -109,7 +133,7 @@ struct GeneFamily
             ivs, ids = ivs[order], ids[order]
 
             n = length(ivs)
-            scaffold_ranges[name] = cursor:(cursor + n - 1)
+            scaffold_ranges[name] = cursor:(cursor+n-1)
             intervals[name] = StructArray(ivs)
             for (offset, id) in enumerate(ids)
                 id_to_index[id] = cursor + offset - 1
@@ -119,10 +143,18 @@ struct GeneFamily
         n_genes = cursor - 1
 
         # Match the optional value columns to their target matrices by name.
-        value_columns = Dict{Symbol, Int}()
+        value_columns = Dict{Symbol,Int}()
         for c = 3:ncol(pairs)
             field = _match_relation(names(pairs)[c])
             isnothing(field) || (value_columns[field] = c)
+        end
+
+        for (field, c) in value_columns
+            eltype(pairs[:, c]) <: Real || throw(
+                ArgumentError(
+                    "Column \"$(names(pairs)[c])\" (matched to `$field`) must contain numeric values, got element type $(eltype(pairs[:, c]))",
+                ),
+            )
         end
 
         has(field) = haskey(value_columns, field)
@@ -187,6 +219,7 @@ struct GeneFamily
         return new(
             intervals,
             scaffold_ranges,
+            id_to_index,
             topology,
             dN,
             dS,
@@ -194,6 +227,139 @@ struct GeneFamily
             id_query_subject,
         )
     end
+
+    # Internal-only: build directly from already-resolved fields, used by the
+    # sub-family `getindex` methods below. The `_RawFields` marker keeps this
+    # unreachable from `GeneFamily(...)` calls outside this module.
+    function GeneFamily(
+        ::_RawFields,
+        intervals::Dict{String,StructArray{Reference.IntervalSimple}},
+        scaffold_ranges::Dict{String,UnitRange{Int}},
+        id_to_index::Dict{String,Int},
+        topology::SparseMatrixCSC{Bool,UInt32},
+        dN,
+        dS,
+        id_subject_query,
+        id_query_subject,
+    )
+        return new(
+            intervals,
+            scaffold_ranges,
+            id_to_index,
+            topology,
+            dN,
+            dS,
+            id_subject_query,
+            id_query_subject,
+        )
+    end
+end
+
+_n_genes(gf::GeneFamily) = size(gf.topology, 1)
+
+function Base.show(io::IO, gf::GeneFamily)
+    n = _n_genes(gf)
+    nscaff = length(gf.scaffold_ranges)
+    npairs = nnz(gf.topology) ÷ 2
+    relations = [
+        String(f) for f in (:dN, :dS, :id_subject_query, :id_query_subject) if
+        !isnothing(getfield(gf, f))
+    ]
+    rel_str = isempty(relations) ? "none" : join(relations, ", ")
+    print(
+        io,
+        "GeneFamily($n gene$(n == 1 ? "" : "s"), $nscaff scaffold$(nscaff == 1 ? "" : "s"), $npairs pair$(npairs == 1 ? "" : "s"); relations: $rel_str)",
+    )
+end
+
+"""
+    gf[i::Integer]
+    gf[id::AbstractString]
+
+Return column `i` (or the column for gene `id`) from every relation matrix
+present on `gf`, as a `Dict{Symbol, Vector}` keyed by `:topology` and whichever
+of `:dN`, `:dS`, `:id_subject_query`, `:id_query_subject` are non-`nothing`.
+
+`dN`/`dS` store only their upper triangle (see the `GeneFamily` docstring), so
+column `i` alone only surfaces partners with a smaller index; combine with row
+`i` for the complete symmetric relation.
+"""
+function Base.getindex(gf::GeneFamily, i::Integer)
+    n = _n_genes(gf)
+    1 <= i <= n || throw(ArgumentError("gene index $i out of bounds (1:$n)"))
+    cols = Dict{Symbol,Vector}(:topology => Vector(gf.topology[:, i]))
+    for field in (:dN, :dS, :id_subject_query, :id_query_subject)
+        m = getfield(gf, field)
+        isnothing(m) || (cols[field] = Vector(m[:, i]))
+    end
+    return cols
+end
+
+function Base.getindex(gf::GeneFamily, id::AbstractString)
+    haskey(gf.id_to_index, id) || throw(ArgumentError("Unknown gene ID: \"$id\""))
+    return gf[gf.id_to_index[id]]
+end
+
+"""
+    gf[indices::AbstractVector{<:Integer}]
+    gf[ids::AbstractVector{<:AbstractString}]
+
+Return a new `GeneFamily` restricted to the given genes (a "sub-family"): every
+relation matrix present on `gf` is sliced to just those genes, and
+`intervals`/`scaffold_ranges` are rebuilt to stay concordant with the new,
+contiguous linear indexing.
+"""
+function Base.getindex(gf::GeneFamily, indices::AbstractVector{<:Integer})
+    isempty(indices) && throw(ArgumentError("`indices` must be non-empty"))
+    n = _n_genes(gf)
+    all(i -> 1 <= i <= n, indices) ||
+        throw(ArgumentError("gene index out of bounds (1:$n)"))
+
+    order = sort!(unique(collect(Int, indices)))
+    order_set = Set(order)
+    index_to_id = Dict(v => k for (k, v) in gf.id_to_index)
+
+    new_intervals = Dict{String,StructArray{Reference.IntervalSimple}}()
+    new_ranges = Dict{String,UnitRange{Int}}()
+    new_id_to_index = Dict{String,Int}()
+    cursor = 1
+    for name in sort!(collect(keys(gf.scaffold_ranges)))
+        rng = gf.scaffold_ranges[name]
+        kept = filter(gi -> gi in order_set, rng)
+        isempty(kept) && continue
+
+        ivs = [gf.intervals[name][gi-first(rng)+1] for gi in kept]
+        m = length(kept)
+        new_intervals[name] = StructArray(ivs)
+        new_ranges[name] = cursor:(cursor+m-1)
+        for (offset, gi) in enumerate(kept)
+            new_id_to_index[index_to_id[gi]] = cursor + offset - 1
+        end
+        cursor += m
+    end
+
+    relation(field) = (m = getfield(gf, field); isnothing(m) ? nothing : m[order, order])
+
+    return GeneFamily(
+        _RawFields(),
+        new_intervals,
+        new_ranges,
+        new_id_to_index,
+        gf.topology[order, order],
+        relation(:dN),
+        relation(:dS),
+        relation(:id_subject_query),
+        relation(:id_query_subject),
+    )
+end
+
+function Base.getindex(gf::GeneFamily, ids::AbstractVector{<:AbstractString})
+    isempty(ids) && throw(ArgumentError("`ids` must be non-empty"))
+    indices = map(ids) do id
+        haskey(gf.id_to_index, id) || throw(ArgumentError("Unknown gene ID: \"$id\""))
+        gf.id_to_index[id]
+    end
+    return gf[indices]
 end
 
 function rbh_ds(paralog_df::DataFrame)
@@ -393,6 +559,6 @@ function rbh(paralog_df::DataFrame; scoring::String = "max")
     )
 end
 
-export rbh, rbh_ds
+export GeneFamily, rbh, rbh_ds
 
 end

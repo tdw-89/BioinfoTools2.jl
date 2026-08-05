@@ -15,8 +15,15 @@ function genome_from_genes(genes)
                 io,
                 join(
                     (
-                        scaffold, "test", "gene", string(start_pos), string(stop_pos),
-                        ".", strand, ".", "ID=$id",
+                        scaffold,
+                        "test",
+                        "gene",
+                        string(start_pos),
+                        string(stop_pos),
+                        ".",
+                        strand,
+                        ".",
+                        "ID=$id",
                     ),
                     '\t',
                 ),
@@ -176,7 +183,7 @@ end
         @test gf.scaffold_ranges["chr2"] == 4:5
 
         # Only topology is built, and it is a symmetric Bool adjacency.
-        @test gf.topology isa SparseMatrixCSC{Bool, UInt32}
+        @test gf.topology isa SparseMatrixCSC{Bool,UInt32}
         @test size(gf.topology) == (5, 5)
         @test gf.topology == permutedims(gf.topology)
         @test gf.topology[1, 2] && gf.topology[2, 1]   # g1-g2
@@ -269,7 +276,7 @@ end
         gf = GF(genome, DataFrame(q = ["g1"], s = ["g2"], dN = [1]))
         q = gene_index(gf, "chr1", 100)
         s = gene_index(gf, "chr1", 300)
-        @test gf.dN isa SparseMatrixCSC{Float64, UInt32}
+        @test gf.dN isa SparseMatrixCSC{Float64,UInt32}
         @test gf.dN[min(q, s), max(q, s)] == 1.0
     end
 
@@ -300,8 +307,168 @@ end
         @test_throws ArgumentError GF(genome, DataFrame())
     end
 
-    @testset "non-numeric value column errors" begin
-        df = DataFrame(q = ["g1"], s = ["g2"], dN = ["not_a_number"])
-        @test_throws MethodError GF(genome, df)
+    @testset "column type validation" begin
+        # Query ID column holding non-strings.
+        @test_throws ArgumentError GF(genome, DataFrame(q = [1, 2], s = ["g2", "g3"]))
+
+        # Subject ID column holding non-strings.
+        @test_throws ArgumentError GF(genome, DataFrame(q = ["g1", "g2"], s = [1, 2]))
+
+        # A recognised value column holding non-numeric data.
+        df_bad_dn = DataFrame(q = ["g1"], s = ["g2"], dN = ["not_a_number"])
+        @test_throws ArgumentError GF(genome, df_bad_dn)
+
+        df_bad_idsq = DataFrame(q = ["g1"], s = ["g2"], id_subject_query = ["high"])
+        @test_throws ArgumentError GF(genome, df_bad_idsq)
+
+        # Error messages name the offending column and its element type.
+        try
+            GF(genome, DataFrame(q = [1], s = ["g2"]))
+            @test false   # unreachable
+        catch err
+            @test err isa ArgumentError
+            @test occursin("Query ID column", err.msg)
+        end
+        try
+            GF(genome, DataFrame(q = ["g1"], s = ["g2"], dS = ["x"]))
+            @test false   # unreachable
+        catch err
+            @test err isa ArgumentError
+            @test occursin("dS", err.msg)
+        end
+
+        # An unrecognised, non-value column is left alone regardless of type.
+        gf = GF(genome, DataFrame(q = ["g1"], s = ["g2"], note = [1, 2, 3][1:1]))
+        @test gf.dN === nothing
+    end
+end
+
+# ============================================================================
+# Tests for Base.show(::GeneFamily)
+# ============================================================================
+@testset "GeneFamily show" begin
+    GF = BioinfoTools2.Paralogs.GeneFamily
+    genes = [
+        ("chr1", 100, 200, "+", "g1"),
+        ("chr1", 300, 400, "-", "g2"),
+        ("chr2", 50, 80, "+", "g3"),
+    ]
+    genome = genome_from_genes(genes)
+
+    @testset "topology only" begin
+        gf = GF(genome, DataFrame(q = ["g1"], s = ["g2"]))
+        str = sprint(show, gf)
+        @test occursin("GeneFamily(", str)
+        # Only g1/g2 (both on chr1) are referenced, so g3/chr2 never get indexed.
+        @test occursin("2 genes", str)
+        @test occursin("1 scaffold", str)
+        @test occursin("1 pair", str)
+        @test occursin("none", str)   # no relation matrices present
+    end
+
+    @testset "with relations" begin
+        df = DataFrame(q = ["g1", "g2"], s = ["g2", "g3"], dN = [0.1, 0.2])
+        gf = GF(genome, df)
+        str = sprint(show, gf)
+        @test occursin("2 pairs", str)
+        @test occursin("dN", str)
+        @test !occursin("dS", str)   # dS was never supplied
+    end
+end
+
+# ============================================================================
+# Tests for GeneFamily getindex overloads
+# ============================================================================
+@testset "GeneFamily getindex" begin
+    GF = BioinfoTools2.Paralogs.GeneFamily
+    genes = [
+        ("chr1", 100, 200, "+", "g1"),
+        ("chr1", 300, 400, "-", "g2"),
+        ("chr1", 500, 600, "+", "g3"),
+        ("chr2", 50, 80, "+", "g4"),
+        ("chr2", 90, 120, "-", "g5"),
+    ]
+    genome = genome_from_genes(genes)
+    df = DataFrame(
+        q = ["g1", "g2", "g4"],
+        s = ["g2", "g3", "g5"],
+        dN = [0.1, 0.2, 0.3],
+        dS = [0.4, 0.5, 0.6],
+        id_subject_query = [90.0, 91.0, 92.0],
+        id_query_subject = [80.0, 81.0, 82.0],
+    )
+    gf = GF(genome, df)
+    g1 = gene_index(gf, "chr1", 100)
+    g2 = gene_index(gf, "chr1", 300)
+
+    @testset "gf[i::Integer] - column dict" begin
+        col = gf[g1]
+        @test col isa Dict{Symbol,Vector}
+        @test Set(keys(col)) ==
+              Set((:topology, :dN, :dS, :id_subject_query, :id_query_subject))
+        @test col[:topology] == Vector(gf.topology[:, g1])
+        @test col[:dN] == Vector(gf.dN[:, g1])
+        @test col[:id_subject_query] == Vector(gf.id_subject_query[:, g1])
+
+        n = size(gf.topology, 1)
+        @test_throws ArgumentError gf[n+1]
+        @test_throws ArgumentError gf[0]
+    end
+
+    @testset "gf[id::AbstractString] - matches integer form" begin
+        @test gf["g1"] == gf[g1]
+        @test_throws ArgumentError gf["no_such_gene"]
+    end
+
+    @testset "gf[indices] - sub-family, matrices sliced correctly" begin
+        sub = gf[[g1, g2]]
+        @test sub isa GF
+        @test sort(collect(keys(sub.intervals))) == ["chr1"]
+        @test size(sub.topology) == (2, 2)
+
+        sq, ss = gene_index(sub, "chr1", 100), gene_index(sub, "chr1", 300)
+        @test sub.topology[sq, ss] && sub.topology[ss, sq]
+        @test sub.dN[min(sq, ss), max(sq, ss)] == gf.dN[min(g1, g2), max(g1, g2)]
+        @test sub.id_subject_query[sq, ss] == gf.id_subject_query[g1, g2]
+        @test sub.id_query_subject[ss, sq] == gf.id_query_subject[g2, g1]
+
+        # intervals/scaffold_ranges stay concordant in the sub-family too.
+        for (name, rng) in sub.scaffold_ranges
+            @test length(rng) == length(sub.intervals[name])
+        end
+    end
+
+    @testset "gf[range] behaves like gf[vector]" begin
+        @test gf[1:2].topology == gf[[1, 2]].topology
+    end
+
+    @testset "gf[indices] - duplicates and unsorted input collapse" begin
+        @test gf[[2, 1, 1]].topology == gf[[1, 2]].topology
+    end
+
+    @testset "gf[indices] - bounds and emptiness errors" begin
+        n = size(gf.topology, 1)
+        @test_throws ArgumentError gf[[0, 1]]
+        @test_throws ArgumentError gf[[n+1]]
+        @test_throws ArgumentError gf[Int[]]
+    end
+
+    @testset "gf[ids::Vector{String}] - matches integer-vector form" begin
+        sub_by_id = gf[["g1", "g2"]]
+        sub_by_idx = gf[[g1, g2]]
+        @test sub_by_id.topology == sub_by_idx.topology
+        @test sub_by_id.dN == sub_by_idx.dN
+
+        @test_throws ArgumentError gf[["g1", "ghost"]]
+        @test_throws ArgumentError gf[String[]]
+    end
+
+    @testset "sub-family with only some relations present" begin
+        df2 = DataFrame(q = ["g1"], s = ["g3"], dS = [0.7])
+        gf2 = GF(genome, df2)
+        sub = gf2[["g1", "g3"]]
+        @test sub.dS !== nothing
+        @test sub.dN === nothing
+        @test sub.id_subject_query === nothing
     end
 end
