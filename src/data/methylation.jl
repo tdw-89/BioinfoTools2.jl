@@ -86,23 +86,14 @@ A single genomic cytosine's aggregated methylation calls, packed into 8 bytes.
 - Bits 26-27 : strand, as the package-wide 2-bit strand codes (see `BitCodes`)
 - Bits 28-31 : reserved for future quality/SNP flags
 
-**A level plus a depth, not two counts.** Splitting the 24 payload bits into two
-12-bit counts would cap each at 4095 and lose the true depth of any site above
-that — precisely the deep sites whose statistics are most trustworthy. Storing
-the depth whole instead keeps it exact to 65535, sixteen times further out, and
-spends the remaining byte on the level, which only ever needs enough resolution
-to name a percentage.
-
-The methylated and unmethylated counts are therefore *reconstructed* rather than
+The methylated and unmethylated counts are *reconstructed* rather than
 stored (see [`get_meth`](@ref)), and the reconstruction is exact for every site
 with a depth of 255 or less — that is, for essentially every site in a real
 bisulfite library. Deeper than that the counts can be off by a read or two,
 while the depth itself stays exact and the level stays within half a
 quantization step (0.196 percentage points).
 
-Read IDs from the source alignment are deliberately discarded: only positional
-counts are kept, which is what makes the fixed 8-byte-per-site footprint (and
-the columnar Arrow layout) possible.
+Read IDs from the source alignment are deliberately discarded.
 """
 struct AggregatedCall
     pos::UInt32

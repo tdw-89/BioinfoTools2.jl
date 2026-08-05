@@ -100,11 +100,15 @@ end
         @test encode_percent(NaN) == 0
 
         # Every code decodes into [0, 100] and re-encodes to itself.
+        pct_in_range = Bool[]
+        pct_roundtrips = Bool[]
         for code = 0:255
             pct = decode_percent(code)
-            @test 0 <= pct <= 100
-            @test encode_percent(pct) == code
+            push!(pct_in_range, 0 <= pct <= 100)
+            push!(pct_roundtrips, encode_percent(pct) == code)
         end
+        @test all(pct_in_range)
+        @test all(pct_roundtrips)
 
         # Packing a level and a depth directly is the same as packing the
         # equivalent counts.
@@ -131,30 +135,50 @@ end
         # realistic bisulfite site — the counts come back exactly as they went
         # in. This is exhaustive over all (meth, unmeth) with a depth <= 255.
         worst_percent_error = 0.0
+        depth_exact = Bool[]
+        meth_exact = Bool[]
+        unmeth_exact = Bool[]
         for depth = 1:255, meth = 0:depth
             payload = pack_payload(meth, depth - meth, CTX_CPG, STRAND_FWD)
-            @test get_depth(payload) == depth
-            @test get_meth(payload) == meth
-            @test get_unmeth(payload) == depth - meth
+            push!(depth_exact, get_depth(payload) == depth)
+            push!(meth_exact, get_meth(payload) == meth)
+            push!(unmeth_exact, get_unmeth(payload) == depth - meth)
             worst_percent_error =
                 max(worst_percent_error, abs(meth_percent(payload) - 100 * meth / depth))
         end
+        @test all(depth_exact)
+        @test all(meth_exact)
+        @test all(unmeth_exact)
         # ...and the level is always within half a quantization step.
         @test worst_percent_error <= PCT_TOL
 
         # Beyond 255 the depth stays exact and the level stays within half a
         # step, while the counts may drift by a read or two.
         rng = Random.MersenneTwister(451)
+        deep_depth_exact = Bool[]
+        deep_percent_ok = Bool[]
+        deep_meth_close = Bool[]
+        deep_counts_partition = Bool[]
         for _ = 1:2000
             depth = rand(rng, 256:65535)
             meth = rand(rng, 0:depth)
             payload = pack_payload(meth, depth - meth, CTX_CPG, STRAND_FWD)
-            @test get_depth(payload) == depth
-            @test abs(meth_percent(payload) - 100 * meth / depth) <= PCT_TOL
-            @test abs(Int(get_meth(payload)) - meth) <= cld(depth, 510) + 1
+            push!(deep_depth_exact, get_depth(payload) == depth)
+            push!(
+                deep_percent_ok,
+                abs(meth_percent(payload) - 100 * meth / depth) <= PCT_TOL,
+            )
+            push!(
+                deep_meth_close,
+                abs(Int(get_meth(payload)) - meth) <= cld(depth, 510) + 1,
+            )
             # The two reconstructed counts always partition the depth exactly.
-            @test get_meth(payload) + get_unmeth(payload) == depth
+            push!(deep_counts_partition, get_meth(payload) + get_unmeth(payload) == depth)
         end
+        @test all(deep_depth_exact)
+        @test all(deep_percent_ok)
+        @test all(deep_meth_close)
+        @test all(deep_counts_partition)
     end
 
     # -------------------------------------------------------------------------
@@ -179,17 +203,30 @@ end
         # Depth saturates instead of wrapping into the neighbouring field — and
         # crucially, the level stays accurate even when it does, because it is
         # computed from the counts as given.
+        clamp_depth_ok = Bool[]
+        clamp_percent_ok = Bool[]
+        clamp_context_ok = Bool[]
+        clamp_strand_ok = Bool[]
         for (meth, unmeth) in
             ((65536, 0), (0, 65536), (100_000, 900_000), (typemax(Int32), 7))
             clamped = pack_payload(meth, unmeth, CTX_CHG, STRAND_BOTH)
-            @test get_depth(clamped) == min(Int128(meth) + unmeth, MAX_COUNT)
-            @test abs(
-                meth_percent(clamped) - 100 * Int128(meth) / (Int128(meth) + unmeth),
-            ) <= PCT_TOL
+            push!(
+                clamp_depth_ok,
+                get_depth(clamped) == min(Int128(meth) + unmeth, MAX_COUNT),
+            )
+            push!(
+                clamp_percent_ok,
+                abs(meth_percent(clamped) - 100 * Int128(meth) / (Int128(meth) + unmeth)) <=
+                PCT_TOL,
+            )
             # The fields must not have bled into context/strand.
-            @test get_context(clamped) == CTX_CHG
-            @test Methylation.get_strand_code(clamped) == STRAND_BOTH
+            push!(clamp_context_ok, get_context(clamped) == CTX_CHG)
+            push!(clamp_strand_ok, Methylation.get_strand_code(clamped) == STRAND_BOTH)
         end
+        @test all(clamp_depth_ok)
+        @test all(clamp_percent_ok)
+        @test all(clamp_context_ok)
+        @test all(clamp_strand_ok)
 
         # Negative counts floor at zero rather than wrapping
         @test get_depth(pack_payload(-5, 3, CTX_CPG, STRAND_FWD)) == 3
@@ -198,19 +235,36 @@ end
 
         # Every context / strand combination round-trips, and fields are
         # independent of one another.
+        combo_depth_ok = Bool[]
+        combo_percent_ok = Bool[]
+        combo_context_ok = Bool[]
+        combo_strand_ok = Bool[]
+        combo_decoded_strand_ok = Bool[]
+        combo_forward_ok = Bool[]
+        combo_reserved_clear = Bool[]
         for context in (CTX_CPG, CTX_CHG, CTX_CHH, CTX_UNKNOWN),
             strand in (STRAND_FWD, STRAND_REV, STRAND_BOTH, STRAND_NA)
 
             payload = pack_payload(1234, 2345, context, strand)
-            @test get_depth(payload) == 3579
-            @test abs(meth_percent(payload) - 100 * 1234 / 3579) <= PCT_TOL
-            @test get_context(payload) == context
-            @test Methylation.get_strand_code(payload) == strand
-            @test get_strand(payload) == decode_strand(strand)
-            @test is_forward(payload) == (strand == STRAND_FWD)
+            push!(combo_depth_ok, get_depth(payload) == 3579)
+            push!(
+                combo_percent_ok,
+                abs(meth_percent(payload) - 100 * 1234 / 3579) <= PCT_TOL,
+            )
+            push!(combo_context_ok, get_context(payload) == context)
+            push!(combo_strand_ok, Methylation.get_strand_code(payload) == strand)
+            push!(combo_decoded_strand_ok, get_strand(payload) == decode_strand(strand))
+            push!(combo_forward_ok, is_forward(payload) == (strand == STRAND_FWD))
             # Bits 28-31 are reserved and must stay clear.
-            @test (payload >> 28) == 0
+            push!(combo_reserved_clear, (payload >> 28) == 0)
         end
+        @test all(combo_depth_ok)
+        @test all(combo_percent_ok)
+        @test all(combo_context_ok)
+        @test all(combo_strand_ok)
+        @test all(combo_decoded_strand_ok)
+        @test all(combo_forward_ok)
+        @test all(combo_reserved_clear)
     end
 
     # -------------------------------------------------------------------------
@@ -301,6 +355,8 @@ end
         @test length(find_calls_in_range(calls, 4, 300)) == 99
 
         rng = Random.MersenneTwister(20260727)
+        hit_count_ok = Bool[]
+        hit_bounds_ok = Bool[]
         for _ = 1:200
             lo = rand(rng, 1:(3n))
             hi = lo + rand(rng, 0:10_000)
@@ -309,9 +365,11 @@ end
             # just how many k fall in the window.
             first_k = max(0, cld(lo - 1, 3))
             last_k = min(n - 1, fld(hi - 1, 3))
-            @test length(hits) == max(0, last_k - first_k + 1)
-            @test all(lo <= c.pos <= hi for c in hits)
+            push!(hit_count_ok, length(hits) == max(0, last_k - first_k + 1))
+            push!(hit_bounds_ok, all(lo <= c.pos <= hi for c in hits))
         end
+        @test all(hit_count_ok)
+        @test all(hit_bounds_ok)
     end
 
     # -------------------------------------------------------------------------
@@ -352,11 +410,15 @@ end
         # Per-site counts match an independent tally of the fixture.
         expected = reference_counts(MICRO_BISMARK)
         @test length(expected) == 76
+        meth_ok = Bool[]
+        unmeth_ok = Bool[]
         for call in calls
             meth, unmeth = expected[call.pos]
-            @test get_meth(call) == meth
-            @test get_unmeth(call) == unmeth
+            push!(meth_ok, get_meth(call) == meth)
+            push!(unmeth_ok, get_unmeth(call) == unmeth)
         end
+        @test all(meth_ok)
+        @test all(unmeth_ok)
 
         # Range queries against real coordinates
         window = find_calls_in_range(data, "15", 31971000, 31971100)
@@ -492,11 +554,17 @@ end
         doubled = merge_calls([load_bismark(MICRO_BISMARK), load_bismark(MICRO_BISMARK)])
         single = load_bismark(MICRO_BISMARK)
         @test n_sites(doubled) == 76
+        pos_ok = Bool[]
+        meth_doubled_ok = Bool[]
+        unmeth_doubled_ok = Bool[]
         for (a, b) in zip(doubled["15"], single["15"])
-            @test a.pos == b.pos
-            @test get_meth(a) == 2 * get_meth(b)
-            @test get_unmeth(a) == 2 * get_unmeth(b)
+            push!(pos_ok, a.pos == b.pos)
+            push!(meth_doubled_ok, get_meth(a) == 2 * get_meth(b))
+            push!(unmeth_doubled_ok, get_unmeth(a) == 2 * get_unmeth(b))
         end
+        @test all(pos_ok)
+        @test all(meth_doubled_ok)
+        @test all(unmeth_doubled_ok)
 
         @test n_sites(load_bismark(String[])) == 0
     end
@@ -529,11 +597,15 @@ end
         # Per-site counts match an independent read of the fixture.
         expected = reference_cov_counts(MICRO_COV)
         @test length(expected) == 151
+        cov_meth_ok = Bool[]
+        cov_unmeth_ok = Bool[]
         for call in calls
             meth, unmeth = expected[call.pos]
-            @test get_meth(call) == meth
-            @test get_unmeth(call) == unmeth
+            push!(cov_meth_ok, get_meth(call) == meth)
+            push!(cov_unmeth_ok, get_unmeth(call) == unmeth)
         end
+        @test all(cov_meth_ok)
+        @test all(cov_unmeth_ok)
 
         # Coordinates are already 1-based, so they line up with the
         # methylation-extractor fixture covering the same window: every one of
@@ -541,12 +613,18 @@ end
         # the same counts.
         extractor = load_bismark(MICRO_BISMARK)["15"]
         @test length(extractor) == 76
+        extractor_hit_unique = Bool[]
+        extractor_meth_ok = Bool[]
+        extractor_unmeth_ok = Bool[]
         for call in extractor
             hit = find_calls_in_range(calls, call.pos, call.pos)
-            @test length(hit) == 1
-            @test get_meth(hit[1]) == get_meth(call)
-            @test get_unmeth(hit[1]) == get_unmeth(call)
+            push!(extractor_hit_unique, length(hit) == 1)
+            push!(extractor_meth_ok, get_meth(hit[1]) == get_meth(call))
+            push!(extractor_unmeth_ok, get_unmeth(hit[1]) == get_unmeth(call))
         end
+        @test all(extractor_hit_unique)
+        @test all(extractor_meth_ok)
+        @test all(extractor_unmeth_ok)
 
         window = find_calls_in_range(data, "15", 31971000, 31971100)
         @test [Int(c.pos) for c in window] == [
@@ -676,11 +754,17 @@ end
         doubled = load_bismark_cov([MICRO_COV, ob_path]; strand = STRAND_FWD)
         single = load_bismark_cov(MICRO_COV)
         @test n_sites(doubled) == 151
+        cov_pos_ok = Bool[]
+        cov_meth_doubled_ok = Bool[]
+        cov_unmeth_doubled_ok = Bool[]
         for (a, b) in zip(doubled["15"], single["15"])
-            @test a.pos == b.pos
-            @test get_meth(a) == 2 * get_meth(b)
-            @test get_unmeth(a) == 2 * get_unmeth(b)
+            push!(cov_pos_ok, a.pos == b.pos)
+            push!(cov_meth_doubled_ok, get_meth(a) == 2 * get_meth(b))
+            push!(cov_unmeth_doubled_ok, get_unmeth(a) == 2 * get_unmeth(b))
         end
+        @test all(cov_pos_ok)
+        @test all(cov_meth_doubled_ok)
+        @test all(cov_unmeth_doubled_ok)
 
         # `context` accepts a function of the path too.
         by_name = load_bismark_cov(
@@ -710,29 +794,65 @@ end
         calls = data["15"]
         dir = mktempdir()
 
+        write_returns_path = Bool[]
+        file_created = Bool[]
+        restored_is_structarray = Bool[]
+        restored_length_ok = Bool[]
+        restored_pos_ok = Bool[]
+        restored_payload_ok = Bool[]
+        restored_elements_ok = Bool[]
+        decoded_meth_ok = Bool[]
+        decoded_unmeth_ok = Bool[]
+        decoded_context_ok = Bool[]
+        decoded_strand_ok = Bool[]
+        search_matches = Bool[]
         for compress in (:zstd, :lz4, nothing)
             path = joinpath(dir, "calls_$(something(compress, :none)).arrow")
-            @test write_methylation_arrow(path, calls; compress = compress) == path
-            @test isfile(path)
+            push!(
+                write_returns_path,
+                write_methylation_arrow(path, calls; compress = compress) == path,
+            )
+            push!(file_created, isfile(path))
 
             restored = read_methylation_arrow(path)
-            @test restored isa StructArray{AggregatedCall}
-            @test length(restored) == length(calls)
-            @test collect(restored.pos) == collect(calls.pos)
-            @test collect(restored.payload) == collect(calls.payload)
-            @test all(restored[i] == calls[i] for i in eachindex(calls))
+            push!(restored_is_structarray, restored isa StructArray{AggregatedCall})
+            push!(restored_length_ok, length(restored) == length(calls))
+            push!(restored_pos_ok, collect(restored.pos) == collect(calls.pos))
+            push!(restored_payload_ok, collect(restored.payload) == collect(calls.payload))
+            push!(
+                restored_elements_ok,
+                all(restored[i] == calls[i] for i in eachindex(calls)),
+            )
 
             # Decoded values survive the round-trip, not just the raw bits.
             for (a, b) in zip(restored, calls)
-                @test get_meth(a) == get_meth(b)
-                @test get_unmeth(a) == get_unmeth(b)
-                @test get_context(a) == get_context(b)
-                @test Methylation.get_strand_code(a) == Methylation.get_strand_code(b)
+                push!(decoded_meth_ok, get_meth(a) == get_meth(b))
+                push!(decoded_unmeth_ok, get_unmeth(a) == get_unmeth(b))
+                push!(decoded_context_ok, get_context(a) == get_context(b))
+                push!(
+                    decoded_strand_ok,
+                    Methylation.get_strand_code(a) == Methylation.get_strand_code(b),
+                )
             end
 
             # And binary search still works on the mapped columns.
-            @test [c.pos for c in find_calls_in_range(restored, 31971000, 31971100)] == [c.pos for c in find_calls_in_range(calls, 31971000, 31971100)]
+            push!(
+                search_matches,
+                [c.pos for c in find_calls_in_range(restored, 31971000, 31971100)] == [c.pos for c in find_calls_in_range(calls, 31971000, 31971100)],
+            )
         end
+        @test all(write_returns_path)
+        @test all(file_created)
+        @test all(restored_is_structarray)
+        @test all(restored_length_ok)
+        @test all(restored_pos_ok)
+        @test all(restored_payload_ok)
+        @test all(restored_elements_ok)
+        @test all(decoded_meth_ok)
+        @test all(decoded_unmeth_ok)
+        @test all(decoded_context_ok)
+        @test all(decoded_strand_ok)
+        @test all(search_matches)
 
         # An empty array is still a valid (readable) file.
         empty_path = joinpath(dir, "empty.arrow")
@@ -789,11 +909,15 @@ end
         restored = read_methylation(dir)
         @test sort(collect(keys(restored))) == sort(collect(keys(data)))
         @test n_sites(restored) == n_sites(data)
+        length_matches = Bool[]
+        elements_match = Bool[]
         for chrom in keys(data)
             original, back = data[chrom], restored[chrom]
-            @test length(back) == length(original)
-            @test all(back[i] == original[i] for i in eachindex(original))
+            push!(length_matches, length(back) == length(original))
+            push!(elements_match, all(back[i] == original[i] for i in eachindex(original)))
         end
+        @test all(length_matches)
+        @test all(elements_match)
 
         # Scaffold names that aren't valid file names survive via the manifest.
         @test haskey(restored, "scaffold|weird:name")

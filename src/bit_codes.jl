@@ -123,6 +123,49 @@ end
 """Convert a strand character (`+`, `-`, `.`) to a `GenomicFeatures.Strand`."""
 get_strand(strand::Char) = decode_strand(strand_code(strand))
 
+#= Feature metadata code (64-bit) =#
+
+# Field layout of the 64-bit feature metadata code used by gene features in
+# `Reference` (see `pack_metadata`). Offsets are 0-based bit positions.
+const INDEX_SHIFT = 0
+const INDEX_WIDTH = 32
+const STRAND_SHIFT = 32
+const STRAND_FIELD_WIDTH = 8
+const SO_SHIFT = 40
+const SO_WIDTH = 16
+
+"""
+Pack a feature's metadata index, strand and SO term into a single 64-bit code:
+
+|-<NULL>-|-----SO-Term-----|-Strand-|---------------Index---------------|
+|00000000|00000000|00000000|00000000|00000000|00000000|00000000|00000000|
+
+`strand` uses the package-wide 2-bit strand codes (see above); the field is 8
+bits wide, so its upper 6 bits are always zero.
+"""
+function pack_metadata(index::UInt32, strand::UInt8, so_term::UInt16)
+    code = UInt64(0)
+    code = set_field(code, index, INDEX_SHIFT, INDEX_WIDTH)
+    code = set_field(code, strand, STRAND_SHIFT, STRAND_FIELD_WIDTH)
+    code = set_field(code, so_term, SO_SHIFT, SO_WIDTH)
+    return code
+end
+
+"""Extract the 32-bit metadata index from a feature code (see [`pack_metadata`](@ref))."""
+function parse_index(code::UInt64)
+    return UInt32(get_field(code, INDEX_SHIFT, INDEX_WIDTH))
+end
+
+"""Extract the strand from a feature code as a `GenomicFeatures.Strand` (see [`pack_metadata`](@ref))."""
+function parse_strand(code::UInt64)
+    return decode_strand(get_field(code, STRAND_SHIFT, STRAND_FIELD_WIDTH))
+end
+
+"""Extract the 16-bit SO term code from a feature code (see [`pack_metadata`](@ref))."""
+function parse_so_term(code::UInt64)
+    return UInt16(get_field(code, SO_SHIFT, SO_WIDTH))
+end
+
 export STRAND_FWD,
     STRAND_REV,
     STRAND_BOTH,
@@ -133,6 +176,10 @@ export STRAND_FWD,
     field_mask,
     get_field,
     get_strand,
+    pack_metadata,
+    parse_index,
+    parse_so_term,
+    parse_strand,
     set_field,
     strand_char,
     strand_code

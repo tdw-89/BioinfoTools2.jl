@@ -1,6 +1,8 @@
 module Paralogs
 
 using DataFrames
+using Graphs
+using SparseArrays
 
 function rbh_ds(paralog_df::DataFrame)
     @assert typeof(paralog_df[1, 1]) <: AbstractString

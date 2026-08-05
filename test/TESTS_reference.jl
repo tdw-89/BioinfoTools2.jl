@@ -61,11 +61,11 @@ end
 
     # -------------------------------------------------------------------------
     @testset "sanitize_id" begin
-        @test Reference.sanitize_id("gene:WBGene00000001") == "WBGene00000001"
-        @test Reference.sanitize_id("gene:transcript:TX0001") == "TX0001"
-        @test Reference.sanitize_id("mRNA:RNA:CDS:Protein:ABC123") == "ABC123"
-        @test Reference.sanitize_id("gene-family:ABC123") == "gene-family:ABC123"
-        @test Reference.sanitize_id("ABC123") == "ABC123"
+        @test sanitize_id("gene:WBGene00000001") == "WBGene00000001"
+        @test sanitize_id("gene:transcript:TX0001") == "TX0001"
+        @test sanitize_id("mRNA:RNA:CDS:Protein:ABC123") == "ABC123"
+        @test sanitize_id("gene-family:ABC123") == "gene-family:ABC123"
+        @test sanitize_id("ABC123") == "ABC123"
     end
 
     # -------------------------------------------------------------------------
@@ -75,15 +75,15 @@ end
                 "chr1\tRefSeq\tgene\t5\t20\t.\t+\t.\tID=gene:transcript:GENE0001;gene_biotype=protein_coding",
             )
 
-            result = Reference.parse_record(record, UInt32(7))
+            result = parse_record(record, UInt32(7))
 
-            @test result isa Reference.ParseResult
+            @test result isa ParseResult
             @test result.scaffold_id == "chr1"
             @test result.start_pos == UInt32(5)
             @test result.end_pos == UInt32(20)
-            @test Reference.parse_index(result.code) == UInt32(7)
-            @test Reference.parse_strand(result.code) == GFF3.GenomicFeatures.STRAND_POS
-            @test Reference.parse_so_term(result.code) == Reference.convert_so_term("gene")
+            @test parse_index(result.code) == UInt32(7)
+            @test parse_strand(result.code) == GFF3.GenomicFeatures.STRAND_POS
+            @test parse_so_term(result.code) == convert_so_term("gene")
             @test result.id == "GENE0001"
             @test result.source == "RefSeq"
             @test result.biotype == "protein_coding"
@@ -94,21 +94,21 @@ end
                 "chr1\tRefSeq\tmRNA\t10\t30\t.\t-\t.\tID=transcript:TX0001;gene_biotype=ncRNA",
             )
 
-            result = Reference.parse_record(record, UInt32(8); sanitize_ids = false)
+            result = parse_record(record, UInt32(8); sanitize_ids = false)
 
             @test result.id == "transcript:TX0001"
-            @test Reference.parse_strand(result.code) == GFF3.GenomicFeatures.STRAND_NEG
+            @test parse_strand(result.code) == GFF3.GenomicFeatures.STRAND_NEG
         end
 
         @testset "missing optional fields fall back to NA" begin
             record = read_test_gff_record("chr2\t.\tgene\t1\t9\t.\t.\t.\tName=no_id")
 
-            result = Reference.parse_record(record, UInt32(9))
+            result = parse_record(record, UInt32(9))
 
             @test result.id == "NA"
             @test result.source == "NA"
             @test result.biotype == "NA"
-            @test Reference.parse_strand(result.code) == GFF3.GenomicFeatures.STRAND_BOTH
+            @test parse_strand(result.code) == GFF3.GenomicFeatures.STRAND_BOTH
         end
 
         @testset "multi-valued ID and biotype fall back to NA" begin
@@ -116,7 +116,7 @@ end
                 "chr3\tRefSeq\tgene\t2\t8\t.\t+\t.\tID=gene:ONE,gene:TWO;gene_biotype=type1,type2",
             )
 
-            result = Reference.parse_record(record, UInt32(10))
+            result = parse_record(record, UInt32(10))
 
             @test result.id == "NA"
             @test result.source == "RefSeq"
@@ -128,7 +128,7 @@ end
                 "chr4\tRefSeq\tnot_a_real_so_term\t3\t6\t.\t+\t.\tID=gene:SKIPME;gene_biotype=protein_coding",
             )
 
-            @test isnothing(Reference.parse_record(record, UInt32(11)))
+            @test isnothing(parse_record(record, UInt32(11)))
         end
     end
 
@@ -311,11 +311,8 @@ end
             @test !isnothing(tree)
             @test !isempty(tree)
             # Every returned interval must carry the same (gene) SO term code
-            gene_code = BioinfoTools2.Reference.parse_so_term(first(tree).value)
-            @test all(
-                iv -> BioinfoTools2.Reference.parse_so_term(iv.value) == gene_code,
-                tree,
-            )
+            gene_code = parse_so_term(first(tree).value)
+            @test all(iv -> parse_so_term(iv.value) == gene_code, tree)
         end
 
         @testset "get_feature(scaffold, Symbol) – unknown term" begin
@@ -379,8 +376,8 @@ end
 
         # Grab a real gene interval, its metadata index and its ID.
         gene_iv = first(get_feature(scaffold, :gene))
-        gene_idx = BioinfoTools2.Reference.parse_index(gene_iv.value)
-        gene_id = BioinfoTools2.Reference.get_metadata_id(s.genome, gene_idx)
+        gene_idx = parse_index(gene_iv.value)
+        gene_id = get_metadata_id(s.genome, gene_idx)
 
         @testset "getindex(genome, String) – match / miss" begin
             rec = s.genome[gene_id]
