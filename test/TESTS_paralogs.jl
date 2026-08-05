@@ -2,6 +2,8 @@ using BioinfoTools2
 using BioinfoTools2.Paralogs
 using BioinfoTools2.Reference
 using DataFrames
+using Graphs
+using SimpleWeightedGraphs
 using SparseArrays
 using Test
 
@@ -302,6 +304,34 @@ end
         @test gf.dN[min(q, s), max(q, s)] == 0.42
     end
 
+    @testset "NaN rows are dropped up front, with a warning" begin
+        # A NaN in *either* matched column drops the whole row, not just that
+        # field's contribution.
+        df = DataFrame(
+            q = ["g1", "g2", "g1"],
+            s = ["g2", "g3", "g3"],
+            dN = [0.1, NaN, 0.3],
+            dS = [0.4, 0.5, NaN],
+        )
+        local gf
+        gf = @test_logs (:warn, r"dropped 2 rows") GF(genome, df)
+
+        # Only the g1-g2 row (no NaNs) survives.
+        @test size(gf.topology) == (2, 2)
+        @test nnz(gf.dN) == 1
+        @test nnz(gf.dS) == 1
+        @test !any(isnan, nonzeros(gf.dN))
+        @test !any(isnan, nonzeros(gf.dS))
+
+        # No NaNs -> no warning, nothing dropped.
+        @test_logs GF(genome, DataFrame(q = ["g1"], s = ["g2"], dN = [0.1]))
+
+        # NaN in an unrecognised (non-value) column never triggers dropping.
+        gf2 = @test_logs GF(genome, DataFrame(q = ["g1"], s = ["g2"], note = [NaN]))
+        @test size(gf2.topology) == (2, 2)
+        @test gf2.dN === nothing
+    end
+
     @testset "fewer than two columns errors" begin
         @test_throws ArgumentError GF(genome, DataFrame(query = ["g1"]))
         @test_throws ArgumentError GF(genome, DataFrame())
@@ -470,5 +500,191 @@ end
         @test sub.dS !== nothing
         @test sub.dN === nothing
         @test sub.id_subject_query === nothing
+    end
+end
+
+# ============================================================================
+# Tests for the *_graph conversion functions
+# ============================================================================
+@testset "GeneFamily graph conversions" begin
+    GF = BioinfoTools2.Paralogs.GeneFamily
+    genes = [
+        ("chr1", 100, 200, "+", "g1"),
+        ("chr1", 300, 400, "-", "g2"),
+        ("chr1", 500, 600, "+", "g3"),
+    ]
+    genome = genome_from_genes(genes)
+    df = DataFrame(
+        q = ["g1", "g2"],
+        s = ["g2", "g3"],
+        dN = [0.1, 0.2],
+        dS = [0.3, 0.4],
+        id_subject_query = [90.0, 91.0],
+        id_query_subject = [80.0, 81.0],
+    )
+    gf = GF(genome, df)
+    g1 = gene_index(gf, "chr1", 100)
+    g2 = gene_index(gf, "chr1", 300)
+    g3 = gene_index(gf, "chr1", 500)
+
+    @testset "topology_graph - unweighted" begin
+        g = topology_graph(gf)
+        @test g isa SimpleGraph
+        @test nv(g) == 3
+        @test ne(g) == 2
+        @test has_edge(g, g1, g2) && has_edge(g, g2, g3)
+        @test !has_edge(g, g1, g3)
+    end
+
+    @testset "dN_graph / dS_graph - symmetric weighted" begin
+        dng = dN_graph(gf)
+        @test dng isa SimpleWeightedGraph
+        @test nv(dng) == 3
+        @test get_weight(dng, g1, g2) == 0.1
+        @test get_weight(dng, g2, g1) == 0.1   # symmetric both ways
+        @test get_weight(dng, g2, g3) == 0.2
+
+        dsg = dS_graph(gf)
+        @test dsg isa SimpleWeightedGraph
+        @test get_weight(dsg, g1, g2) == 0.3
+        @test get_weight(dsg, g3, g2) == 0.4
+    end
+
+    @testset "id_*_graph - directed weighted, not mirrored" begin
+        sqg = id_subject_query_graph(gf)
+        @test sqg isa SimpleWeightedDiGraph
+        @test get_weight(sqg, g1, g2) == 90.0
+        @test get_weight(sqg, g2, g1) == 0.0   # directed: opposite entry unset
+
+        qsg = id_query_subject_graph(gf)
+        @test qsg isa SimpleWeightedDiGraph
+        @test get_weight(qsg, g2, g1) == 80.0
+        @test get_weight(qsg, g1, g2) == 0.0
+    end
+
+    @testset "absent relations propagate as nothing" begin
+        gf2 = GF(genome, DataFrame(q = ["g1"], s = ["g2"]))
+        @test topology_graph(gf2) isa SimpleGraph
+        @test dN_graph(gf2) === nothing
+        @test dS_graph(gf2) === nothing
+        @test id_subject_query_graph(gf2) === nothing
+        @test id_query_subject_graph(gf2) === nothing
+    end
+
+    @testset "graphs stay consistent through sub-family indexing" begin
+        sub = gf[["g1", "g2"]]
+        sg1, sg2 = gene_index(sub, "chr1", 100), gene_index(sub, "chr1", 300)
+        @test nv(topology_graph(sub)) == 2
+        @test get_weight(dN_graph(sub), sg1, sg2) == 0.1
+        @test get_weight(id_subject_query_graph(sub), sg1, sg2) == 90.0
+    end
+end
+
+# ============================================================================
+# Tests for rbh(::GeneFamily) - per-component reciprocal best hit
+# ============================================================================
+@testset "rbh(::GeneFamily)" begin
+    GF = BioinfoTools2.Paralogs.GeneFamily
+    genes = [
+        ("chr1", 100, 110, "+", "g1"),
+        ("chr1", 200, 210, "+", "g2"),
+        ("chr1", 300, 310, "+", "g3"),
+        ("chr1", 400, 410, "+", "g4"),
+        ("chr2", 10, 20, "+", "g5"),
+        ("chr2", 30, 40, "+", "g6"),
+    ]
+    genome = genome_from_genes(genes)
+
+    @testset "ranks by dS, then dN, then %ID, per component" begin
+        # Component {g1,g2,g3}: g2-g3 has the lowest dS -> wins outright.
+        # Component {g4,g5,g6} is a chain g4-g5, g5-g6 with equal dS; dN then
+        # breaks the tie in favour of g5-g6.
+        df = DataFrame(
+            q = ["g1", "g1", "g2", "g4", "g5"],
+            s = ["g2", "g3", "g3", "g5", "g6"],
+            dS = [0.5, 0.5, 0.1, 0.3, 0.3],
+            dN = [0.2, 0.2, 0.2, 0.9, 0.4],
+        )
+        gf = GF(genome, df)
+        result = rbh(gf)
+
+        @test nrow(result) == 2
+        @test Set(names(result)) == Set(["query", "subject", "dN", "dS"])
+
+        r1 = only(
+            filter(r -> Set([r.query, r.subject]) == Set(["g2", "g3"]), eachrow(result)),
+        )
+        @test r1.dS == 0.1
+
+        r2 = only(
+            filter(r -> Set([r.query, r.subject]) == Set(["g5", "g6"]), eachrow(result)),
+        )
+        @test r2.dS == 0.3 && r2.dN == 0.4
+    end
+
+    @testset "%ID breaks ties after dS and dN, scoring is configurable" begin
+        # g1-g2 and g1-g3 tie on both dS and dN; %ID must decide.
+        df = DataFrame(
+            q = ["g1", "g1"],
+            s = ["g2", "g3"],
+            dS = [0.2, 0.2],
+            dN = [0.1, 0.1],
+            id_subject_query = [70.0, 95.0],
+            id_query_subject = [72.0, 60.0],
+        )
+        gf = GF(genome, df)
+
+        # mean(70,72)=71 vs mean(95,60)=77.5 -> g1-g3 wins on higher mean %ID.
+        mean_result = rbh(gf; scoring = "mean")
+        @test nrow(mean_result) == 1
+        @test Set([mean_result.query[1], mean_result.subject[1]]) == Set(["g1", "g3"])
+
+        # min(70,72)=70 vs min(95,60)=60 -> g1-g2 wins on higher minimum %ID.
+        min_result = rbh(gf; scoring = "min")
+        @test Set([min_result.query[1], min_result.subject[1]]) == Set(["g1", "g2"])
+
+        # max(70,72)=72 vs max(95,60)=95 -> g1-g3 wins on higher maximum %ID.
+        max_result = rbh(gf; scoring = "max")
+        @test Set([max_result.query[1], max_result.subject[1]]) == Set(["g1", "g3"])
+
+        @test_throws ArgumentError rbh(gf; scoring = "bogus")
+    end
+
+    @testset "genuine ties warn and resolve deterministically" begin
+        # g1-g2 and g1-g3 are identical on every available metric.
+        df = DataFrame(q = ["g1", "g1"], s = ["g2", "g3"], dS = [0.4, 0.4], dN = [0.1, 0.1])
+        gf = GF(genome, df)
+
+        local result
+        result = @test_logs (:warn, r"tied best-hit") rbh(gf)
+        @test nrow(result) == 1
+        # The lowest-indexed pair (g1-g2) deterministically wins the tie.
+        @test Set([result.query[1], result.subject[1]]) == Set(["g1", "g2"])
+
+        # No tie -> no warning at all.
+        clean = GF(genome, DataFrame(q = ["g1"], s = ["g2"], dS = [0.4]))
+        @test_logs rbh(clean)
+    end
+
+    @testset "singleton (edge-less) components are skipped" begin
+        # g4/g5/g6 never appear in the pair table, so they never enter `gf`;
+        # only the connected g1-g2 pair contributes a row.
+        gf = GF(genome, DataFrame(q = ["g1"], s = ["g2"], dS = [0.1]))
+        result = rbh(gf)
+        @test nrow(result) == 1
+        @test Set([result.query[1], result.subject[1]]) == Set(["g1", "g2"])
+    end
+
+    @testset "no rankable relation errors" begin
+        gf = GF(genome, DataFrame(q = ["g1"], s = ["g2"]))
+        @test_throws ArgumentError rbh(gf)
+    end
+
+    @testset "output round-trips through the GeneFamily constructor" begin
+        df = DataFrame(q = ["g1", "g1"], s = ["g2", "g3"], dS = [0.5, 0.1], dN = [0.2, 0.2])
+        gf = GF(genome, df)
+        result = rbh(gf)
+        gf2 = GF(genome, result)
+        @test size(gf2.topology, 1) == 2
     end
 end

@@ -2,6 +2,7 @@ module Paralogs
 
 using DataFrames
 using Graphs
+using SimpleWeightedGraphs
 using SparseArrays
 using StructArrays
 
@@ -46,21 +47,12 @@ struct GeneFamily
     the rest optional and matched to the relation matrices *by name*
     (case-insensitive):
 
-    1. Query ID (`String`)
-    2. Subject ID (`String`)
-    3. `dN`               → pairwise dN
-    4. `dS`               → pairwise dS
-    5. `id_subject_query` → % identity subject → query
-    6. `id_query_subject` → % identity query → subject
-
-    With only the two ID columns just `topology` is populated; every recognised
-    value column adds its matrix and the rest stay `nothing`.
-
-    Each gene is placed by looking its ID up in `genome`, inheriting the
-    feature's 1-based bounds and full 64-bit metadata code (strand, SO term,
-    metadata index). Genes are grouped by scaffold and handed contiguous linear
-    indices — `scaffold_ranges[name]` is that block. IDs absent from `genome`,
-    and any pair row referencing one, are skipped.
+    1. Query ID (`String`; mandatory)
+    2. Subject ID (`String`; mandatory)
+    3. `dN`               → pairwise dN (Float; optional)
+    4. `dS`               → pairwise dS (Float; optional)
+    5. `id_subject_query` → % identity subject → query (Float; optional)
+    6. `id_query_subject` → % identity query → subject (Float; optional)
 
     Every matrix is `n_genes x n_genes` over those indices, oriented so the axis
     you look up by is the (column-major) fast axis:
@@ -76,13 +68,11 @@ struct GeneFamily
 
     Repeated or reciprocal entries for a cell collapse to one value.
 
-    This is the only public constructor, so `intervals`, `scaffold_ranges` and
-    `id_to_index` are always concordant by construction. Query/subject ID
-    columns must hold `AbstractString`s and every matched value column must
-    hold `Real`s; anything else raises an informative `ArgumentError`.
 
     See `getindex` for per-gene (`gf[i]`/`gf["id"]`) and sub-family
-    (`gf[indices]`/`gf[ids]`) indexing.
+    (`gf[indices]`/`gf[ids]`) indexing, and `topology_graph`/`dN_graph`/
+    `dS_graph`/`id_subject_query_graph`/`id_query_subject_graph` for `Graphs`/
+    `SimpleWeightedGraphs` views of the relation matrices.
     """
     function GeneFamily(genome::Reference.Genome, pairs::DataFrame)
         ncol(pairs) >= 2 ||
@@ -98,6 +88,36 @@ struct GeneFamily
                 "Subject ID column (column 2, \"$(names(pairs)[2])\") must contain strings, got element type $(eltype(pairs[:, 2]))",
             ),
         )
+
+        # Match the optional value columns to their target matrices by name.
+        value_columns = Dict{Symbol,Int}()
+        for c = 3:ncol(pairs)
+            field = _match_relation(names(pairs)[c])
+            isnothing(field) || (value_columns[field] = c)
+        end
+
+        for (field, c) in value_columns
+            eltype(pairs[:, c]) <: Real || throw(
+                ArgumentError(
+                    "Column \"$(names(pairs)[c])\" (matched to `$field`) must contain numeric values, got element type $(eltype(pairs[:, c]))",
+                ),
+            )
+        end
+
+        # Drop rows carrying a NaN in any matched value column up front, so
+        # nothing downstream (dN/dS in particular, via `issymmetric` on their
+        # *_graph views) ever sees one.
+        if !isempty(value_columns)
+            keep = trues(nrow(pairs))
+            for c in values(value_columns)
+                keep .&= .!isnan.(pairs[:, c])
+            end
+            n_dropped = count(!, keep)
+            if n_dropped > 0
+                @warn "GeneFamily: dropped $n_dropped row$(n_dropped == 1 ? "" : "s") with a NaN relation value"
+                pairs = pairs[keep, :]
+            end
+        end
 
         query_ids = string.(pairs[:, 1])
         subject_ids = string.(pairs[:, 2])
@@ -141,21 +161,6 @@ struct GeneFamily
             cursor += n
         end
         n_genes = cursor - 1
-
-        # Match the optional value columns to their target matrices by name.
-        value_columns = Dict{Symbol,Int}()
-        for c = 3:ncol(pairs)
-            field = _match_relation(names(pairs)[c])
-            isnothing(field) || (value_columns[field] = c)
-        end
-
-        for (field, c) in value_columns
-            eltype(pairs[:, c]) <: Real || throw(
-                ArgumentError(
-                    "Column \"$(names(pairs)[c])\" (matched to `$field`) must contain numeric values, got element type $(eltype(pairs[:, c]))",
-                ),
-            )
-        end
 
         has(field) = haskey(value_columns, field)
 
@@ -362,6 +367,155 @@ function Base.getindex(gf::GeneFamily, ids::AbstractVector{<:AbstractString})
     return gf[indices]
 end
 
+"""
+    topology_graph(gf::GeneFamily) -> SimpleGraph
+
+Unweighted `Graphs.SimpleGraph` view of `gf.topology`: vertex `v` is gene `v`
+(see `gf.id_to_index` for the name), and edge `u-v` marks a topology pair.
+"""
+topology_graph(gf::GeneFamily) = SimpleGraph(gf.topology)
+
+_weighted_undirected_graph(::Nothing) = nothing
+# dN/dS store only their upper triangle; SimpleWeightedGraph requires a fully
+# symmetric adjacency matrix, so mirror it across the diagonal first.
+_weighted_undirected_graph(m::SparseMatrixCSC) = SimpleWeightedGraph(m + permutedims(m))
+
+"""
+    dN_graph(gf::GeneFamily) -> Union{Nothing, SimpleWeightedGraph}
+
+Undirected `SimpleWeightedGraphs.SimpleWeightedGraph` view of `gf.dN`, or
+`nothing` if `dN` wasn't supplied.
+"""
+dN_graph(gf::GeneFamily) = _weighted_undirected_graph(gf.dN)
+
+"""
+    dS_graph(gf::GeneFamily) -> Union{Nothing, SimpleWeightedGraph}
+
+Same as [`dN_graph`](@ref), for `gf.dS`.
+"""
+dS_graph(gf::GeneFamily) = _weighted_undirected_graph(gf.dS)
+
+_weighted_directed_graph(::Nothing) = nothing
+_weighted_directed_graph(m::SparseMatrixCSC) = SimpleWeightedDiGraph(m)
+
+"""
+    id_subject_query_graph(gf::GeneFamily) -> Union{Nothing, SimpleWeightedDiGraph}
+
+Directed `SimpleWeightedGraphs.SimpleWeightedDiGraph` view of
+`gf.id_subject_query`, or `nothing` if it wasn't supplied. Edge `i -> j` carries
+weight `M[i, j]`, following the stored `[query, subject]` axis convention (see
+the `GeneFamily` docstring) — no symmetrisation, since the relation is directed.
+"""
+id_subject_query_graph(gf::GeneFamily) = _weighted_directed_graph(gf.id_subject_query)
+
+"""
+    id_query_subject_graph(gf::GeneFamily) -> Union{Nothing, SimpleWeightedDiGraph}
+
+Same as [`id_subject_query_graph`](@ref), for `gf.id_query_subject` (stored
+`[subject, query]`).
+"""
+id_query_subject_graph(gf::GeneFamily) = _weighted_directed_graph(gf.id_query_subject)
+
+# For edge {a, b}, resolve which end was the original query/subject using
+# whichever id_* relation is present (their storage axis records it exactly);
+# falls back to the lower index as query when neither is present.
+function _edge_query_subject(gf::GeneFamily, a::Integer, b::Integer)
+    if gf.id_subject_query !== nothing
+        return gf.id_subject_query[a, b] != 0 ? (a, b) : (b, a)
+    elseif gf.id_query_subject !== nothing
+        return gf.id_query_subject[b, a] != 0 ? (a, b) : (b, a)
+    end
+    return minmax(a, b)
+end
+
+# The %ID for edge (q, s), combining whichever of id_subject_query/
+# id_query_subject are present via `scoring`; `nothing` if neither is present.
+function edge_identity(gf::GeneFamily, q::Integer, s::Integer, scoring::String)
+    vals = Float64[]
+    gf.id_subject_query !== nothing && push!(vals, gf.id_subject_query[q, s])
+    gf.id_query_subject !== nothing && push!(vals, gf.id_query_subject[s, q])
+    isempty(vals) && return nothing
+    return scoring == "mean" ? sum(vals) / length(vals) :
+           scoring == "min" ? minimum(vals) : maximum(vals)
+end
+
+"""
+    rbh(gf::GeneFamily; scoring::String = "mean") -> DataFrame
+
+Reciprocal best hit per weakly-connected component of `gf.topology`. Within
+each component, edges are ranked ascending by `dS`, then `dN`, then %ID
+(combining `id_subject_query`/`id_query_subject` via `scoring` — `"mean"`
+(default), `"min"`, or `"max"`), skipping whichever levels `gf` lacks. The
+top-ranked edge of each multi-gene component is kept; singleton (edge-less)
+components are skipped. A tie at the top rank is broken by the lowest gene
+indices, and warned about (naming the tied component's gene indices).
+
+Returns a `DataFrame` shaped like `GeneFamily`'s constructor input — `query`,
+`subject`, plus whichever of `dN`/`dS`/`id_subject_query`/`id_query_subject`
+are present on `gf` — containing only the chosen pairs.
+"""
+function rbh(gf::GeneFamily; scoring::String = "mean")
+    scoring = lowercase(scoring)
+    scoring =
+        scoring in ("mean", "avg", "average") ? "mean" :
+        scoring in ("min", "minimum") ? "min" :
+        scoring in ("max", "maximum") ? "max" :
+        throw(ArgumentError("scoring must be \"mean\", \"min\", or \"max\""))
+
+    any(!isnothing, (gf.dN, gf.dS, gf.id_subject_query, gf.id_query_subject)) ||
+        throw(ArgumentError("gf has no dN, dS, or %ID relation to rank edges by"))
+
+    # Ascending ranking key: dS, then dN, then -%ID, omitting absent levels;
+    # (lo, hi) is a final, deterministic tie-break (lowest indices win).
+    function rank_key(a, b)
+        lo, hi = minmax(a, b)
+        parts = Float64[]
+        gf.dS !== nothing && push!(parts, gf.dS[lo, hi])
+        gf.dN !== nothing && push!(parts, gf.dN[lo, hi])
+        pid = edge_identity(gf, _edge_query_subject(gf, a, b)..., scoring)
+        isnothing(pid) || push!(parts, -pid)
+        return (Tuple(parts), (lo, hi))
+    end
+
+    index_to_id = Dict(v => k for (k, v) in gf.id_to_index)
+    g = topology_graph(gf)
+
+    query, subject = String[], String[]
+    dN_out, dS_out, sq_out, qs_out = Float64[], Float64[], Float64[], Float64[]
+    tied_components = Vector{Int}[]
+
+    for comp in connected_components(g)
+        comp_set = Set(comp)
+        comp_edges = [e for e in edges(g) if src(e) in comp_set]
+        isempty(comp_edges) && continue   # singleton gene, no partner to hit
+
+        ranked = sort([(rank_key(src(e), dst(e)), src(e), dst(e)) for e in comp_edges])
+        best_metric = ranked[1][1][1]
+        count(r -> r[1][1] == best_metric, ranked) > 1 && push!(tied_components, sort(comp))
+
+        _, a, b = ranked[1]
+        q, s = _edge_query_subject(gf, a, b)
+        push!(query, index_to_id[q])
+        push!(subject, index_to_id[s])
+        gf.dN !== nothing && push!(dN_out, gf.dN[minmax(q, s)...])
+        gf.dS !== nothing && push!(dS_out, gf.dS[minmax(q, s)...])
+        gf.id_subject_query !== nothing && push!(sq_out, gf.id_subject_query[q, s])
+        gf.id_query_subject !== nothing && push!(qs_out, gf.id_query_subject[s, q])
+    end
+
+    if !isempty(tied_components)
+        groups = join(("[$(join(c, ", "))]" for c in tied_components), ", ")
+        @warn "rbh: tied best-hit distance in $(length(tied_components)) group(s): $groups"
+    end
+
+    cols = Pair{String,Vector}["query"=>query, "subject"=>subject]
+    gf.dN !== nothing && push!(cols, "dN" => dN_out)
+    gf.dS !== nothing && push!(cols, "dS" => dS_out)
+    gf.id_subject_query !== nothing && push!(cols, "id_subject_query" => sq_out)
+    gf.id_query_subject !== nothing && push!(cols, "id_query_subject" => qs_out)
+    return DataFrame(cols...)
+end
+
 function rbh_ds(paralog_df::DataFrame)
     @assert typeof(paralog_df[1, 1]) <: AbstractString
     @assert typeof(paralog_df[1, 2]) <: AbstractString
@@ -559,6 +713,14 @@ function rbh(paralog_df::DataFrame; scoring::String = "max")
     )
 end
 
-export GeneFamily, rbh, rbh_ds
+export GeneFamily,
+    dN_graph,
+    dS_graph,
+    edge_identity,
+    id_query_subject_graph,
+    id_subject_query_graph,
+    rbh,
+    rbh_ds,
+    topology_graph
 
 end
