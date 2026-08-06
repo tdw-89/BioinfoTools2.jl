@@ -1,5 +1,8 @@
 module Exploration
 
+# Scoped, not a blanket `using DataFrames` — that would also pull in
+# `DataFrames.leftjoin`, colliding with `Data.leftjoin` used by `coverage`.
+using DataFrames: DataFrame, nrow
 using Distributions
 using Interpolations
 using KernelDensity
@@ -140,6 +143,84 @@ function quantiles(data::TabularData; quantiles::Int = 4, merge = mean)
         push!(result, (record, value, _quantile_bin(edges, value, quantiles)))
     end
 
+    return result
+end
+
+"""
+    quantiles(data::TabularData, ranking::Vector{String}; quantiles::Int = 4)
+
+Rank samples in `data` by the named `ranking` variables — the first entry
+primary, each subsequent entry breaking ties in the one before it, and any
+remaining tie broken by original sample order — then cut that ranking into
+`quantiles` equal-sized (up to an off-by-one) bins.
+
+Returns a flat vector of `(FeatureRecord, quantile_index)` tuples, in ranked
+order. The `FeatureRecord` is looked up in `genome` by the sample's 32-bit
+metadata index; unmatched samples and unresolvable features are skipped, but
+(like every matched sample) still occupy a rank position and so still affect
+bin sizing.
+"""
+function quantiles(data::TabularData, ranking::Vector{String}; quantiles::Int = 4)
+    quantiles >= 1 ||
+        throw(ArgumentError("`quantiles` must be a positive integer (got $quantiles)"))
+    isempty(ranking) && throw(ArgumentError("`ranking` must name at least one variable"))
+
+    col_indices = map(ranking) do name
+        idx = findfirst(==(name), data.variables)
+        idx === nothing && throw(ArgumentError("Unknown ranking variable: \"$name\""))
+        idx
+    end
+
+    # Matched samples only; the row index itself is the final tie-break.
+    rows = findall(!isnothing, data.samples)
+    n = length(rows)
+    n == 0 && return Tuple{FeatureRecord,Int}[]
+
+    keyed = sort([(Tuple(data.table[row, c] for c in col_indices)..., row) for row in rows])
+
+    result = Tuple{FeatureRecord,Int}[]
+    sizehint!(result, n)
+    for (rank_pos, key) in enumerate(keyed)
+        row = key[end]
+        meta_idx = Reference.parse_index(data.samples[row][2].value)
+        record = data.genome[meta_idx]
+        record === nothing && continue
+        push!(result, (record, cld(rank_pos * quantiles, n)))
+    end
+    return result
+end
+
+"""
+    quantiles(pairs::DataFrame, ranking::Vector{String}; quantiles::Int = 4) -> DataFrame
+
+Rank the rows of a paralog-pair table (shaped like `GeneFamily`'s constructor
+input, or `rbh`'s output) by the named `ranking` columns — the first entry
+primary, each subsequent entry breaking ties in the one before it, and any
+remaining tie broken by original row order — then cut that ranking into
+`quantiles` equal-sized (up to an off-by-one) bins.
+
+Returns `pairs` with a `"quantile"` column appended (1-based bin number); row
+order is unchanged.
+"""
+function quantiles(pairs::DataFrame, ranking::Vector{String}; quantiles::Int = 4)
+    quantiles >= 1 ||
+        throw(ArgumentError("`quantiles` must be a positive integer (got $quantiles)"))
+    isempty(ranking) && throw(ArgumentError("`ranking` must name at least one column"))
+    for name in ranking
+        name in names(pairs) || throw(ArgumentError("Unknown ranking column: \"$name\""))
+    end
+
+    n = nrow(pairs)
+    bins = Vector{Int}(undef, n)
+    if n > 0
+        order = sort([(Tuple(pairs[row, name] for name in ranking)..., row) for row = 1:n])
+        for (rank_pos, key) in enumerate(order)
+            bins[key[end]] = cld(rank_pos * quantiles, n)
+        end
+    end
+
+    result = copy(pairs)
+    result.quantile = bins
     return result
 end
 

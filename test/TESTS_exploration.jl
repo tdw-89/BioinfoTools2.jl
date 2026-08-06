@@ -53,27 +53,24 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             # For 8 evenly spaced values (1..8) the quartiles pack 2 per bin:
             #   1,2 → q1 | 3,4 → q2 | 5,6 → q3 | 7,8 → q4  (cld(i, 2)).
             byid = Dict(rec.id => (val, qi) for (rec, val, qi) in q)
-            for (i, gid) in enumerate(gene_ids)
-                @test haskey(byid, gid)
-                val, qi = byid[gid]
-                @test val == Float64(i)
-                @test qi == cld(i, 2)
-            end
+            has_all = all(gid -> haskey(byid, gid), gene_ids)
+            @test has_all
+            correct =
+                [byid[gid] == (Float64(i), cld(i, 2)) for (i, gid) in enumerate(gene_ids)]
+            @test all(correct)
 
             # Each quartile bin holds exactly two features.
-            for bin = 1:4
-                @test count(t -> t[3] == bin, q) == 2
-            end
+            bin_counts = [count(t -> t[3] == bin, q) == 2 for bin = 1:4]
+            @test all(bin_counts)
         end
 
         # ---------------------------------------------------------------------
         @testset "custom quantiles count" begin
             q2 = quantiles(tab; quantiles = 2)
             byid = Dict(rec.id => qi for (rec, _, qi) in q2)
-            for (i, gid) in enumerate(gene_ids)
-                # 1..4 → bin 1, 5..8 → bin 2.
-                @test byid[gid] == (i <= 4 ? 1 : 2)
-            end
+            # 1..4 → bin 1, 5..8 → bin 2.
+            correct = [byid[gid] == (i <= 4 ? 1 : 2) for (i, gid) in enumerate(gene_ids)]
+            @test all(correct)
         end
 
         # ---------------------------------------------------------------------
@@ -82,11 +79,9 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             # unchanged but the paired value now reflects the merge.
             qs = quantiles(tab; merge = sum)
             byid = Dict(rec.id => (val, qi) for (rec, val, qi) in qs)
-            for (i, gid) in enumerate(gene_ids)
-                val, qi = byid[gid]
-                @test val == Float64(2i)
-                @test qi == cld(i, 2)
-            end
+            correct =
+                [byid[gid] == (Float64(2i), cld(i, 2)) for (i, gid) in enumerate(gene_ids)]
+            @test all(correct)
         end
 
         # ---------------------------------------------------------------------
@@ -102,6 +97,134 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             empty_q = quantiles(tab_none)
             @test empty_q isa Vector{Tuple{FeatureRecord,Float64,Int}}
             @test isempty(empty_q)
+        end
+    end
+
+    # =========================================================================
+    @testset "quantiles(data, ranking) - rank-based" begin
+        sp = Species("C. elegans")
+        add_features!(EX_GFF_SINGLE, sp.genome)
+        scaffold = sp.genome.scaffolds["NC_003280.10"]
+
+        gene_ids = String[]
+        for iv in get_feature(scaffold, :gene)
+            gid = Reference.get_metadata_id(sp.genome, Reference.parse_index(iv.value))
+            gid !== nothing && push!(gene_ids, gid)
+            length(gene_ids) >= 8 && break
+        end
+        @test length(gene_ids) == 8
+
+        # v1 ties the first four rows; v2 (descending within the tie) then
+        # decides their relative order. Rows 5-8 are already strictly ordered.
+        df = DataFrame(
+            sample = vcat(gene_ids, ["NO_SUCH_ID"]),
+            v1 = Float64[1, 1, 1, 1, 5, 6, 7, 8, 99],
+            v2 = Float64[4, 3, 2, 1, 5, 6, 7, 8, 99],
+        )
+        tab = load_table(sp.genome, df)
+
+        @testset "ranks by first variable, breaks ties with the next" begin
+            q = quantiles(tab, ["v1", "v2"]; quantiles = 4)
+            @test q isa Vector{Tuple{FeatureRecord,Int}}
+            @test length(q) == 8   # NO_SUCH_ID is unmatched, skipped
+
+            byid = Dict{String,Int}()
+            for (rec, qi) in q
+                byid[rec.id] = qi
+            end
+
+            # Ascending (v1, v2): gene4(1,1) gene3(1,2) gene2(1,3) gene1(1,4) gene5..gene8
+            expected_order =
+                [gene_ids[4], gene_ids[3], gene_ids[2], gene_ids[1], gene_ids[5:8]...]
+            correct = [
+                byid[gid] == cld(rank_pos * 4, 8) for
+                (rank_pos, gid) in enumerate(expected_order)
+            ]
+            @test all(correct)
+        end
+
+        @testset "unrecognised ranking variable errors" begin
+            @test_throws ArgumentError quantiles(tab, ["no_such_variable"])
+        end
+
+        @testset "empty ranking errors" begin
+            @test_throws ArgumentError quantiles(tab, String[])
+        end
+
+        @testset "invalid quantiles count errors" begin
+            @test_throws ArgumentError quantiles(tab, ["v1"]; quantiles = 0)
+        end
+
+        @testset "no matched samples → empty result" begin
+            df_none = DataFrame(sample = ["NO_SUCH_ID"], v1 = [1.0])
+            tab_none = load_table(sp.genome, df_none)
+            @test isempty(quantiles(tab_none, ["v1"]))
+        end
+    end
+
+    # =========================================================================
+    @testset "quantiles(::DataFrame, ranking) - rank-based" begin
+        # dS ties the first four rows; dN then decides their relative order.
+        # Rows 5-6 are already strictly ordered by dS alone.
+        df = DataFrame(
+            query = ["g1", "g2", "g3", "g4", "g5", "g6"],
+            subject = ["h1", "h2", "h3", "h4", "h5", "h6"],
+            dS = [0.5, 0.5, 0.5, 0.5, 0.1, 0.2],
+            dN = [0.4, 0.3, 0.2, 0.1, 0.9, 0.9],
+        )
+
+        @testset "ranks by first column, breaks ties with the next" begin
+            result = quantiles(df, ["dS", "dN"]; quantiles = 3)
+            @test names(result) == vcat(names(df), ["quantile"])
+            @test nrow(result) == 6
+            @test result.query == df.query   # row order unchanged
+
+            byrow = Dict{String,Int}()
+            for row in eachrow(result)
+                byrow[row.query] = row.quantile
+            end
+            # Ascending (dS, dN): g5(0.1) g6(0.2) g4(0.5,0.1) g3(0.5,0.2) g2(0.5,0.3) g1(0.5,0.4)
+            expected_order = ["g5", "g6", "g4", "g3", "g2", "g1"]
+            correct = [
+                byrow[gid] == cld(rank_pos * 3, 6) for
+                (rank_pos, gid) in enumerate(expected_order)
+            ]
+            @test all(correct)
+        end
+
+        @testset "input DataFrame is not mutated" begin
+            original_names = copy(names(df))
+            quantiles(df, ["dS"])
+            @test names(df) == original_names
+        end
+
+        @testset "remaining ties fall back to original row order" begin
+            tied = DataFrame(
+                query = ["a", "b", "c"],
+                subject = ["x", "y", "z"],
+                dS = [0.3, 0.3, 0.3],
+            )
+            result = quantiles(tied, ["dS"]; quantiles = 3)
+            @test result.quantile == [1, 2, 3]   # original order breaks the 3-way tie
+        end
+
+        @testset "unrecognised ranking column errors" begin
+            @test_throws ArgumentError quantiles(df, ["no_such_column"])
+        end
+
+        @testset "empty ranking errors" begin
+            @test_throws ArgumentError quantiles(df, String[])
+        end
+
+        @testset "invalid quantiles count errors" begin
+            @test_throws ArgumentError quantiles(df, ["dS"]; quantiles = 0)
+        end
+
+        @testset "empty DataFrame yields an empty (but shaped) result" begin
+            empty_df = DataFrame(query = String[], subject = String[], dS = Float64[])
+            result = quantiles(empty_df, ["dS"])
+            @test nrow(result) == 0
+            @test "quantile" in names(result)
         end
     end
 

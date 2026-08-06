@@ -201,10 +201,12 @@ end
     @testset "intervals and scaffold_ranges stay concordant" begin
         gf = GF(genome, DataFrame(q = ["g1", "g3"], s = ["g5", "g4"]))
         covered = Int[]
+        lengths_match = Bool[]
         for (name, rng) in gf.scaffold_ranges
-            @test length(rng) == length(gf.intervals[name])
+            push!(lengths_match, length(rng) == length(gf.intervals[name]))
             append!(covered, collect(rng))
         end
+        @test all(lengths_match)
         # Ranges partition 1:n_genes exactly (no gaps, no overlaps).
         @test sort(covered) == 1:size(gf.topology, 1)
     end
@@ -463,9 +465,11 @@ end
         @test sub.id_query_subject[ss, sq] == gf.id_query_subject[g2, g1]
 
         # intervals/scaffold_ranges stay concordant in the sub-family too.
-        for (name, rng) in sub.scaffold_ranges
-            @test length(rng) == length(sub.intervals[name])
-        end
+        lengths_match = [
+            length(rng) == length(sub.intervals[name]) for
+            (name, rng) in sub.scaffold_ranges
+        ]
+        @test all(lengths_match)
     end
 
     @testset "gf[range] behaves like gf[vector]" begin
