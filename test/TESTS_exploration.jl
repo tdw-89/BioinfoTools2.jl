@@ -1,6 +1,7 @@
 using BioinfoTools2.Exploration
 using BioinfoTools2.Reference
 using BioinfoTools2.Data
+using BioinfoTools2.Data.Methylation
 using DataFrames
 using IntervalTrees
 using KernelDensity
@@ -493,4 +494,328 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
                   zeros(2 * flank + body_bins)
         end
     end  # mean_gene_profile
+
+    # =========================================================================
+    @testset "methylation" begin
+        sp = Species("C. elegans")
+        add_features!(EX_GFF_SINGLE, sp.genome)
+        const_scaffold = "NC_003280.10"
+        scaffold = sp.genome.scaffolds[const_scaffold]
+
+        # Wrap positions/payloads for `const_scaffold` as a MethylationData.
+        meth_data(positions, payloads) = MethylationData(
+            Dict(const_scaffold => aggregated_calls(UInt32.(positions), payloads)),
+        )
+
+        # A stored level sits within half a quantization step (1/255 as a
+        # fraction) of the truth, so a sum over `n` sites is within `n`
+        # half-steps.
+        meth_tol(n_sites) = n_sites * (1 / 255) / 2 + 1e-12
+
+        strand_fwd = BioinfoTools2.BitCodes.STRAND_FWD
+        strand_rev = BioinfoTools2.BitCodes.STRAND_REV
+
+        # A gene far enough into the scaffold that a 500 bp left flank fits.
+        gene = first(x for x in get_feature(scaffold, :gene) if Int(x.first) > 1000)
+        gene_id = Reference.get_metadata_id(sp.genome, Reference.parse_index(gene.value))
+        gene_negative = Reference.parse_strand(gene.value) == get_strand('-')
+        gene_first, gene_last = Int(gene.first), Int(gene.last)
+        gene_length = gene_last - gene_first + 1
+
+        # -------------------------------------------------------------------
+        @testset "coverage" begin
+            # Two fully methylated sites inside the gene. The score is the sum
+            # of per-base fractions over the *feature length*, so uncovered
+            # bases pull it down: 2 / gene_length. Same [0, 1] scale as the
+            # BedData method.
+            data = meth_data(
+                [gene_first, gene_first+1],
+                UInt32[pack_payload(10, 0), pack_payload(10, 0)],
+            )
+            scores = coverage(sp.genome, data, :gene)
+            @test haskey(scores, const_scaffold)
+            @test maximum(scores[const_scaffold]) ≈ 2 / gene_length
+            @test all(score -> 0 <= score <= 1, scores[const_scaffold])
+
+            # Half-methylated sites contribute half as much, and a site with no
+            # coverage at all (depth 0) contributes nothing. 0.5 is not exactly
+            # representable in the 8-bit level field, hence the tolerance.
+            half = meth_data(
+                [gene_first, gene_first+1, gene_first+2],
+                UInt32[pack_payload(5, 5), pack_payload(5, 5), pack_payload(0, 0)],
+            )
+            half_scores = coverage(sp.genome, half, :gene)
+            @test maximum(half_scores[const_scaffold]) ≈ 1 / gene_length atol =
+                meth_tol(2) / gene_length
+
+            # Most genes hold no call at all, so most scores are exactly zero.
+            @test count(iszero, scores[const_scaffold]) > 0
+            filtered = coverage(sp.genome, data, :gene; filter_zeros = true)
+            @test all(!iszero, filtered[const_scaffold])
+            @test length(filtered[const_scaffold]) < length(scores[const_scaffold])
+
+            # A scaffold the methylation data never mentions is omitted.
+            @test isempty(coverage(sp.genome, MethylationData(), :gene))
+        end
+
+        # -------------------------------------------------------------------
+        @testset "kde" begin
+            # Spread sites over several genes so the fitted vector varies.
+            positions = Int[]
+            payloads = UInt32[]
+            for (offset, interval) in enumerate(get_feature(scaffold, :gene))
+                offset > 12 && break
+                push!(positions, Int(interval.first))
+                push!(payloads, pack_payload(offset, 12 - offset))
+            end
+            data = meth_data(positions, payloads)
+
+            fitted = Exploration.kde(sp.genome, data, :gene)
+            @test fitted[const_scaffold] isa UnivariateKDE
+
+            # Nothing left to fit once the zeros are dropped from an empty set.
+            @test Exploration.kde(sp.genome, MethylationData(), :gene) |> isempty
+        end
+
+        # -------------------------------------------------------------------
+        @testset "feature_frequency" begin
+            flank = 500
+            # One call in the upstream flank, one just inside the 5' end. Both
+            # are placed relative to the gene's own orientation.
+            upstream = gene_negative ? gene_last + flank : gene_first - flank
+            inside = gene_negative ? gene_last - 1 : gene_first + 1
+
+            data = meth_data(
+                [upstream, inside],
+                UInt32[pack_payload(10, 0), pack_payload(5, 5)],
+            )
+            frequency = feature_frequency(sp.genome, :gene, data; flank = flank)
+
+            @test frequency isa MethylationFrequency
+            @test frequency.min_depth == Exploration.DEFAULT_MIN_DEPTH
+            @test frequency.context == CTX_CPG
+            @test haskey(frequency.features, gene_id)
+
+            levels = frequency.features[gene_id]
+            @test length(levels.levels) == gene_length + 2 * flank
+            # Index 1 is the 5' end for either strand.
+            @test levels.levels[1] ≈ 1.0
+            @test levels.weights[1] == 10
+            @test levels.levels[flank+2] ≈ 0.5 atol = 1 / 255
+            @test levels.weights[flank+2] == 10
+
+            @testset "depth and context filters" begin
+                shallow = meth_data([inside], UInt32[pack_payload(2, 0)])
+                @test nnz(
+                    feature_frequency(sp.genome, :gene, shallow; flank).features[gene_id].weights,
+                ) == 0
+                # ...unless the threshold is lowered to admit it.
+                @test nnz(
+                    feature_frequency(sp.genome, :gene, shallow; flank, min_depth = 2).features[gene_id].weights,
+                ) == 1
+
+                non_cpg = meth_data([inside], UInt32[pack_payload(10, 0, CTX_CHH)])
+                @test nnz(
+                    feature_frequency(sp.genome, :gene, non_cpg; flank).features[gene_id].weights,
+                ) == 0
+                # `context = nothing` keeps every context.
+                kept =
+                    feature_frequency(sp.genome, :gene, non_cpg; flank, context = nothing)
+                @test nnz(kept.features[gene_id].weights) == 1
+                @test kept.context === nothing
+            end
+
+            @testset "calls sharing a base combine by depth" begin
+                # Same position, opposite strands: 100% over 30 reads and 0%
+                # over 10 gives a depth-weighted 0.75 at depth 40.
+                shared = meth_data(
+                    [inside, inside],
+                    UInt32[
+                        pack_payload(30, 0, CTX_CPG, strand_fwd),
+                        pack_payload(0, 10, CTX_CPG, strand_rev),
+                    ],
+                )
+                combined = feature_frequency(sp.genome, :gene, shared; flank)
+                slot = combined.features[gene_id]
+                @test slot.weights[flank+2] == 40
+                @test slot.levels[flank+2] ≈ 0.75 atol = 1 / 255
+            end
+
+            @testset "region is not clipped at the scaffold start" begin
+                # A gene closer to the start than `flank`; the region keeps its
+                # full width so index `flank + 1` is still the first base.
+                edge =
+                    first(x for x in get_feature(scaffold, :gene) if Int(x.first) < flank)
+                edge_id =
+                    Reference.get_metadata_id(sp.genome, Reference.parse_index(edge.value))
+                edge_length = Int(edge.last) - Int(edge.first) + 1
+                clipped = feature_frequency(sp.genome, :gene, data; flank)
+                @test length(clipped.features[edge_id].levels) == edge_length + 2 * flank
+            end
+
+            @testset "scaffold absent from the data contributes nothing" begin
+                @test isempty(
+                    feature_frequency(sp.genome, :gene, MethylationData()).features,
+                )
+            end
+        end
+
+        # -------------------------------------------------------------------
+        @testset "gene_profile" begin
+            # flank = 2, body = 6 bases over 3 bins → 2 bases per bin.
+            #   region:  1 2 | 3 4 5 6 7 8 | 9 10
+            #   profile: 1 2 |   3   4   5 | 6  7
+            flank, body_bins = 2, 3
+            levels = FeatureLevels(
+                sparsevec([1, 3, 4, 10], Float32[1.0, 0.25, 0.75, 0.5], 10),
+                sparsevec([1, 3, 4, 10], UInt32[10, 5, 15, 8], 10),
+            )
+            profile = gene_profile(levels; flank, body_bins)
+
+            @test length(profile.levels) == 2 * flank + body_bins
+            @test profile.levels[1] ≈ 1.0
+            # Bases 3 and 4 share the first body bin, combined by depth:
+            # (0.25*5 + 0.75*15) / 20 = 0.625.
+            @test profile.levels[3] ≈ 0.625
+            @test profile.weights[3] == 20
+            # Base 10 is the second downstream flank base → last slot.
+            @test profile.levels[7] ≈ 0.5
+            @test profile.weights[7] == 8
+
+            # Unmeasured slots carry zero weight, which is what marks them.
+            @test profile.weights[2] == 0
+            @test all(iszero, profile.weights[[2, 4, 5, 6]])
+
+            @testset "weight transform reshapes the within-bin pooling" begin
+                # Bases 3 and 4 again, now pooled under sqrt weighting:
+                # (0.25*√5 + 0.75*√15) / (√5 + √15).
+                root = gene_profile(levels; flank, body_bins, weight_transform = sqrt)
+                expected = (0.25 * sqrt(5) + 0.75 * sqrt(15)) / (sqrt(5) + sqrt(15))
+                @test root.levels[3] ≈ expected
+                @test root.weights[3] ≈ sqrt(5) + sqrt(15)
+                # A single-call slot is untouched by any transform.
+                @test root.levels[1] ≈ 1.0
+
+                # Unweighted: both bases count once, so the bin is a plain mean
+                # and the weight is the number of measured bases.
+                equal = gene_profile(levels; flank, body_bins, weight_by_depth = false)
+                @test equal.levels[3] ≈ 0.5
+                @test equal.weights[3] == 2
+                @test equal.weights[1] == 1
+            end
+
+            @testset "invalid weights are rejected" begin
+                # log(1) == 0 is allowed (it just drops the base), but a
+                # negative or non-finite weight would corrupt the mean.
+                @test_throws ArgumentError gene_profile(
+                    levels;
+                    flank,
+                    body_bins,
+                    weight_transform = depth -> -depth,
+                )
+                @test_throws ArgumentError gene_profile(
+                    levels;
+                    flank,
+                    body_bins,
+                    weight_transform = depth -> NaN,
+                )
+                @test Exploration.weight_of(4, sqrt) == 2.0
+                @test Exploration.weight_of(1, log) == 0.0
+            end
+
+            @testset "too-short regions return nothing" begin
+                short = FeatureLevels(spzeros(Float32, 5), spzeros(UInt32, 5))
+                @test gene_profile(short; flank, body_bins) === nothing
+                exact = FeatureLevels(spzeros(Float32, 6), spzeros(UInt32, 6))
+                @test gene_profile(exact; flank, body_bins) !== nothing
+            end
+        end
+
+        # -------------------------------------------------------------------
+        @testset "mean_gene_profile" begin
+            flank, body_bins = 2, 3
+
+            # Two genes measured at opposite ends and nowhere else.
+            only_start = FeatureLevels(
+                sparsevec([1], Float32[1.0], 10),
+                sparsevec([1], UInt32[10], 10),
+            )
+            only_end = FeatureLevels(
+                sparsevec([10], Float32[0.5], 10),
+                sparsevec([10], UInt32[10], 10),
+            )
+            frequency = MethylationFrequency(
+                Exploration.DEFAULT_MIN_DEPTH,
+                CTX_CPG,
+                Dict("start" => only_start, "end" => only_end),
+            )
+            metagene = mean_gene_profile(frequency; flank, body_bins)
+
+            @test length(metagene) == 2 * flank + body_bins
+            # Only the gene measured there counts — averaging in a zero for the
+            # other would have given 0.5 and 0.25.
+            @test metagene[1] ≈ 1.0
+            @test metagene[7] ≈ 0.5
+            # Nothing measured anywhere else.
+            @test all(isnan, metagene[2:6])
+
+            @testset "depth weighting" begin
+                # Same base, same 0%/100% split, very different depths. A base
+                # measured at 0% still counts: its weight is nonzero even though
+                # its level is a structural zero.
+                deep = FeatureLevels(
+                    sparsevec([1], Float32[1.0], 10),
+                    sparsevec([1], UInt32[30], 10),
+                )
+                shallow = FeatureLevels(
+                    sparsevec([1], Float32[0.0], 10),
+                    sparsevec([1], UInt32[10], 10),
+                )
+                pair = MethylationFrequency(
+                    Exploration.DEFAULT_MIN_DEPTH,
+                    CTX_CPG,
+                    Dict("deep" => deep, "shallow" => shallow),
+                )
+
+                weighted = mean_gene_profile(pair; flank, body_bins)
+                @test weighted[1] ≈ (1.0 * 30 + 0.0 * 10) / 40
+
+                unweighted =
+                    mean_gene_profile(pair; flank, body_bins, weight_by_depth = false)
+                @test unweighted[1] ≈ 0.5
+
+                # A transform reshapes the cross-gene weighting the same way it
+                # reshapes the within-gene pooling: each gene contributes one
+                # base here, so its weight is `transform(depth)`.
+                compressed =
+                    mean_gene_profile(pair; flank, body_bins, weight_transform = sqrt)
+                @test compressed[1] ≈
+                      (1.0 * sqrt(30) + 0.0 * sqrt(10)) / (sqrt(30) + sqrt(10))
+                # sqrt pulls the deep gene's advantage in, so the mean sits
+                # between the linear and the equal-weight answers.
+                @test unweighted[1] < compressed[1] < weighted[1]
+
+                logged = mean_gene_profile(pair; flank, body_bins, weight_transform = log)
+                @test logged[1] ≈ (1.0 * log(30) + 0.0 * log(10)) / (log(30) + log(10))
+                @test logged[1] < compressed[1]
+            end
+
+            @testset "exclude skips genes" begin
+                without_start =
+                    mean_gene_profile(frequency; exclude = Set(["start"]), flank, body_bins)
+                @test isnan(without_start[1])
+                @test without_start[7] ≈ 0.5
+            end
+
+            @testset "no qualifying genes → all NaN" begin
+                short = FeatureLevels(spzeros(Float32, 5), spzeros(UInt32, 5))
+                empty_frequency = MethylationFrequency(
+                    Exploration.DEFAULT_MIN_DEPTH,
+                    CTX_CPG,
+                    Dict("short" => short),
+                )
+                @test all(isnan, mean_gene_profile(empty_frequency; flank, body_bins))
+            end
+        end
+    end  # methylation
 end
