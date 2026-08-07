@@ -720,6 +720,175 @@ end
     end
 
     # -------------------------------------------------------------------------
+    @testset "load_bismark_cov - fast field parsing" begin
+        bytes(s) = Vector{UInt8}(codeunits(s))
+        parse_all(s) = Methylation.parse_uint32(bytes(s), 1, ncodeunits(s))
+
+        @test parse_all("0") === UInt32(0)
+        @test parse_all("42") === UInt32(42)
+        @test parse_all("00042") === UInt32(42)
+        @test parse_all("4294967295") === typemax(UInt32)
+
+        # Out of range, rather than wrapping.
+        @test parse_all("4294967296") === nothing
+        @test parse_all("99999999999999999999999") === nothing
+
+        # Digits only — stricter than `tryparse`, which takes a sign and
+        # surrounding whitespace.
+        @test parse_all("") === nothing
+        @test parse_all("one") === nothing
+        @test parse_all("1e3") === nothing
+        @test parse_all("12x") === nothing
+        @test parse_all("+7") === nothing
+        @test parse_all(" 7") === nothing
+        @test parse_all("7 ") === nothing
+        @test parse_all("-1") === nothing
+
+        # Confined to the requested byte range.
+        buf = bytes("chr1\t100\t100")
+        @test Methylation.parse_uint32(buf, 6, 8) === UInt32(100)
+        @test Methylation.parse_uint32(buf, 5, 8) === nothing   # includes the tab
+        @test Methylation.parse_uint32(buf, 7, 6) === nothing   # empty range
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "load_bismark_cov - line chunking" begin
+        # `chunk_lines!` must hand the workers whole lines, in file order,
+        # losing nothing.
+        function collect_chunks(text, chunk_bytes)
+            channel = Channel{Methylation.CovChunk}(Inf)
+            pool = Methylation.ChunkPool(chunk_bytes, 8)
+            Methylation.chunk_lines!(channel, IOBuffer(text), pool)
+            close(channel)
+            return collect(channel)
+        end
+
+        # Only `bytes[start_index:stop_index]` belongs to a chunk; the rest of a
+        # pooled buffer is stale.
+        chunk_text(chunk) = String(copy(chunk.bytes[chunk.start_index:chunk.stop_index]))
+
+        function chunks_ok(text, chunk_bytes)
+            chunks = collect_chunks(text, chunk_bytes)
+            indices_ok = [c.index for c in chunks] == collect(1:length(chunks))
+            rejoined = join(chunk_text(c) for c in chunks)
+            # Every chunk but the last must end on a line boundary.
+            whole = all(last(chunk_text(c)) == '\n' for c in chunks[1:(end-1)])
+            return indices_ok && rejoined == text && whole
+        end
+
+        lines = join(("c\t$(i)\t$(i)\t50\t1\t1\n" for i = 1:200))
+        # Cuts landing mid-line, on a newline, and past the end of the stream.
+        @test all(chunks_ok(lines, n) for n in (1, 7, 12, 13, 64, 1000, 1 << 20))
+
+        # Final line with no trailing newline.
+        @test chunks_ok("a\t1\t1\t50\t1\t1\nb\t2\t2\t50\t1\t1", 16)
+        # A line longer than the chunk size accumulates into one chunk.
+        @test length(collect_chunks("c\t1\t1\t50\t1\t1\n", 3)) == 1
+        @test isempty(collect_chunks("", 64))
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "load_bismark_cov - chunk buffer pooling" begin
+        pool = Methylation.ChunkPool(64, 4)
+
+        # An empty pool mints a buffer; a recycled one comes back.
+        first_buffer = Methylation.take_chunk!(pool)
+        @test length(first_buffer) == 64
+        Methylation.recycle_chunk!(pool, first_buffer)
+        @test Methylation.take_chunk!(pool) === first_buffer
+
+        # Undersized buffers (straddling-line copies) are dropped, not pooled.
+        Methylation.recycle_chunk!(pool, UInt8[1, 2, 3])
+        @test !isready(pool.free)
+
+        # A recycled buffer still holds the previous chunk's bytes, so parsing
+        # must stop dead at `stop_index` rather than reading into the tail.
+        stale = Vector{UInt8}(codeunits("a\t1\t1\t50\t1\t1\nb\t9\t9\t50\t7\t7\n"))
+        live = Methylation.CovChunk(1, stale, 1, 14)   # first line only
+        parsed = Methylation.parse_cov_chunk(live)
+        @test collect(keys(parsed)) == ["a"]
+        @test parsed["a"].positions == UInt32[1]
+
+        # The reader recycles buffers, so a load must survive many reuses with
+        # its output unchanged.
+        text = join(("c\t$(i)\t$(i)\t50\t$(i % 5)\t1\n" for i = 1:5_000))
+        reference = load_bismark_cov(IOBuffer(text))
+        @test length(reference["c"]) == 5_000
+        @test load_bismark_cov(IOBuffer(text))["c"] == reference["c"]
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "load_bismark_cov - multi-chunk input" begin
+        # The only test exceeding `COV_CHUNK_BYTES`, i.e. the only one parsing
+        # several chunks concurrently and stitching them back together. Two
+        # scaffolds alternate line by line (defeating the scaffold-name cache)
+        # and every site is written twice (so duplicates straddle chunk
+        # boundaries).
+        n = 60_000
+        io = IOBuffer()
+        for i = 1:n, chrom in ("chrA", "chrB")
+            print(io, chrom, '\t', i, '\t', i, "\t33\t1\t2\n")
+            print(io, chrom, '\t', i, '\t', i, "\t75\t3\t4\n")
+        end
+        text = String(take!(io))
+        @test sizeof(text) > Methylation.COV_CHUNK_BYTES
+
+        data = load_bismark_cov(IOBuffer(text))
+        @test sort(collect(keys(data))) == ["chrA", "chrB"]
+        @test n_sites(data) == 2n
+
+        pos_ok = Bool[]
+        meth_ok = Bool[]
+        unmeth_ok = Bool[]
+        for chrom in ("chrA", "chrB")
+            calls = data[chrom]
+            push!(pos_ok, length(calls) == n)
+            push!(pos_ok, [Int(c.pos) for c in calls] == collect(1:n))
+            # Each site's two lines summed: (1, 2) + (3, 4).
+            push!(meth_ok, all(c -> get_meth(c) == 4, calls))
+            push!(unmeth_ok, all(c -> get_unmeth(c) == 6, calls))
+        end
+        @test all(pos_ok)
+        @test all(meth_ok)
+        @test all(unmeth_ok)
+
+        # Chunks reassemble in file order, so the load is scheduling-independent.
+        repeat_load = load_bismark_cov(IOBuffer(text))
+        @test all(repeat_load[c] == data[c] for c in ("chrA", "chrB"))
+
+        # Same input chunked out of a decompressor stream rather than a file.
+        gz_path = joinpath(mktempdir(), "big.cov.gz")
+        open(GzipCompressorStream, gz_path, "w") do stream
+            write(stream, text)
+        end
+        gzipped = load_bismark_cov(gz_path)
+        @test all(gzipped[c] == data[c] for c in ("chrA", "chrB"))
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "load_bismark_cov - many interleaved scaffolds" begin
+        # More scaffolds in one chunk than `COV_NAME_SCAN_LIMIT`, interleaved so
+        # neither the name cache nor the scan can answer a lookup and every
+        # record falls back to the `Dict`.
+        nscaffolds = Methylation.COV_NAME_SCAN_LIMIT + 40
+        nsites = 30
+        io = IOBuffer()
+        for i = 1:nsites, s = 1:nscaffolds
+            print(io, "scaffold_", s, '\t', i, '\t', i, "\t50\t", s, '\t', 1, "\n")
+        end
+        data = load_bismark_cov(IOBuffer(String(take!(io))))
+
+        @test length(data) == nscaffolds
+        counts_ok = Bool[]
+        for s = 1:nscaffolds
+            calls = data["scaffold_$(s)"]
+            push!(counts_ok, [Int(c.pos) for c in calls] == collect(1:nsites))
+            push!(counts_ok, all(c -> get_meth(c) == s && get_unmeth(c) == 1, calls))
+        end
+        @test all(counts_ok)
+    end
+
+    # -------------------------------------------------------------------------
     @testset "load_bismark_cov - gzipped input" begin
         plain = load_bismark_cov(MICRO_COV)
 
@@ -775,6 +944,61 @@ end
         @test count(c -> get_context(c) == CTX_CPG, by_name["15"]) == 151
 
         @test n_sites(load_bismark_cov(String[])) == 0
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "load_bismark_cov - concurrent files" begin
+        # Files load concurrently under a semaphore, but merge in `paths` order,
+        # so the result must not depend on the bound — including a bound of one
+        # (fully sequential) and one well above the file count.
+        dir = mktempdir()
+        paths = String[]
+        for file = 1:6
+            path = joinpath(dir, "sample_$(file).cov")
+            open(path, "w") do io
+                for site = 1:400
+                    println(
+                        io,
+                        "chr",
+                        1 + site % 3,
+                        '\t',
+                        site,
+                        '\t',
+                        site,
+                        "\t50\t",
+                        file,
+                        "\t1",
+                    )
+                end
+            end
+            push!(paths, path)
+        end
+
+        sequential = load_bismark_cov(paths; max_concurrent_files = 1)
+        scaffolds = sort(collect(keys(sequential)))
+        @test scaffolds == ["chr1", "chr2", "chr3"]
+        # Each site is written once per file, so counts sum over 1:6.
+        @test all(c -> get_meth(c) == sum(1:6) && get_unmeth(c) == 6, sequential["chr1"])
+
+        bound_ok = Bool[]
+        for bound in (2, 4, 8, 100)
+            concurrent = load_bismark_cov(paths; max_concurrent_files = bound)
+            push!(bound_ok, sort(collect(keys(concurrent))) == scaffolds)
+            push!(bound_ok, all(concurrent[s] == sequential[s] for s in scaffolds))
+        end
+        @test all(bound_ok)
+
+        # Gzipped input takes the same path, and is the case per-file
+        # concurrency exists for — decompression is serial within a stream.
+        gz_paths = map(paths) do path
+            gz_path = path * ".gz"
+            open(GzipCompressorStream, gz_path, "w") do io
+                write(io, read(path))
+            end
+            gz_path
+        end
+        gzipped = load_bismark_cov(gz_paths)
+        @test all(gzipped[s] == sequential[s] for s in scaffolds)
     end
 
     # -------------------------------------------------------------------------

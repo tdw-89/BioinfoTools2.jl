@@ -141,31 +141,46 @@ points apart, so a decoded level is within half of that of the true one.
 """
 @inline decode_percent(code::Integer) = (code % Int) * 100 / MAX_PERCENT_CODE
 
-# Encode a pair of non-negative counts as a percentage code, staying in integer
-# arithmetic: `round(MAX_PERCENT_CODE * m / (m + u))`, half up, matching
-# `encode_percent`.
-@inline function percent_code(m::Int64, u::Int64)
-    m == 0 && u == 0 && return UInt8(0)
-    # The exact form needs `510 * m` and `2 * (m + u)` to fit in an Int64.
-    # Counts that large cannot come from a real library, so rather than risk an
-    # overflow, fall back to floating point for them.
-    (m > typemax(Int32) || u > typemax(Int32)) &&
-        return encode_percent(100 * (Float64(m) / (Float64(m) + Float64(u))))
-    total = m + u
-    return UInt8(div(2 * Int64(MAX_PERCENT_CODE) * m + total, 2 * total))
+"""
+    percent_code(meth_count, unmeth_count)
+
+Encode a pair of non-negative counts as a percentage code in integer arithmetic:
+`round(MAX_PERCENT_CODE * meth / (meth + unmeth))`, half up, matching
+[`encode_percent`](@ref).
+"""
+@inline function percent_code(meth_count::Int64, unmeth_count::Int64)
+    meth_count == 0 && unmeth_count == 0 && return UInt8(0)
+    # The exact form needs `510 * meth` and `2 * (meth + unmeth)` to fit in an
+    # Int64; counts that large cannot come from a real library, so fall back to
+    # floating point rather than risk an overflow.
+    (meth_count > typemax(Int32) || unmeth_count > typemax(Int32)) && return encode_percent(
+        100 * (Float64(meth_count) / (Float64(meth_count) + Float64(unmeth_count))),
+    )
+    total = meth_count + unmeth_count
+    return UInt8(div(2 * Int64(MAX_PERCENT_CODE) * meth_count + total, 2 * total))
 end
 
-# Inverse of `percent_code` given a depth: `round(depth * code / 255)`, half up.
-# Exact for any depth <= 255; see the `AggregatedCall` docstring.
+"""
+    count_from_percent(code, depth)
+
+Inverse of [`percent_code`](@ref) given a depth: `round(depth * code / 255)`,
+half up. Exact for any depth ≤ 255 — see [`AggregatedCall`](@ref).
+"""
 @inline function count_from_percent(code::UInt8, depth::UInt32)
     scale = Int64(MAX_PERCENT_CODE)
     return UInt32(div(2 * Int64(depth) * Int64(code) + scale, 2 * scale))
 end
 
-# `m + u` without ever overflowing: the depth field tops out at MAX_COUNT, so if
-# either count alone already reaches it the sum saturates regardless.
-@inline saturating_sum(m::Int64, u::Int64) =
-    (m >= Int64(MAX_COUNT) || u >= Int64(MAX_COUNT)) ? Int64(MAX_COUNT) : m + u
+"""
+    saturating_sum(meth_count, unmeth_count)
+
+Total depth without overflowing. The depth field tops out at
+[`MAX_COUNT`](@ref), so a sum where either count alone reaches it saturates
+regardless.
+"""
+@inline saturating_sum(meth_count::Int64, unmeth_count::Int64) =
+    (meth_count >= Int64(MAX_COUNT) || unmeth_count >= Int64(MAX_COUNT)) ?
+    Int64(MAX_COUNT) : meth_count + unmeth_count
 
 """
     pack_payload(meth, unmeth, context, strand)
@@ -185,9 +200,14 @@ function pack_payload(
     context::Integer = CTX_CPG,
     strand::Integer = STRAND_NA,
 )
-    m = max(Int64(meth), Int64(0))
-    u = max(Int64(unmeth), Int64(0))
-    return pack_fields(percent_code(m, u), saturating_sum(m, u), context, strand)
+    meth_count = max(Int64(meth), Int64(0))
+    unmeth_count = max(Int64(unmeth), Int64(0))
+    return pack_fields(
+        percent_code(meth_count, unmeth_count),
+        saturating_sum(meth_count, unmeth_count),
+        context,
+        strand,
+    )
 end
 
 """
@@ -208,8 +228,13 @@ function pack_percent_payload(
     return pack_fields(encode_percent(percent), depth, context, strand)
 end
 
-# Shared tail of both packers: lay an already-encoded percentage code, a depth
-# and the metadata into the 32-bit payload.
+"""
+    pack_fields(code, depth, context, strand)
+
+Lay an already-encoded percentage code, a depth and the metadata into the 32-bit
+payload; the shared tail of [`pack_payload`](@ref) and
+[`pack_percent_payload`](@ref).
+"""
 @inline function pack_fields(code::UInt8, depth::Integer, context::Integer, strand::Integer)
     payload = UInt32(0)
     payload = set_field(
@@ -325,16 +350,16 @@ end
 #= StructArray construction and search =#
 
 """
-    alloc_calls(n = 0)
+    alloc_calls(n_sites = 0)
 
-Allocate an uninitialized `StructArray{AggregatedCall}` sized for `n` sites. The
+Allocate an uninitialized `StructArray{AggregatedCall}` sized for `n_sites`. The
 two 4-byte columns are allocated separately (struct of arrays), so `calls.pos`
 is a contiguous `Vector{UInt32}` that `searchsorted` can scan without touching
 the payloads.
 """
-alloc_calls(n::Integer = 0) = StructArray{AggregatedCall}((
-    pos = Vector{UInt32}(undef, n),
-    payload = Vector{UInt32}(undef, n),
+alloc_calls(n_sites::Integer = 0) = StructArray{AggregatedCall}((
+    pos = Vector{UInt32}(undef, n_sites),
+    payload = Vector{UInt32}(undef, n_sites),
 ))
 
 """
@@ -407,17 +432,54 @@ n_sites(data::MethylationData) = sum(length, values(data.scaffolds); init = 0)
 
 #= Bismark parsing =#
 
-# Bismark methylation-call letters: uppercase = methylated, lowercase = not.
-# Returns (context, is_methylated), or `nothing` for anything unrecognised.
-@inline function decode_call(c::Char)
-    c == 'Z' && return (CTX_CPG, true)
-    c == 'z' && return (CTX_CPG, false)
-    c == 'X' && return (CTX_CHG, true)
-    c == 'x' && return (CTX_CHG, false)
-    c == 'H' && return (CTX_CHH, true)
-    c == 'h' && return (CTX_CHH, false)
-    c == 'U' && return (CTX_UNKNOWN, true)
-    c == 'u' && return (CTX_UNKNOWN, false)
+# Byte values the line/field scanners look for.
+const NEWLINE = UInt8('\n')
+const CARRIAGE_RETURN = UInt8('\r')
+const TAB = UInt8('\t')
+const ZERO_DIGIT = UInt8('0')
+
+"""
+    parse_uint32(buffer, first_index, last_index)
+
+Parse a non-negative *decimal* integer out of `buffer[first_index:last_index]`.
+Returns `nothing` for an empty range, a non-digit byte, or a value exceeding
+`typemax(UInt32)`.
+
+Stricter than `tryparse(UInt32, ...)`, which also accepts a sign and surrounding
+whitespace; neither occurs in Bismark output, so lines carrying them are dropped
+as malformed.
+"""
+@inline function parse_uint32(
+    buffer::AbstractVector{UInt8},
+    first_index::Int,
+    last_index::Int,
+)
+    first_index > last_index && return nothing
+    value = UInt64(0)
+    @inbounds for index = first_index:last_index
+        digit = buffer[index] - ZERO_DIGIT
+        digit > 0x09 && return nothing
+        value = value * 10 + digit
+        value > UInt64(typemax(UInt32)) && return nothing
+    end
+    return value % UInt32
+end
+
+"""
+    decode_call(letter)
+
+Split a Bismark methylation-call letter into `(context, is_methylated)`;
+uppercase is methylated. Returns `nothing` for an unrecognised letter.
+"""
+@inline function decode_call(letter::Char)
+    letter == 'Z' && return (CTX_CPG, true)
+    letter == 'z' && return (CTX_CPG, false)
+    letter == 'X' && return (CTX_CHG, true)
+    letter == 'x' && return (CTX_CHG, false)
+    letter == 'H' && return (CTX_CHH, true)
+    letter == 'h' && return (CTX_CHH, false)
+    letter == 'U' && return (CTX_UNKNOWN, true)
+    letter == 'u' && return (CTX_UNKNOWN, false)
     return nothing
 end
 
@@ -442,80 +504,108 @@ function infer_strand(path::AbstractString)
     return STRAND_NA
 end
 
-# Parse one Bismark record line into (chrom, pos, context, is_methylated).
-#
-# Expected layout (tab separated):
-#   <read id> <methylation state> <chromosome> <position> <call letter>
-#
-# Returns `nothing` for the version header, blank lines, and any line that
-# doesn't have the five expected fields, so those are skipped rather than
-# aborting a load. Field boundaries are located by index so the chromosome and
-# position are read as `SubString`s, without allocating per record.
+"""
+    parse_bismark_line(line)
+
+Parse one Bismark methylation-extractor record into
+`(scaffold, position, context, is_methylated)`, with the scaffold as a
+`SubString` so nothing is allocated per record.
+
+Expected layout (tab separated):
+
+```
+<read id>	<methylation state>	<chromosome>	<position>	<call letter>
+```
+
+Returns `nothing` for the version header, blank lines, and any line without the
+five expected fields; those are skipped rather than aborting a load.
+"""
 @inline function parse_bismark_line(line::AbstractString)
     isempty(line) && return nothing
 
-    t1 = findfirst('\t', line)
-    t1 === nothing && return nothing
-    t2 = findnext('\t', line, t1 + 1)
-    t2 === nothing && return nothing
-    t3 = findnext('\t', line, t2 + 1)
-    t3 === nothing && return nothing
-    t4 = findnext('\t', line, t3 + 1)
-    t4 === nothing && return nothing
+    tab_after_read_id = findfirst('\t', line)
+    tab_after_read_id === nothing && return nothing
+    tab_after_state = findnext('\t', line, tab_after_read_id + 1)
+    tab_after_state === nothing && return nothing
+    tab_after_scaffold = findnext('\t', line, tab_after_state + 1)
+    tab_after_scaffold === nothing && return nothing
+    tab_after_position = findnext('\t', line, tab_after_scaffold + 1)
+    tab_after_position === nothing && return nothing
 
-    t3 > t2 + 1 || return nothing
-    t4 > t3 + 1 || return nothing
-    lastindex(line) >= t4 + 1 || return nothing
+    tab_after_scaffold > tab_after_state + 1 || return nothing
+    tab_after_position > tab_after_scaffold + 1 || return nothing
+    lastindex(line) >= tab_after_position + 1 || return nothing
 
-    chrom = SubString(line, t2 + 1, t3 - 1)
-    pos = tryparse(UInt32, SubString(line, t3 + 1, t4 - 1))
-    pos === nothing && return nothing
+    scaffold = SubString(line, tab_after_state + 1, tab_after_scaffold - 1)
+    position = parse_uint32(codeunits(line), tab_after_scaffold + 1, tab_after_position - 1)
+    position === nothing && return nothing
 
-    call = decode_call(line[t4+1])
+    call = decode_call(line[tab_after_position+1])
     call === nothing && return nothing
 
-    return (chrom, pos, call[1], call[2])
+    return (scaffold, position, call[1], call[2])
 end
 
-# Sort/group key for one raw call. Laying the fields out as
-#
-#   |--- pos (bits 63-32) ---|--- unused (31-5) ---|-cx (4-3)-|-st (2-1)-|-meth (0)-|
-#
-# means an ordinary `sort!` of the keys orders records by position first, and
-# that every record for one site lands in a contiguous run whose members share
-# `key >>> 1`. Aggregation is then a single linear scan, with no hashing and no
-# per-site allocation.
-@inline site_key(pos::UInt32, context::UInt8, strand::UInt8, meth::Bool) =
-    (UInt64(pos) << 32) | (UInt64(context) << 3) | (UInt64(strand) << 1) | UInt64(meth)
+"""
+    site_key(position, context, strand, is_methylated)
 
-@inline key_pos(key::UInt64) = UInt32(key >>> 32)
+Sort/group key for one raw methylation-extractor call:
+
+```
+|--- pos (bits 63-32) ---|--- unused (31-5) ---|-cx (4-3)-|-st (2-1)-|-meth (0)-|
+```
+
+`sort!` over these keys therefore orders records by position, and every record
+for one site forms a contiguous run sharing `key >>> 1`, which
+[`aggregate_keys!`](@ref) collapses in a single scan with no hashing.
+"""
+@inline site_key(position::UInt32, context::UInt8, strand::UInt8, is_methylated::Bool) =
+    (UInt64(position) << 32) | (UInt64(context) << 3) | (UInt64(strand) << 1) |
+    UInt64(is_methylated)
+
+"""Position held by a [`site_key`](@ref)."""
+@inline key_position(key::UInt64) = UInt32(key >>> 32)
+
+"""Context code held by a [`site_key`](@ref)."""
 @inline key_context(key::UInt64) = UInt8((key >>> 3) & 0x03)
-@inline key_strand(key::UInt64) = UInt8((key >>> 1) & 0x03)
-@inline key_meth(key::UInt64) = (key & 0x01) == 0x01
 
-# Collapse a scaffold's sorted raw keys into aggregated per-site calls.
+"""Strand code held by a [`site_key`](@ref)."""
+@inline key_strand(key::UInt64) = UInt8((key >>> 1) & 0x03)
+
+"""Whether a [`site_key`](@ref) records a methylated call."""
+@inline key_is_methylated(key::UInt64) = (key & 0x01) == 0x01
+
+"""
+    aggregate_keys!(keys)
+
+Sort one scaffold's [`site_key`](@ref)s in place and collapse each
+(position, context, strand) run into an [`AggregatedCall`](@ref).
+"""
 function aggregate_keys!(keys::Vector{UInt64})
     sort!(keys)
 
     positions = UInt32[]
     payloads = UInt32[]
 
-    i = 1
-    n = length(keys)
-    while i <= n
-        site = keys[i] >>> 1
-        meth = 0
-        unmeth = 0
+    index = 1
+    n_keys = length(keys)
+    while index <= n_keys
+        site = keys[index] >>> 1
+        meth_count = 0
+        unmeth_count = 0
 
         # Walk the run of raw calls belonging to this (pos, context, strand).
-        while i <= n && (keys[i] >>> 1) == site
-            key_meth(keys[i]) ? (meth += 1) : (unmeth += 1)
-            i += 1
+        while index <= n_keys && (keys[index] >>> 1) == site
+            key_is_methylated(keys[index]) ? (meth_count += 1) : (unmeth_count += 1)
+            index += 1
         end
 
         key = site << 1
-        push!(positions, key_pos(key))
-        push!(payloads, pack_payload(meth, unmeth, key_context(key), key_strand(key)))
+        push!(positions, key_position(key))
+        push!(
+            payloads,
+            pack_payload(meth_count, unmeth_count, key_context(key), key_strand(key)),
+        )
     end
 
     return aggregated_calls(positions, payloads)
@@ -530,26 +620,26 @@ method, which also infers `strand` from the file name).
 """
 function load_bismark(io::IO; strand::Integer = STRAND_NA)
     strand_bits = UInt8(strand) & 0x03
-    raw = Dict{String,Vector{UInt64}}()
+    keys_by_scaffold = Dict{String,Vector{UInt64}}()
 
     for line in eachline(io)
         record = parse_bismark_line(line)
         record === nothing && continue
-        chrom, pos, context, meth = record
+        scaffold, position, context, is_methylated = record
 
-        # `get` with a SubString key hits the same hash as the interned String,
-        # so a scaffold name is only materialised the first time it is seen.
-        bucket = get(raw, chrom, nothing)
+        # A SubString key hashes as the interned String, so a scaffold name is
+        # materialised only the first time it is seen.
+        bucket = get(keys_by_scaffold, scaffold, nothing)
         if bucket === nothing
             bucket = UInt64[]
-            raw[String(chrom)] = bucket
+            keys_by_scaffold[String(scaffold)] = bucket
         end
-        push!(bucket, site_key(pos, context, strand_bits, meth))
+        push!(bucket, site_key(position, context, strand_bits, is_methylated))
     end
 
     scaffolds = Dict{String,StructArray{AggregatedCall}}()
-    for (chrom, bucket) in raw
-        scaffolds[chrom] = aggregate_keys!(bucket)
+    for (scaffold, bucket) in keys_by_scaffold
+        scaffolds[scaffold] = aggregate_keys!(bucket)
     end
     return MethylationData(scaffolds)
 end
@@ -582,15 +672,19 @@ function load_bismark(path::AbstractString; strand::Integer = infer_strand(path)
     end
 end
 
-# Open `path` for reading and hand the stream to `f`, transparently
-# decompressing it when the name ends in ".gz".
+"""
+    open_maybe_gzip(f, path)
+
+Open `path` and hand the stream to `f`, decompressing when the name ends in
+`.gz`.
+"""
 function open_maybe_gzip(f, path::AbstractString)
-    return open(path) do fh
-        io = endswith(path, ".gz") ? GzipDecompressorStream(fh) : fh
+    return open(path) do file
+        io = endswith(path, ".gz") ? GzipDecompressorStream(file) : file
         try
             f(io)
         finally
-            io === fh || close(io)
+            io === file || close(io)
         end
     end
 end
@@ -616,142 +710,499 @@ end
 
 #= Bismark coverage (.cov) parsing =#
 
-# Parse one Bismark coverage line into (chrom, pos, meth, unmeth).
-#
-# Expected layout (tab separated):
-#   <chromosome> <start> <end> <methylation %> <count meth> <count unmeth>
-#
-# Unlike the methylation-extractor format this is already aggregated: one line
-# per cytosine, carrying counts rather than a single read's call. `start` is
-# 1-based (and equals `end` for a single cytosine), so it is used as-is; the
-# percentage is redundant with the two counts and is skipped. Trailing columns
-# beyond the sixth are tolerated and ignored.
-#
-# Returns `nothing` for blank lines and anything without the six expected
-# fields, so those are skipped rather than aborting a load. Field boundaries are
-# located by index so the chromosome is read as a `SubString`, without
-# allocating per record.
-@inline function parse_cov_line(line::AbstractString)
-    isempty(line) && return nothing
+"""
+    find_tab(buffer, from_index, line_stop)
 
-    t1 = findfirst('\t', line)
-    t1 === nothing && return nothing
-    t2 = findnext('\t', line, t1 + 1)
-    t2 === nothing && return nothing
-    t3 = findnext('\t', line, t2 + 1)
-    t3 === nothing && return nothing
-    t4 = findnext('\t', line, t3 + 1)
-    t4 === nothing && return nothing
-    t5 = findnext('\t', line, t4 + 1)
-    t5 === nothing && return nothing
-
-    t1 > firstindex(line) || return nothing
-    lastindex(line) >= t5 + 1 || return nothing
-
-    chrom = SubString(line, firstindex(line), t1 - 1)
-    pos = tryparse(UInt32, SubString(line, t1 + 1, t2 - 1))
-    pos === nothing && return nothing
-    meth = tryparse(UInt32, SubString(line, t4 + 1, t5 - 1))
-    meth === nothing && return nothing
-
-    t6 = findnext('\t', line, t5 + 1)
-    unmeth =
-        tryparse(UInt32, SubString(line, t5 + 1, t6 === nothing ? lastindex(line) : t6 - 1))
-    unmeth === nothing && return nothing
-
-    return (chrom, pos, meth, unmeth)
+Next tab at or after `from_index`, or `nothing` if there is none by `line_stop`.
+"""
+@inline function find_tab(buffer::Vector{UInt8}, from_index::Int, line_stop::Int)
+    from_index > line_stop && return nothing
+    tab = findnext(==(TAB), buffer, from_index)
+    (tab === nothing || tab > line_stop) && return nothing
+    return tab
 end
 
-# One scaffold's coverage records in file order. The counts arrive already
-# aggregated, so unlike the extractor path there is nothing to tally — the three
-# columns are just accumulated and then collapsed by `collapse_cov!`.
+"""
+    parse_cov_record(buffer, line_start, line_stop)
+
+Parse one Bismark coverage record out of `buffer[line_start:line_stop]` (a line
+with its newline already stripped) into
+`(scaffold_stop, position, meth_count, unmeth_count)`. The scaffold name is
+`buffer[line_start:scaffold_stop]`, left as a byte range so
+[`parse_cov_chunk`](@ref) can match it without allocating.
+
+Expected layout (tab separated):
+
+```
+<chromosome>	<start>	<end>	<methylation %>	<count meth>	<count unmeth>
+```
+
+`start` is 1-based and equals `end` for a single cytosine, so it is the
+position. The percentage is derivable from the counts and is skipped, as is any
+column past the sixth. Returns `nothing` for blank lines and anything without
+the six expected fields; those are skipped rather than aborting a load.
+"""
+@inline function parse_cov_record(buffer::Vector{UInt8}, line_start::Int, line_stop::Int)
+    line_start > line_stop && return nothing
+
+    tab_after_scaffold = find_tab(buffer, line_start, line_stop)
+    tab_after_scaffold === nothing && return nothing
+    tab_after_scaffold > line_start || return nothing        # empty scaffold name
+    tab_after_start = find_tab(buffer, tab_after_scaffold + 1, line_stop)
+    tab_after_start === nothing && return nothing
+    tab_after_stop = find_tab(buffer, tab_after_start + 1, line_stop)
+    tab_after_stop === nothing && return nothing
+    tab_after_percent = find_tab(buffer, tab_after_stop + 1, line_stop)
+    tab_after_percent === nothing && return nothing
+    tab_after_meth = find_tab(buffer, tab_after_percent + 1, line_stop)
+    tab_after_meth === nothing && return nothing
+    line_stop >= tab_after_meth + 1 || return nothing        # empty unmeth count
+
+    position = parse_uint32(buffer, tab_after_scaffold + 1, tab_after_start - 1)
+    position === nothing && return nothing
+    meth_count = parse_uint32(buffer, tab_after_percent + 1, tab_after_meth - 1)
+    meth_count === nothing && return nothing
+
+    tab_after_unmeth = find_tab(buffer, tab_after_meth + 1, line_stop)
+    unmeth_count = parse_uint32(
+        buffer,
+        tab_after_meth + 1,
+        tab_after_unmeth === nothing ? line_stop : tab_after_unmeth - 1,
+    )
+    unmeth_count === nothing && return nothing
+
+    return (tab_after_scaffold - 1, position, meth_count, unmeth_count)
+end
+
+"""
+One scaffold's coverage records in file order. `.cov` counts arrive already
+aggregated, so unlike the extractor path there is nothing to tally: the three
+columns accumulate and are then collapsed by [`collapse_cov!`](@ref).
+"""
 struct CovBuffer
-    pos::Vector{UInt32}
-    meth::Vector{UInt32}
-    unmeth::Vector{UInt32}
+    positions::Vector{UInt32}
+    meth_counts::Vector{UInt32}
+    unmeth_counts::Vector{UInt32}
 end
 
 CovBuffer() = CovBuffer(UInt32[], UInt32[], UInt32[])
 
-@inline function push_cov!(buf::CovBuffer, pos::UInt32, meth::UInt32, unmeth::UInt32)
-    push!(buf.pos, pos)
-    push!(buf.meth, meth)
-    push!(buf.unmeth, unmeth)
-    return buf
+"""Append one record to a [`CovBuffer`](@ref)."""
+@inline function push_cov!(
+    buffer::CovBuffer,
+    position::UInt32,
+    meth_count::UInt32,
+    unmeth_count::UInt32,
+)
+    push!(buffer.positions, position)
+    push!(buffer.meth_counts, meth_count)
+    push!(buffer.unmeth_counts, unmeth_count)
+    return buffer
 end
 
-# Collapse one scaffold's coverage records into position-sorted per-site calls.
-#
-# A `.cov` file is normally already sorted and holds one line per cytosine, so
-# both the sort and the duplicate-summing scan are usually no-ops — but neither
-# is guaranteed (concatenated or re-ordered files repeat sites), and
-# `find_calls_in_range` needs the sort, so both are done regardless. Counts are
-# summed as `Int` and only saturate once, when the payload is packed.
-function collapse_cov!(buf::CovBuffer, context::UInt8, strand::UInt8)
-    positions, meth, unmeth = buf.pos, buf.meth, buf.unmeth
+"""
+    collapse_cov!(buffer, context, strand)
+
+Sort one scaffold's coverage records by position and sum repeated positions into
+per-site [`AggregatedCall`](@ref)s, consuming `buffer`.
+
+Both steps are usually no-ops — a normal `.cov` is sorted and holds one line per
+cytosine — but neither is guaranteed (concatenated or re-ordered files repeat
+sites) and [`find_calls_in_range`](@ref) needs the sort. Counts sum as `Int` and
+saturate only when the payload is packed.
+"""
+function collapse_cov!(buffer::CovBuffer, context::UInt8, strand::UInt8)
+    positions = buffer.positions
+    meth_counts = buffer.meth_counts
+    unmeth_counts = buffer.unmeth_counts
 
     if !issorted(positions)
         order = sortperm(positions)
         permute!(positions, order)
-        permute!(meth, order)
-        permute!(unmeth, order)
+        permute!(meth_counts, order)
+        permute!(unmeth_counts, order)
     end
 
-    n = length(positions)
-    out_pos = UInt32[]
-    out_payload = UInt32[]
-    sizehint!(out_pos, n)
-    sizehint!(out_payload, n)
+    n_records = length(positions)
+    site_positions = UInt32[]
+    site_payloads = UInt32[]
+    sizehint!(site_positions, n_records)
+    sizehint!(site_payloads, n_records)
 
-    i = 1
-    while i <= n
-        site = positions[i]
-        m = Int(meth[i])
-        u = Int(unmeth[i])
-        i += 1
-        while i <= n && positions[i] == site
-            m += Int(meth[i])
-            u += Int(unmeth[i])
-            i += 1
+    index = 1
+    while index <= n_records
+        site = positions[index]
+        meth_total = Int(meth_counts[index])
+        unmeth_total = Int(unmeth_counts[index])
+        index += 1
+        while index <= n_records && positions[index] == site
+            meth_total += Int(meth_counts[index])
+            unmeth_total += Int(unmeth_counts[index])
+            index += 1
         end
-        push!(out_pos, site)
-        push!(out_payload, pack_payload(m, u, context, strand))
+        push!(site_positions, site)
+        push!(site_payloads, pack_payload(meth_total, unmeth_total, context, strand))
     end
 
-    return aggregated_calls(out_pos, out_payload)
+    return aggregated_calls(site_positions, site_payloads)
+end
+
+#= Parallel .cov ingestion =#
+
+"""How much of the input one worker takes at a time."""
+const COV_CHUNK_BYTES = 1 << 22   # 4 MiB
+
+"""
+    ChunkPool(chunk_bytes, capacity)
+
+Free list of `chunk_bytes`-sized read buffers. Reading a whole file allocates a
+few hundred MiB of these otherwise, all of it immediately garbage.
+
+`capacity` must be at least the number of buffers that can be alive at once, so
+that [`recycle_chunk!`](@ref) never blocks.
+"""
+struct ChunkPool
+    free::Channel{Vector{UInt8}}
+    chunk_bytes::Int
+end
+
+ChunkPool(chunk_bytes::Int, capacity::Int) =
+    ChunkPool(Channel{Vector{UInt8}}(capacity), chunk_bytes)
+
+"""
+    take_chunk!(pool)
+
+A recycled buffer, or a fresh one when the pool is empty. Only the reader task
+takes from a pool, so the emptiness check cannot race a competing take.
+"""
+@inline take_chunk!(pool::ChunkPool) =
+    isready(pool.free) ? take!(pool.free) : Vector{UInt8}(undef, pool.chunk_bytes)
+
+"""
+    recycle_chunk!(pool, buffer)
+
+Return `buffer` to `pool`. Undersized buffers (the copies
+[`chunk_lines!`](@ref) makes for lines straddling a read) are dropped instead.
+"""
+@inline function recycle_chunk!(pool::ChunkPool, buffer::Vector{UInt8})
+    length(buffer) == pool.chunk_bytes && put!(pool.free, buffer)
+    return nothing
+end
+
+"""
+One unit of parsing work: the whole lines in `bytes[start_index:stop_index]`.
+`index` is the chunk's position in the file, which restores file order once the
+workers are done. Bytes outside the range are stale content from an earlier use
+of a pooled buffer and must never be read.
+"""
+struct CovChunk
+    index::Int
+    bytes::Vector{UInt8}
+    start_index::Int
+    stop_index::Int
+end
+
+"""
+    name_matches(buffer, first_index, last_index, name)
+
+Whether `buffer[first_index:last_index]` spells out `name`.
+"""
+@inline function name_matches(
+    buffer::Vector{UInt8},
+    first_index::Int,
+    last_index::Int,
+    name::String,
+)
+    (last_index - first_index + 1) == ncodeunits(name) || return false
+    @inbounds for offset = 0:(last_index-first_index)
+        buffer[first_index+offset] == codeunit(name, offset + 1) || return false
+    end
+    return true
+end
+
+"""
+    chunk_lines!(channel, io, pool)
+
+Cut `io` into [`CovChunk`](@ref)s of whole lines and `put!` them on `channel` in
+file order, drawing read buffers from `pool`. Returns the number of chunks.
+
+Each read is emitted as a byte range rather than a trimmed copy, so a chunk
+costs no allocation. A line straddling two reads is the one exception: it is
+copied into a small chunk of its own, emitted ahead of the read's body, and its
+buffer is not recycled. A read containing no newline at all accumulates into
+that copy.
+"""
+function chunk_lines!(channel::Channel{CovChunk}, io::IO, pool::ChunkPool)
+    chunk_bytes = pool.chunk_bytes
+    n_chunks = 0
+    straddling = UInt8[]
+
+    while true
+        buffer = take_chunk!(pool)
+        n_bytes = readbytes!(io, buffer, chunk_bytes)
+        if n_bytes == 0
+            recycle_chunk!(pool, buffer)
+            break
+        end
+
+        last_newline = findprev(==(NEWLINE), buffer, n_bytes)
+        if last_newline === nothing
+            append!(straddling, view(buffer, 1:n_bytes))
+            recycle_chunk!(pool, buffer)
+            continue
+        end
+
+        body_start = 1
+        if !isempty(straddling)
+            # This read completes the line left over from the previous one.
+            first_newline = findnext(==(NEWLINE), buffer, 1)::Int
+            append!(straddling, view(buffer, 1:first_newline))
+            n_chunks += 1
+            put!(channel, CovChunk(n_chunks, straddling, 1, length(straddling)))
+            straddling = UInt8[]
+            body_start = first_newline + 1
+        end
+
+        # Copy the tail out before the buffer is handed off.
+        append!(straddling, view(buffer, (last_newline+1):n_bytes))
+
+        if body_start <= last_newline
+            n_chunks += 1
+            put!(channel, CovChunk(n_chunks, buffer, body_start, last_newline))
+        else
+            recycle_chunk!(pool, buffer)
+        end
+    end
+
+    # Last line, if it had no trailing newline.
+    if !isempty(straddling)
+        n_chunks += 1
+        put!(channel, CovChunk(n_chunks, straddling, 1, length(straddling)))
+    end
+
+    return n_chunks
+end
+
+"""
+Shortest `.cov` line that can carry a record (`"c\\t1\\t1\\t0\\t0\\t0\\n"`), so a
+chunk's byte count divided by this bounds its record count.
+"""
+const MIN_COV_LINE_BYTES = 16
+
+"""
+    reserve_cov!(buffer, n_records, rank)
+
+Presize a new [`CovBuffer`](@ref) so its vectors do not re-pay the doubling ramp
+in every chunk. `n_records` is the chunk's record ceiling and `rank` is how many
+scaffolds the chunk has already opened: the first buffer gets the ceiling, each
+later one half of the previous. Exact for a `.cov` sorted by scaffold (one or
+two per chunk), and for a chunk holding many the reservations still sum to under
+twice the ceiling.
+"""
+@inline function reserve_cov!(buffer::CovBuffer, n_records::Int, rank::Int)
+    reserved = max(256, rank > 20 ? 0 : n_records >> (rank - 1))
+    sizehint!(buffer.positions, reserved)
+    sizehint!(buffer.meth_counts, reserved)
+    sizehint!(buffer.unmeth_counts, reserved)
+    return buffer
+end
+
+"""
+How many of a chunk's scaffold names a lookup scans before falling back to the
+`Dict` (see [`parse_cov_chunk`](@ref)).
+"""
+const COV_NAME_SCAN_LIMIT = 64
+
+"""
+    parse_cov_chunk(chunk)
+
+Parse the whole coverage lines in `chunk` into per-scaffold [`CovBuffer`](@ref)s,
+keyed by scaffold name and holding records in the order they appear.
+
+A `Dict` lookup needs the scaffold column as a `String`, i.e. an allocation per
+record, so two byte-matching layers sit in front of it: the previous record's
+scaffold, which a `.cov` grouped by scaffold repeats for long runs, then a scan
+of the names this chunk has already opened, which covers a file that interleaves
+scaffolds. [`COV_NAME_SCAN_LIMIT`](@ref) caps the scan so that many distinct
+scaffolds in one chunk fall back to the `Dict` rather than turning the lookup
+quadratic.
+"""
+function parse_cov_chunk(chunk::CovChunk)
+    bytes = chunk.bytes
+    stop_index = chunk.stop_index
+
+    buffers = Dict{String,CovBuffer}()
+    seen_names = String[]
+    seen_buffers = CovBuffer[]
+    n_records = (stop_index - chunk.start_index + 1) ÷ MIN_COV_LINE_BYTES
+
+    # Last scaffold seen, and its buffer. `parse_cov_record` rejects an empty
+    # scaffold column, so `""` never matches and this placeholder is never
+    # written into.
+    cached_name = ""
+    cached_buffer = CovBuffer()
+
+    line_start = chunk.start_index
+    while line_start <= stop_index
+        # A pooled buffer holds stale bytes past `stop_index`, so a newline
+        # found beyond it is not this chunk's.
+        newline = findnext(==(NEWLINE), bytes, line_start)
+        at_end = newline === nothing || newline > stop_index
+        line_stop = at_end ? stop_index : newline - 1
+        # CRLF input.
+        (line_stop >= line_start && bytes[line_stop] == CARRIAGE_RETURN) && (line_stop -= 1)
+
+        record = parse_cov_record(bytes, line_start, line_stop)
+        if record !== nothing
+            scaffold_stop, position, meth_count, unmeth_count = record
+            if !name_matches(bytes, line_start, scaffold_stop, cached_name)
+                found = 0
+                if length(seen_names) <= COV_NAME_SCAN_LIMIT
+                    for candidate in eachindex(seen_names)
+                        if name_matches(
+                            bytes,
+                            line_start,
+                            scaffold_stop,
+                            seen_names[candidate],
+                        )
+                            found = candidate
+                            break
+                        end
+                    end
+                end
+
+                if found != 0
+                    cached_name = seen_names[found]
+                    cached_buffer = seen_buffers[found]
+                else
+                    name = String(bytes[line_start:scaffold_stop])
+                    buffer = get(buffers, name, nothing)
+                    if buffer === nothing
+                        buffer = reserve_cov!(CovBuffer(), n_records, length(buffers) + 1)
+                        buffers[name] = buffer
+                        push!(seen_names, name)
+                        push!(seen_buffers, buffer)
+                    end
+                    cached_name = name
+                    cached_buffer = buffer
+                end
+            end
+            push_cov!(cached_buffer, position, meth_count, unmeth_count)
+        end
+
+        at_end && break
+        line_start = newline + 1
+    end
+
+    return buffers
+end
+
+"""
+    parse_cov_parallel(io, n_workers)
+
+Read `io` and parse it into per-scaffold [`CovBuffer`](@ref)s.
+
+One task reads (decompression, where there is any, is serial) while `n_workers`
+tasks parse chunks off a bounded channel, each into its own scaffold buffers so
+the hot loop shares nothing. Results concatenate in chunk order, which makes the
+load independent of scheduling and leaves an already-sorted `.cov` sorted for
+[`collapse_cov!`](@ref).
+
+Read buffers come from a [`ChunkPool`](@ref) sized to the most that can be alive
+at once: one in the reader's hand, `n_workers` queued, `n_workers` being parsed.
+"""
+function parse_cov_parallel(io::IO, n_workers::Int)
+    n_workers = max(1, n_workers)
+    channel = Channel{CovChunk}(n_workers)
+    pool = ChunkPool(COV_CHUNK_BYTES, 2 * n_workers + 2)
+
+    results = Tuple{Int,Dict{String,CovBuffer}}[]
+    results_lock = ReentrantLock()
+
+    workers = map(1:n_workers) do _
+        Threads.@spawn begin
+            try
+                for chunk in channel
+                    parsed = parse_cov_chunk(chunk)
+                    recycle_chunk!(pool, chunk.bytes)
+                    Base.@lock results_lock push!(results, (chunk.index, parsed))
+                end
+            catch err
+                # Unblocks a reader waiting on a full channel.
+                close(channel, err isa Exception ? err : ErrorException(string(err)))
+                rethrow()
+            end
+        end
+    end
+
+    try
+        chunk_lines!(channel, io, pool)
+    finally
+        close(channel)
+    end
+    foreach(wait, workers)
+
+    sort!(results; by = first)
+
+    # Total each scaffold up front, so the buffer the rest are folded into is
+    # grown once.
+    totals = Dict{String,Int}()
+    for (_, parsed) in results, (scaffold, buffer) in parsed
+        totals[scaffold] = get(totals, scaffold, 0) + length(buffer.positions)
+    end
+
+    merged = Dict{String,CovBuffer}()
+    for (_, parsed) in results
+        for (scaffold, buffer) in parsed
+            existing = get(merged, scaffold, nothing)
+            if existing === nothing
+                reserve_cov!(buffer, totals[scaffold], 1)
+                merged[scaffold] = buffer
+            else
+                append!(existing.positions, buffer.positions)
+                append!(existing.meth_counts, buffer.meth_counts)
+                append!(existing.unmeth_counts, buffer.unmeth_counts)
+            end
+        end
+    end
+    return merged
+end
+
+"""
+    load_cov_stream(io, context, strand, n_workers)
+
+Parse `io` on `n_workers` tasks and collapse the result into a
+[`MethylationData`](@ref). Shared by every `load_bismark_cov` method;
+`n_workers` is what lets concurrent files split the available threads.
+"""
+function load_cov_stream(io::IO, context::UInt8, strand::UInt8, n_workers::Int)
+    buffers = parse_cov_parallel(io, n_workers)
+
+    # Scaffolds collapse independently of one another.
+    scaffold_names = collect(keys(buffers))
+    collapsed = Vector{StructArray{AggregatedCall}}(undef, length(scaffold_names))
+    @sync for (index, scaffold) in enumerate(scaffold_names)
+        Threads.@spawn collapsed[index] = collapse_cov!(buffers[scaffold], context, strand)
+    end
+
+    scaffolds = Dict{String,StructArray{AggregatedCall}}()
+    for (index, scaffold) in enumerate(scaffold_names)
+        scaffolds[scaffold] = collapsed[index]
+    end
+    return MethylationData(scaffolds)
 end
 
 """
     load_bismark_cov(io; context = CTX_CPG, strand = STRAND_NA)
 
 Read Bismark coverage records from `io` and pack them into per-site calls.
+
+Parsing runs on `Threads.nthreads()` tasks over whole-line chunks of the stream,
+and the per-scaffold collapse over the scaffolds, so this needs `julia -t auto`
+to be worth anything. The result is the same at any thread count.
 """
-function load_bismark_cov(io::IO; context::Integer = CTX_CPG, strand::Integer = STRAND_NA)
-    context_bits = UInt8(context) & 0x03
-    strand_bits = UInt8(strand) & 0x03
-    raw = Dict{String,CovBuffer}()
-
-    for line in eachline(io)
-        record = parse_cov_line(line)
-        record === nothing && continue
-        chrom, pos, meth, unmeth = record
-
-        # `get` with a SubString key hits the same hash as the interned String,
-        # so a scaffold name is only materialised the first time it is seen.
-        buf = get(raw, chrom, nothing)
-        if buf === nothing
-            buf = CovBuffer()
-            raw[String(chrom)] = buf
-        end
-        push_cov!(buf, pos, meth, unmeth)
-    end
-
-    scaffolds = Dict{String,StructArray{AggregatedCall}}()
-    for (chrom, buf) in raw
-        scaffolds[chrom] = collapse_cov!(buf, context_bits, strand_bits)
-    end
-    return MethylationData(scaffolds)
-end
+load_bismark_cov(io::IO; context::Integer = CTX_CPG, strand::Integer = STRAND_NA) =
+    load_cov_stream(io, UInt8(context) & 0x03, UInt8(strand) & 0x03, Threads.nthreads())
 
 """
     load_bismark_cov(path; context = CTX_CPG, strand = infer_strand(path))
@@ -787,7 +1238,10 @@ supplied by the caller:
   counts are pooled across strands anyway). Pass a code explicitly for coverage
   generated from one strand's extractor output.
 
-Blank lines and any line without the six expected fields are skipped.
+Blank lines and any line without the six expected fields are skipped, as are
+lines whose numeric fields are not plain runs of digits (a sign or padding
+spaces count as malformed). Parsing is threaded — see
+[`load_bismark_cov(::IO)`](@ref).
 """
 function load_bismark_cov(
     path::AbstractString;
@@ -800,7 +1254,15 @@ function load_bismark_cov(
 end
 
 """
-    load_bismark_cov(paths; context = CTX_CPG, strand = infer_strand)
+Default ceiling on how many `.cov` files [`load_bismark_cov`](@ref) reads at
+once. Each concurrent file holds a full [`MethylationData`](@ref) plus its
+[`ChunkPool`](@ref), so the bound is about memory, not scheduling.
+"""
+const MAX_CONCURRENT_COV_FILES = 4
+
+"""
+    load_bismark_cov(paths; context = CTX_CPG, strand = infer_strand,
+                     max_concurrent_files = MAX_CONCURRENT_COV_FILES)
 
 Load several Bismark coverage files and merge them into a single
 [`MethylationData`](@ref), summing the counts of entries that share a position,
@@ -809,20 +1271,36 @@ context and strand.
 `context` and `strand` may each be a fixed code applied to every file, or a
 function mapping a path to a code (`strand` defaults to inferring it from each
 file's name).
+
+Up to `max_concurrent_files` files are read at once, gated by a semaphore, and
+the available threads are split between them. Reading files concurrently is what
+overlaps the parts of a load that a single file cannot parallelize — chiefly
+gzip decompression, which is serial per stream. Merging still follows `paths`
+order, so the result does not depend on which file finishes first.
 """
 function load_bismark_cov(
     paths::AbstractVector{<:AbstractString};
     context = CTX_CPG,
     strand = infer_strand,
+    max_concurrent_files::Integer = MAX_CONCURRENT_COV_FILES,
 )
     isempty(paths) && return MethylationData()
-    return merge_calls(
-        load_bismark_cov(
-            path;
-            context = context isa Function ? context(path) : context,
-            strand = strand isa Function ? strand(path) : strand,
-        ) for path in paths
-    )
+
+    n_concurrent = clamp(Int(max_concurrent_files), 1, length(paths))
+    workers_per_file = max(1, Threads.nthreads() ÷ n_concurrent)
+    gate = Base.Semaphore(n_concurrent)
+
+    tasks = map(paths) do path
+        file_context = UInt8(context isa Function ? context(path) : context) & 0x03
+        file_strand = UInt8(strand isa Function ? strand(path) : strand) & 0x03
+        Threads.@spawn Base.acquire(gate) do
+            open_maybe_gzip(path) do io
+                load_cov_stream(io, file_context, file_strand, workers_per_file)
+            end
+        end
+    end
+
+    return merge_calls(fetch(task) for task in tasks)
 end
 
 """
@@ -848,47 +1326,61 @@ function merge_calls(datasets)
     return MethylationData(scaffolds)
 end
 
-# Merge two sorted call arrays for the same scaffold, summing shared sites.
-function merge_scaffold(a::StructArray{AggregatedCall}, b::StructArray{AggregatedCall})
+"""
+    merge_scaffold(left, right)
+
+Merge two sorted call arrays for the same scaffold, summing sites that share a
+position, context and strand. Both inputs are ordered by [`sort_key`](@ref), so
+this is a merge of two ordered runs.
+"""
+function merge_scaffold(
+    left::StructArray{AggregatedCall},
+    right::StructArray{AggregatedCall},
+)
     positions = UInt32[]
     payloads = UInt32[]
-    sizehint!(positions, length(a) + length(b))
-    sizehint!(payloads, length(a) + length(b))
+    sizehint!(positions, length(left) + length(right))
+    sizehint!(payloads, length(left) + length(right))
 
-    # Both inputs are sorted by (pos, context, strand), so this is a merge of two
-    # ordered runs; entries that agree on all three are summed as they meet.
-    i, j = 1, 1
-    while i <= length(a) || j <= length(b)
-        take_a = j > length(b) || (i <= length(a) && sort_key(a[i]) <= sort_key(b[j]))
-        if take_a && i <= length(a) && j <= length(b) && sort_key(a[i]) == sort_key(b[j])
-            call_a, call_b = a[i], b[j]
-            push!(positions, call_a.pos)
+    left_index, right_index = 1, 1
+    while left_index <= length(left) || right_index <= length(right)
+        take_left =
+            right_index > length(right) || (
+                left_index <= length(left) &&
+                sort_key(left[left_index]) <= sort_key(right[right_index])
+            )
+        if take_left &&
+           left_index <= length(left) &&
+           right_index <= length(right) &&
+           sort_key(left[left_index]) == sort_key(right[right_index])
+            left_call, right_call = left[left_index], right[right_index]
+            push!(positions, left_call.pos)
             push!(
                 payloads,
                 pack_payload(
-                    Int(get_meth(call_a)) + Int(get_meth(call_b)),
-                    Int(get_unmeth(call_a)) + Int(get_unmeth(call_b)),
-                    get_context(call_a),
-                    get_strand_code(call_a),
+                    Int(get_meth(left_call)) + Int(get_meth(right_call)),
+                    Int(get_unmeth(left_call)) + Int(get_unmeth(right_call)),
+                    get_context(left_call),
+                    get_strand_code(left_call),
                 ),
             )
-            i += 1
-            j += 1
-        elseif take_a
-            push!(positions, a[i].pos)
-            push!(payloads, a[i].payload)
-            i += 1
+            left_index += 1
+            right_index += 1
+        elseif take_left
+            push!(positions, left[left_index].pos)
+            push!(payloads, left[left_index].payload)
+            left_index += 1
         else
-            push!(positions, b[j].pos)
-            push!(payloads, b[j].payload)
-            j += 1
+            push!(positions, right[right_index].pos)
+            push!(payloads, right[right_index].payload)
+            right_index += 1
         end
     end
 
     return aggregated_calls(positions, payloads)
 end
 
-# Ordering key used to keep merged arrays in (pos, context, strand) order.
+"""Ordering key keeping merged arrays in (position, context, strand) order."""
 @inline sort_key(call::AggregatedCall) =
     (UInt64(call.pos) << 32) | (UInt64(get_context(call)) << 2) |
     UInt64(get_strand_code(call))
@@ -1014,7 +1506,7 @@ function read_methylation(dir::AbstractString)
     return MethylationData(scaffolds)
 end
 
-# Reduce a scaffold name to something safe to use as a file name.
+"""Reduce a scaffold name to something safe to use as a file name."""
 sanitize_name(name::AbstractString) = replace(String(name), r"[^A-Za-z0-9._-]" => "_")
 
 #= Base.show overloads =#
