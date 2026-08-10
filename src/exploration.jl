@@ -219,8 +219,12 @@ function quantiles(data::TabularData; quantiles::Int = 4, merge = mean)
     # `quantiles + 1` edges spanning the observed range of merged values.
     edges = quantile(merged, range(0, 1; length = quantiles + 1))
 
+    # One genome walk for every index at once; a lookup per index would be
+    # O(rows * features).
+    records = data.genome[indices]
+
     for (meta_idx, value) in zip(indices, merged)
-        record = data.genome[meta_idx]
+        record = get(records, meta_idx, nothing)
         record === nothing && continue
         push!(result, (record, value, _quantile_bin(edges, value, quantiles)))
     end
@@ -260,12 +264,16 @@ function quantiles(data::TabularData, ranking::Vector{String}; quantiles::Int = 
 
     keyed = sort([(Tuple(data.table[row, c] for c in col_indices)..., row) for row in rows])
 
+    # Resolve every ranked sample's feature in one genome walk; a lookup per rank
+    # position would be O(rows * features).
+    meta_indices =
+        UInt32[Reference.parse_index(data.samples[key[end]][2].value) for key in keyed]
+    records = data.genome[meta_indices]
+
     result = Tuple{FeatureRecord,Int}[]
     sizehint!(result, n)
-    for (rank_pos, key) in enumerate(keyed)
-        row = key[end]
-        meta_idx = Reference.parse_index(data.samples[row][2].value)
-        record = data.genome[meta_idx]
+    for (rank_pos, meta_idx) in enumerate(meta_indices)
+        record = get(records, meta_idx, nothing)
         record === nothing && continue
         push!(result, (record, cld(rank_pos * quantiles, n)))
     end
@@ -631,6 +639,18 @@ function feature_frequency(
 end
 
 """
+Iterate the `(position, count)` pairs of `counts` that could contribute a nonzero
+frequency, in ascending 1-based position. A `SparseVector` yields its stored
+entries directly (a stored zero is harmless, only wasted work); any other vector
+is scanned with its zeros skipped.
+"""
+_nonzero_bases(counts::SparseVector) =
+    zip(SparseArrays.nonzeroinds(counts), SparseArrays.nonzeros(counts))
+
+_nonzero_bases(counts::AbstractVector) =
+    ((base, count) for (base, count) in enumerate(counts) if count != 0)
+
+"""
     gene_profile(counts, n_measurements; flank = 500, body_bins = 100)
 
 Reduce one feature's per-base overlap `counts` — `flank` bp upstream, the feature
@@ -639,6 +659,14 @@ body, then `flank` bp downstream — to a frequency profile of length
 interpolated onto `body_bins` evenly spaced points, and every value is divided by
 `n_measurements` to give a frequency. Returns `nothing` when `counts` is shorter
 than `2 * flank + 2` (no room for a body of at least two bases).
+
+`counts` is typically a `SparseVector` from [`FeatureFrequency`](@ref) holding a
+few thousand nonzeros in a region tens of kilobases long, and most features carry
+none at all, so only the stored entries are visited and the body is materialised
+densely only when one falls inside it — densifying the whole region per feature
+costs gigabytes across a genome. Positions with no count take
+`0.0 / n_measurements`, not a literal zero, because the dense predecessor divided
+before anything could mask an `n_measurements` of `0`.
 """
 function gene_profile(
     counts::AbstractVector,
@@ -646,13 +674,42 @@ function gene_profile(
     flank::Integer = 500,
     body_bins::Integer = 100,
 )
-    length(counts) < 2 * flank + 2 && return nothing
-    frequency = Vector{Float64}(counts) ./ n_measurements
-    body = frequency[(flank+1):(end-flank)]
-    body_binned = linear_interpolation(range(0, 1; length = length(body)), body).(
-        range(0, 1; length = body_bins),
-    )
-    return vcat(frequency[1:flank], body_binned, frequency[(end-flank+1):end])
+    region_length = length(counts)
+    region_length < 2 * flank + 2 && return nothing
+    # Interpolating onto a single point is not defined; checked up front so a
+    # feature with an empty body fails the same way as a covered one.
+    body_bins >= 2 ||
+        throw(ArgumentError("`body_bins` must be at least 2 (got $body_bins)"))
+
+    body_length = region_length - 2 * flank
+    unmeasured = 0.0 / n_measurements
+    profile = fill(unmeasured, 2 * flank + body_bins)
+    # Allocated on the first count landing in the body, and left `nothing` when
+    # none does — an all-zero body interpolates to all-zero (or all-`NaN`) whatever
+    # its length, so the fill above already holds the answer.
+    body = nothing
+
+    for (base, count) in _nonzero_bases(counts)
+        frequency = Float64(count) / n_measurements
+        if base <= flank
+            profile[base] = frequency
+        elseif base > flank + body_length
+            # Past the body: shift by however much the body shrank.
+            profile[base-body_length+body_bins] = frequency
+        else
+            body === nothing && (body = fill(unmeasured, body_length))
+            body[base-flank] = frequency
+        end
+    end
+
+    if body !== nothing
+        binned = linear_interpolation(range(0, 1; length = body_length), body).(
+            range(0, 1; length = body_bins),
+        )
+        copyto!(profile, flank + 1, binned, 1, body_bins)
+    end
+
+    return profile
 end
 
 """

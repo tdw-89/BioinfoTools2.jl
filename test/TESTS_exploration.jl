@@ -466,6 +466,66 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             @test sparse_profile[1] == 1.0     # 2 / 2
             @test sparse_profile[end] == 5.0   # 10 / 2
         end
+
+        @testset "sparse and dense inputs agree exactly" begin
+            # The sparse path visits only stored entries and materialises the body
+            # solely when a count lands in it, so it must still be bit-identical to
+            # walking the region densely — the flank/body/flank boundaries and a
+            # body both shorter and longer than `body_bins` are where it could
+            # drift.
+            cases = [
+                (sparsevec([1, 8], UInt32[4, 8], 8), 2, 2, 3),      # flanks only
+                (sparsevec([4], UInt32[9], 8), 3, 2, 3),            # body only
+                (sparsevec([2, 3, 6, 7], UInt32[1, 2, 3, 4], 8), 2, 2, 3),  # boundaries
+                (sparsevec([3], UInt32[5], 8), 1, 2, 100),          # body < body_bins
+                (sparsevec([60, 300, 900], UInt32[1, 7, 3], 1000), 4, 50, 10),
+                (SparseVector(8, [4], UInt32[0]), 2, 2, 3),         # stored zero
+            ]
+            agree = map(cases) do (counts, n, flank, body_bins)
+                gene_profile(counts, n; flank, body_bins) ==
+                gene_profile(Vector(counts), n; flank, body_bins)
+            end
+            @test all(agree)
+        end
+
+        @testset "uncovered regions profile to zero" begin
+            # An all-zero region interpolates to an all-zero body whatever its
+            # length, which is what lets the sparse path skip it entirely.
+            lengths = [1002, 6200, 31900]
+            zeroed = map(lengths) do region_length
+                profile = gene_profile(spzeros(UInt32, region_length), 4)
+                length(profile) == 2 * 500 + 100 && all(iszero, profile)
+            end
+            @test all(zeroed)
+        end
+
+        @testset "n_measurements = 0 divides to NaN, not zero" begin
+            # Every value is divided by `n_measurements`, so an unmeasured base is
+            # `0/0`; the zero-fill fast path must not turn that into a real zero.
+            profile =
+                gene_profile(sparsevec([1], UInt32[3], 8), 0; flank = 2, body_bins = 3)
+            @test profile[1] == Inf
+            @test all(isnan, profile[2:end])
+            @test all(isnan, gene_profile(spzeros(UInt32, 8), 0; flank = 2, body_bins = 3))
+        end
+
+        @testset "body_bins below 2 throws" begin
+            # Interpolating onto one point is undefined; a covered and an empty
+            # region must fail alike, but a too-short region still returns nothing.
+            @test_throws ArgumentError gene_profile(
+                sparsevec([4], UInt32[9], 8),
+                3;
+                flank = 2,
+                body_bins = 1,
+            )
+            @test_throws ArgumentError gene_profile(
+                spzeros(UInt32, 8),
+                3;
+                flank = 2,
+                body_bins = 1,
+            )
+            @test gene_profile(spzeros(UInt32, 5), 3; flank = 2, body_bins = 1) === nothing
+        end
     end  # gene_profile
 
     # =========================================================================

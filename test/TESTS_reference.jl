@@ -406,5 +406,35 @@ end
             # An index no feature uses returns nothing.
             @test isnothing(s.genome[typemax(UInt32)])
         end
+
+        @testset "getindex(genome, Vector{UInt32}) – batched metadata indices" begin
+            # Every gene's index resolved in one walk must match what the scalar
+            # method returns index by index.
+            gene_indices =
+                UInt32[parse_index(iv.value) for iv in get_feature(scaffold, :gene)]
+            @test length(gene_indices) > 1
+
+            batched = s.genome[gene_indices]
+            @test batched isa Dict{UInt32,FeatureRecord}
+            @test length(batched) == length(gene_indices)
+
+            matches = map(gene_indices) do idx
+                scalar = s.genome[idx]
+                record = batched[idx]
+                record.id == scalar.id &&
+                    record.feature_type == scalar.feature_type &&
+                    record.chromosome == scalar.chromosome &&
+                    record.start_pos == scalar.start_pos &&
+                    record.end_pos == scalar.end_pos &&
+                    record.code == scalar.code
+            end
+            @test all(matches)
+
+            # Unused indices are simply absent; an empty request walks nothing.
+            mixed = s.genome[UInt32[gene_idx, typemax(UInt32)]]
+            @test collect(keys(mixed)) == [gene_idx]
+            @test isempty(s.genome[UInt32[]])
+            @test isempty(s.genome[UInt32[typemax(UInt32)]])
+        end
     end
 end

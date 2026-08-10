@@ -362,6 +362,37 @@ function Base.getindex(genome::Genome, meta_index::UInt32)
     return nothing
 end
 
+"""
+Look up every feature whose 32-bit metadata index appears in `meta_indices`,
+returning a `Dict` mapping each found index to its [`FeatureRecord`](@ref).
+Indices matching no feature are absent from the result.
+
+A single O(features) walk resolves the whole set, stopping early once every
+requested index has been found, so a caller holding many indices must use this
+rather than calling the scalar `getindex(::Genome, ::UInt32)` per index — that is
+O(indices × features). Unlike the `Vector{<:AbstractString}` method this returns
+a `Dict` rather than a vector, because the caller needs to map each index back to
+its own record. As in the scalar method, the first interval carrying an index
+wins.
+"""
+function Base.getindex(genome::Genome, meta_indices::AbstractVector{UInt32})
+    records = Dict{UInt32,FeatureRecord}()
+    wanted = Set{UInt32}(meta_indices)
+    isempty(wanted) && return records
+
+    for (name, scaffold) in genome.scaffolds
+        for interval in scaffold.features
+            meta_index = parse_index(interval.value)
+            if meta_index in wanted
+                records[meta_index] = feature_record(genome, name, interval)
+                delete!(wanted, meta_index)
+                isempty(wanted) && return records
+            end
+        end
+    end
+    return records
+end
+
 function Base.show(io::IO, f::FeatureRecord)
     print(
         io,
