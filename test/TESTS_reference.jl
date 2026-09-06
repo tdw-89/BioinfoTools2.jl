@@ -184,9 +184,7 @@ end
         ]
 
         @test length(s.genome.scaffolds) == length(expected_scaffolds)
-        for id in expected_scaffolds
-            @test haskey(s.genome.scaffolds, id)
-        end
+        @test all(id -> haskey(s.genome.scaffolds, id), expected_scaffolds)
 
         # Total gene count across all scaffolds
         n_features = 531872
@@ -343,9 +341,10 @@ end
             by_symbol = get_feature(s.genome, :gene)
             by_string = get_feature(s.genome, "gene")
             @test keys(by_symbol) == keys(by_string)
-            for scaffold_name in keys(by_symbol)
-                @test length(by_symbol[scaffold_name]) == length(by_string[scaffold_name])
-            end
+            @test all(
+                length(by_symbol[name]) == length(by_string[name]) for
+                name in keys(by_symbol)
+            )
         end
     end
 

@@ -21,9 +21,11 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
     # -------------------------------------------------------------------------
     @testset "pack_bed_code / parse_bed_strand roundtrip" begin
         # BED intervals use the package-wide strand codes (see BitCodes).
-        for strand in (STRAND_FWD, STRAND_REV, STRAND_BOTH, STRAND_NA)
-            @test Data.parse_bed_strand(Data.pack_bed_code(strand)) == strand
-        end
+        strands = (STRAND_FWD, STRAND_REV, STRAND_BOTH, STRAND_NA)
+        @test all(
+            Data.parse_bed_strand(Data.pack_bed_code(strand)) == strand for
+            strand in strands
+        )
 
         # Only bits 33-40 should be set; all other bits must remain zero
         @test (Data.pack_bed_code(STRAND_REV) & ~(UInt64(0xFF) << 32)) == UInt64(0)
@@ -45,13 +47,12 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
         # All 8 records in micro.narrowPeak have strand '.' → STRAND_BOTH
         bd = load_bed(test_genome, MICRO_NARROWPEAK)
 
-        for (_, tree) in bd.scaffolds
-            for iv in tree
-                @test Data.parse_bed_strand(iv.value) == STRAND_BOTH
-                @test Data.parse_bed_strand(iv.value) |> decode_strand ==
-                      GFF3.GenomicFeatures.STRAND_BOTH
-            end
-        end
+        codes = [
+            Data.parse_bed_strand(iv.value) for tree in values(bd.scaffolds) for iv in tree
+        ]
+        @test !isempty(codes)
+        @test all(==(STRAND_BOTH), codes)
+        @test all(==(GFF3.GenomicFeatures.STRAND_BOTH), decode_strand.(codes))
     end
 
     # -------------------------------------------------------------------------
@@ -433,13 +434,14 @@ const ST_GFF_SINGLE = joinpath(ST_DATA_DIR, "NC_003280.10.gff.gz")
 
             @test exp isa Data.Experiment{Float64}
             @test Set(keys(exp.variables)) == Set(["ctrl", "drug"])
-            for key in ("ctrl", "drug")
-                v = exp.variables[key]
-                @test v.value == key
-                @test v.covariates === nothing
-                @test v.data isa BedData
-                @test v.data.genome === test_genome
-            end
+
+            leaves = [exp.variables[key] for key in ("ctrl", "drug")]
+            @test [leaf.value for leaf in leaves] == ["ctrl", "drug"]
+            @test all(leaf -> leaf.covariates === nothing, leaves)
+            @test all(
+                leaf -> leaf.data isa BedData && leaf.data.genome === test_genome,
+                leaves,
+            )
         end
 
         @testset "tabular samples (non-.bed extension)" begin

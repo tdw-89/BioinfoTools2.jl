@@ -138,7 +138,7 @@ end
         @test "ParalogID" in names(result)
     end
 
-    @testset "rbh - empty input should error" begin
+    @testset "rbh - empty input yields an empty (but shaped) result" begin
         df = DataFrame(
             GeneID = String[],
             ParalogID = String[],
@@ -146,8 +146,48 @@ end
             Perc2 = Float64[],
         )
 
-        # Empty DataFrame will cause BoundsError when accessing elements
-        @test_throws BoundsError rbh(df; scoring = "max")
+        result = rbh(df; scoring = "max")
+        @test nrow(result) == 0
+        @test names(result) ==
+              ["GeneID", "ParalogID", "perc_1", "perc_2", "max_perc", "mean_perc"]
+    end
+
+    @testset "rbh - column type and arity validation" begin
+        @test_throws ArgumentError rbh(
+            DataFrame(GeneID = ["A"], ParalogID = ["B"], Perc1 = [95.0]),
+        )
+        @test_throws ArgumentError rbh(
+            DataFrame(GeneID = [1], ParalogID = ["B"], Perc1 = [95.0], Perc2 = [94.0]),
+        )
+        @test_throws ArgumentError rbh(
+            DataFrame(GeneID = ["A"], ParalogID = ["B"], Perc1 = ["x"], Perc2 = [94.0]),
+        )
+        @test_throws ArgumentError rbh(
+            DataFrame(GeneID = ["A"], ParalogID = ["B"], Perc1 = [95.0], Perc2 = [94.0]);
+            scoring = "not_a_scoring",
+        )
+    end
+
+    @testset "rbh_ds - lowest dS wins, unscored pairs ignored" begin
+        # a-b are each other's closest pair (dS 0.05); c-d likewise (0.30).
+        # a-d is a distant pair that must not beat either.
+        df = DataFrame(
+            GeneID = ["a", "c", "a"],
+            ParalogID = ["b", "d", "d"],
+            dS = [0.05, 0.30, 0.90],
+        )
+
+        result = rbh_ds(df)
+        @test names(result) == ["GeneID", "ParalogID", "ds", "min_ds"]
+        @test nrow(result) == 2
+
+        pairs = Set(Set([row.GeneID, row.ParalogID]) for row in eachrow(result))
+        @test pairs == Set([Set(["a", "b"]), Set(["c", "d"])])
+        @test sort(result.ds) == [0.05, 0.30]
+        @test result.ds == result.min_ds
+
+        # `scoring = "ds"` routes to the same result.
+        @test rbh(df; scoring = "ds") == result
     end
 end
 

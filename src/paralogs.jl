@@ -8,13 +8,18 @@ using StructArrays
 
 using ..Reference
 
+"""Relation matrix an optional `pairs` column name maps to, or `nothing`."""
 function _match_relation(colname)
     key = lowercase(String(colname))
-    return key == "dn" ? :dN :
-           key == "ds" ? :dS :
-           key == "id_subject_query" ? :id_subject_query :
-           key == "id_query_subject" ? :id_query_subject : nothing
+    key == "dn" && return :dN
+    key == "ds" && return :dS
+    key == "id_subject_query" && return :id_subject_query
+    key == "id_query_subject" && return :id_query_subject
+    return nothing
 end
+
+"""The optional relation fields of a [`GeneFamily`](@ref), in declaration order."""
+const RELATIONS = (:dN, :dS, :id_subject_query, :id_query_subject)
 
 # Marker distinguishing the raw-fields constructor (below) from the public
 # `GeneFamily(genome, pairs)` one; kept unexported so ordinary callers can't
@@ -66,8 +71,9 @@ struct GeneFamily
     - `id_query_subject` — %ID query → subject with **queries on the columns**
       (`[subject, query]`), so `M[:, q]` gathers query `q`'s scores in O(nnz).
 
-    Repeated or reciprocal entries for a cell collapse to one value.
-
+    Repeated or reciprocal entries for a cell collapse to one value. Rows
+    carrying a `NaN` in any matched value column are dropped up front, with a
+    warning: `NaN != NaN` would break the symmetry the `*_graph` views check.
 
     See `getindex` for per-gene (`gf[i]`/`gf["id"]`) and sub-family
     (`gf[indices]`/`gf[ids]`) indexing, and `topology_graph`/`dN_graph`/
@@ -78,39 +84,33 @@ struct GeneFamily
         ncol(pairs) >= 2 ||
             throw(ArgumentError("`pairs` needs at least a query and a subject column"))
 
-        eltype(pairs[:, 1]) <: AbstractString || throw(
-            ArgumentError(
-                "Query ID column (column 1, \"$(names(pairs)[1])\") must contain strings, got element type $(eltype(pairs[:, 1]))",
-            ),
-        )
-        eltype(pairs[:, 2]) <: AbstractString || throw(
-            ArgumentError(
-                "Subject ID column (column 2, \"$(names(pairs)[2])\") must contain strings, got element type $(eltype(pairs[:, 2]))",
-            ),
-        )
-
-        # Match the optional value columns to their target matrices by name.
-        value_columns = Dict{Symbol,Int}()
-        for c = 3:ncol(pairs)
-            field = _match_relation(names(pairs)[c])
-            isnothing(field) || (value_columns[field] = c)
-        end
-
-        for (field, c) in value_columns
-            eltype(pairs[:, c]) <: Real || throw(
+        for (column, role) in ((1, "Query"), (2, "Subject"))
+            eltype(pairs[:, column]) <: AbstractString || throw(
                 ArgumentError(
-                    "Column \"$(names(pairs)[c])\" (matched to `$field`) must contain numeric values, got element type $(eltype(pairs[:, c]))",
+                    "$role ID column (column $column, \"$(names(pairs)[column])\") must contain strings, got element type $(eltype(pairs[:, column]))",
                 ),
             )
         end
 
-        # Drop rows carrying a NaN in any matched value column up front, so
-        # nothing downstream (dN/dS in particular, via `issymmetric` on their
-        # *_graph views) ever sees one.
+        # Match the optional value columns to their target matrices by name.
+        value_columns = Dict{Symbol,Int}()
+        for column = 3:ncol(pairs)
+            field = _match_relation(names(pairs)[column])
+            isnothing(field) || (value_columns[field] = column)
+        end
+
+        for (field, column) in value_columns
+            eltype(pairs[:, column]) <: Real || throw(
+                ArgumentError(
+                    "Column \"$(names(pairs)[column])\" (matched to `$field`) must contain numeric values, got element type $(eltype(pairs[:, column]))",
+                ),
+            )
+        end
+
         if !isempty(value_columns)
             keep = trues(nrow(pairs))
-            for c in values(value_columns)
-                keep .&= .!isnan.(pairs[:, c])
+            for column in values(value_columns)
+                keep .&= .!isnan.(pairs[:, column])
             end
             n_dropped = count(!, keep)
             if n_dropped > 0
@@ -121,6 +121,11 @@ struct GeneFamily
 
         query_ids = string.(pairs[:, 1])
         subject_ids = string.(pairs[:, 2])
+        # Materialised up front: indexing a DataFrame cell per row is both
+        # type-unstable and far slower than indexing a `Vector{Float64}`.
+        values_by_field = Dict{Symbol,Vector{Float64}}(
+            field => Float64.(pairs[:, column]) for (field, column) in value_columns
+        )
 
         # Resolve every ID to its feature.
         records = genome[unique(vcat(query_ids, subject_ids))]
@@ -146,19 +151,20 @@ struct GeneFamily
         id_to_index = Dict{String,Int}()
         cursor = 1
         for name in sort!(collect(keys(scaffold_intervals)))
-            ivs = scaffold_intervals[name]
+            scaffold_ivs = scaffold_intervals[name]
             ids = scaffold_id_lists[name]
-            order = collect(1:length(ivs))
-            sort!(order; by = k -> (ivs[k].start_pos, ivs[k].end_pos, ids[k]))
-            ivs, ids = ivs[order], ids[order]
+            order = sortperm(
+                eachindex(scaffold_ivs);
+                by = k -> (scaffold_ivs[k].start_pos, scaffold_ivs[k].end_pos, ids[k]),
+            )
 
-            n = length(ivs)
-            scaffold_ranges[name] = cursor:(cursor+n-1)
-            intervals[name] = StructArray(ivs)
-            for (offset, id) in enumerate(ids)
-                id_to_index[id] = cursor + offset - 1
+            n_scaffold_genes = length(order)
+            scaffold_ranges[name] = cursor:(cursor+n_scaffold_genes-1)
+            intervals[name] = StructArray(scaffold_ivs[order])
+            for (offset, k) in enumerate(order)
+                id_to_index[ids[k]] = cursor + offset - 1
             end
-            cursor += n
+            cursor += n_scaffold_genes
         end
         n_genes = cursor - 1
 
@@ -174,31 +180,31 @@ struct GeneFamily
         qs_i, qs_j, qs_v = UInt32[], UInt32[], Float64[]
 
         want_tri = has(:dN) || has(:dS)
-        for r = 1:nrow(pairs)
-            q, s = query_ids[r], subject_ids[r]
-            (haskey(id_to_index, q) && haskey(id_to_index, s)) || continue
-            iq, is = id_to_index[q], id_to_index[s]
+        for row = 1:nrow(pairs)
+            query, subject = query_ids[row], subject_ids[row]
+            (haskey(id_to_index, query) && haskey(id_to_index, subject)) || continue
+            query_index, subject_index = id_to_index[query], id_to_index[subject]
 
-            push!(topo_i, iq)
-            push!(topo_j, is)
+            push!(topo_i, query_index)
+            push!(topo_j, subject_index)
 
             if want_tri
-                lo, hi = minmax(iq, is)
+                lo, hi = minmax(query_index, subject_index)
                 push!(tri_i, lo)
                 push!(tri_j, hi)
-                has(:dN) && push!(dN_v, Float64(pairs[r, value_columns[:dN]]))
-                has(:dS) && push!(dS_v, Float64(pairs[r, value_columns[:dS]]))
+                has(:dN) && push!(dN_v, values_by_field[:dN][row])
+                has(:dS) && push!(dS_v, values_by_field[:dS][row])
             end
 
             if has(:id_subject_query)
-                push!(sq_i, iq)               # subjects on the column axis
-                push!(sq_j, is)
-                push!(sq_v, Float64(pairs[r, value_columns[:id_subject_query]]))
+                push!(sq_i, query_index)          # subjects on the column axis
+                push!(sq_j, subject_index)
+                push!(sq_v, values_by_field[:id_subject_query][row])
             end
             if has(:id_query_subject)
-                push!(qs_i, is)               # queries on the column axis
-                push!(qs_j, iq)
-                push!(qs_v, Float64(pairs[r, value_columns[:id_query_subject]]))
+                push!(qs_i, subject_index)        # queries on the column axis
+                push!(qs_j, query_index)
+                push!(qs_v, values_by_field[:id_query_subject][row])
             end
         end
 
@@ -212,24 +218,17 @@ struct GeneFamily
             n_genes,
             |,
         )
-        dN = has(:dN) ? sparse(tri_i, tri_j, dN_v, n_genes, n_genes, max) : nothing
-        dS = has(:dS) ? sparse(tri_i, tri_j, dS_v, n_genes, n_genes, max) : nothing
-        id_subject_query =
-            has(:id_subject_query) ? sparse(sq_i, sq_j, sq_v, n_genes, n_genes, max) :
-            nothing
-        id_query_subject =
-            has(:id_query_subject) ? sparse(qs_i, qs_j, qs_v, n_genes, n_genes, max) :
-            nothing
+        relation(rows, cols, vals) = sparse(rows, cols, vals, n_genes, n_genes, max)
 
         return new(
             intervals,
             scaffold_ranges,
             id_to_index,
             topology,
-            dN,
-            dS,
-            id_subject_query,
-            id_query_subject,
+            has(:dN) ? relation(tri_i, tri_j, dN_v) : nothing,
+            has(:dS) ? relation(tri_i, tri_j, dS_v) : nothing,
+            has(:id_subject_query) ? relation(sq_i, sq_j, sq_v) : nothing,
+            has(:id_query_subject) ? relation(qs_i, qs_j, qs_v) : nothing,
         )
     end
 
@@ -260,20 +259,20 @@ struct GeneFamily
     end
 end
 
+"""Number of genes a family spans."""
 _n_genes(gf::GeneFamily) = size(gf.topology, 1)
+
+"""Reverse of `gf.id_to_index`: linear gene index to gene ID."""
+_index_to_id(gf::GeneFamily) = Dict(index => id for (id, index) in gf.id_to_index)
 
 function Base.show(io::IO, gf::GeneFamily)
     n = _n_genes(gf)
-    nscaff = length(gf.scaffold_ranges)
-    npairs = nnz(gf.topology) ÷ 2
-    relations = [
-        String(f) for f in (:dN, :dS, :id_subject_query, :id_query_subject) if
-        !isnothing(getfield(gf, f))
-    ]
-    rel_str = isempty(relations) ? "none" : join(relations, ", ")
+    n_scaffolds = length(gf.scaffold_ranges)
+    n_pairs = nnz(gf.topology) ÷ 2
+    present = [String(field) for field in RELATIONS if !isnothing(getfield(gf, field))]
     print(
         io,
-        "GeneFamily($n gene$(n == 1 ? "" : "s"), $nscaff scaffold$(nscaff == 1 ? "" : "s"), $npairs pair$(npairs == 1 ? "" : "s"); relations: $rel_str)",
+        "GeneFamily($n gene$(n == 1 ? "" : "s"), $n_scaffolds scaffold$(n_scaffolds == 1 ? "" : "s"), $n_pairs pair$(n_pairs == 1 ? "" : "s"); relations: $(isempty(present) ? "none" : join(present, ", ")))",
     )
 end
 
@@ -292,12 +291,12 @@ column `i` alone only surfaces partners with a smaller index; combine with row
 function Base.getindex(gf::GeneFamily, i::Integer)
     n = _n_genes(gf)
     1 <= i <= n || throw(ArgumentError("gene index $i out of bounds (1:$n)"))
-    cols = Dict{Symbol,Vector}(:topology => Vector(gf.topology[:, i]))
-    for field in (:dN, :dS, :id_subject_query, :id_query_subject)
-        m = getfield(gf, field)
-        isnothing(m) || (cols[field] = Vector(m[:, i]))
+    columns = Dict{Symbol,Vector}(:topology => Vector(gf.topology[:, i]))
+    for field in RELATIONS
+        matrix = getfield(gf, field)
+        isnothing(matrix) || (columns[field] = Vector(matrix[:, i]))
     end
-    return cols
+    return columns
 end
 
 function Base.getindex(gf::GeneFamily, id::AbstractString)
@@ -322,28 +321,30 @@ function Base.getindex(gf::GeneFamily, indices::AbstractVector{<:Integer})
 
     order = sort!(unique(collect(Int, indices)))
     order_set = Set(order)
-    index_to_id = Dict(v => k for (k, v) in gf.id_to_index)
+    index_to_id = _index_to_id(gf)
 
     new_intervals = Dict{String,StructArray{Reference.IntervalSimple}}()
     new_ranges = Dict{String,UnitRange{Int}}()
     new_id_to_index = Dict{String,Int}()
     cursor = 1
     for name in sort!(collect(keys(gf.scaffold_ranges)))
-        rng = gf.scaffold_ranges[name]
-        kept = filter(gi -> gi in order_set, rng)
+        range = gf.scaffold_ranges[name]
+        kept = filter(in(order_set), range)
         isempty(kept) && continue
 
-        ivs = [gf.intervals[name][gi-first(rng)+1] for gi in kept]
-        m = length(kept)
-        new_intervals[name] = StructArray(ivs)
-        new_ranges[name] = cursor:(cursor+m-1)
-        for (offset, gi) in enumerate(kept)
-            new_id_to_index[index_to_id[gi]] = cursor + offset - 1
+        new_intervals[name] =
+            StructArray([gf.intervals[name][gene-first(range)+1] for gene in kept])
+        new_ranges[name] = cursor:(cursor+length(kept)-1)
+        for (offset, gene) in enumerate(kept)
+            new_id_to_index[index_to_id[gene]] = cursor + offset - 1
         end
-        cursor += m
+        cursor += length(kept)
     end
 
-    relation(field) = (m = getfield(gf, field); isnothing(m) ? nothing : m[order, order])
+    function relation(field)
+        matrix = getfield(gf, field)
+        return isnothing(matrix) ? nothing : matrix[order, order]
+    end
 
     return GeneFamily(
         _RawFields(),
@@ -366,6 +367,8 @@ function Base.getindex(gf::GeneFamily, ids::AbstractVector{<:AbstractString})
     end
     return gf[indices]
 end
+
+#= Graph views =#
 
 """
     topology_graph(gf::GeneFamily) -> SimpleGraph
@@ -416,27 +419,68 @@ Same as [`id_subject_query_graph`](@ref), for `gf.id_query_subject` (stored
 """
 id_query_subject_graph(gf::GeneFamily) = _weighted_directed_graph(gf.id_query_subject)
 
+#= Reciprocal best hits =#
+
+"""
+Canonical name for a scoring alias (`"maximum"` → `"max"`, `"avg"` → `"mean"`,
+…), or `nothing` when the alias is unrecognised. Which names a given `rbh`
+method accepts is up to that method.
+"""
+function _canonical_scoring(scoring::AbstractString)
+    key = lowercase(scoring)
+    key in ("max", "maximum") && return "max"
+    key in ("min", "minimum") && return "min"
+    key in ("mean", "avg", "average") && return "mean"
+    key in ("double_max", "ds") && return key
+    return nothing
+end
+
 # For edge {a, b}, resolve which end was the original query/subject using
 # whichever id_* relation is present (their storage axis records it exactly);
 # falls back to the lower index as query when neither is present.
 function _edge_query_subject(gf::GeneFamily, a::Integer, b::Integer)
-    if gf.id_subject_query !== nothing
+    if !isnothing(gf.id_subject_query)
         return gf.id_subject_query[a, b] != 0 ? (a, b) : (b, a)
-    elseif gf.id_query_subject !== nothing
+    elseif !isnothing(gf.id_query_subject)
         return gf.id_query_subject[b, a] != 0 ? (a, b) : (b, a)
     end
     return minmax(a, b)
 end
 
-# The %ID for edge (q, s), combining whichever of id_subject_query/
-# id_query_subject are present via `scoring`; `nothing` if neither is present.
-function edge_identity(gf::GeneFamily, q::Integer, s::Integer, scoring::String)
-    vals = Float64[]
-    gf.id_subject_query !== nothing && push!(vals, gf.id_subject_query[q, s])
-    gf.id_query_subject !== nothing && push!(vals, gf.id_query_subject[s, q])
-    isempty(vals) && return nothing
-    return scoring == "mean" ? sum(vals) / length(vals) :
-           scoring == "min" ? minimum(vals) : maximum(vals)
+"""
+    edge_identity(gf, query, subject, scoring)
+
+The %ID for edge `(query, subject)`, combining whichever of
+`id_subject_query`/`id_query_subject` are present via `scoring` (`"mean"`,
+`"min"` or `"max"`). Returns `nothing` when neither relation is present.
+"""
+function edge_identity(gf::GeneFamily, query::Integer, subject::Integer, scoring::String)
+    subject_query =
+        isnothing(gf.id_subject_query) ? nothing : gf.id_subject_query[query, subject]
+    query_subject =
+        isnothing(gf.id_query_subject) ? nothing : gf.id_query_subject[subject, query]
+    isnothing(subject_query) && return query_subject
+    isnothing(query_subject) && return subject_query
+    scoring == "mean" && return (subject_query + query_subject) / 2
+    scoring == "min" && return min(subject_query, query_subject)
+    return max(subject_query, query_subject)
+end
+
+# Group `graph`'s edges by connected component, returning `(components, edges)`
+# as parallel vectors. One pass over the edges, rather than one pass per
+# component.
+function _component_edges(graph::SimpleGraph)
+    components = connected_components(graph)
+    component_of = zeros(Int, nv(graph))
+    for (index, component) in enumerate(components), vertex in component
+        component_of[vertex] = index
+    end
+
+    grouped = [eltype(edges(graph))[] for _ in components]
+    for edge in edges(graph)
+        push!(grouped[component_of[src(edge)]], edge)
+    end
+    return components, grouped
 end
 
 """
@@ -455,52 +499,54 @@ Returns a `DataFrame` shaped like `GeneFamily`'s constructor input — `query`,
 are present on `gf` — containing only the chosen pairs.
 """
 function rbh(gf::GeneFamily; scoring::String = "mean")
-    scoring = lowercase(scoring)
-    scoring =
-        scoring in ("mean", "avg", "average") ? "mean" :
-        scoring in ("min", "minimum") ? "min" :
-        scoring in ("max", "maximum") ? "max" :
+    scoring = something(_canonical_scoring(scoring), "")
+    scoring in ("mean", "min", "max") ||
         throw(ArgumentError("scoring must be \"mean\", \"min\", or \"max\""))
 
     any(!isnothing, (gf.dN, gf.dS, gf.id_subject_query, gf.id_query_subject)) ||
         throw(ArgumentError("gf has no dN, dS, or %ID relation to rank edges by"))
 
-    # Ascending ranking key: dS, then dN, then -%ID, omitting absent levels;
-    # (lo, hi) is a final, deterministic tie-break (lowest indices win).
+    # Ascending ranking key: dS, then dN, then -%ID. A level `gf` lacks
+    # contributes a constant, so it never discriminates; `primary` records which
+    # slot is the first real one, for the tie warning below. `(lo, hi)` is a
+    # final, deterministic tie-break (lowest indices win).
+    primary = !isnothing(gf.dS) ? 1 : !isnothing(gf.dN) ? 2 : 3
     function rank_key(a, b)
         lo, hi = minmax(a, b)
-        parts = Float64[]
-        gf.dS !== nothing && push!(parts, gf.dS[lo, hi])
-        gf.dN !== nothing && push!(parts, gf.dN[lo, hi])
         pid = edge_identity(gf, _edge_query_subject(gf, a, b)..., scoring)
-        isnothing(pid) || push!(parts, -pid)
-        return (Tuple(parts), (lo, hi))
+        return (
+            (
+                isnothing(gf.dS) ? 0.0 : gf.dS[lo, hi],
+                isnothing(gf.dN) ? 0.0 : gf.dN[lo, hi],
+                isnothing(pid) ? 0.0 : -pid,
+            ),
+            (lo, hi),
+        )
     end
 
-    index_to_id = Dict(v => k for (k, v) in gf.id_to_index)
-    g = topology_graph(gf)
+    index_to_id = _index_to_id(gf)
+    components, component_edges = _component_edges(topology_graph(gf))
 
     query, subject = String[], String[]
     dN_out, dS_out, sq_out, qs_out = Float64[], Float64[], Float64[], Float64[]
     tied_components = Vector{Int}[]
 
-    for comp in connected_components(g)
-        comp_set = Set(comp)
-        comp_edges = [e for e in edges(g) if src(e) in comp_set]
-        isempty(comp_edges) && continue   # singleton gene, no partner to hit
+    for (component, edge_list) in zip(components, component_edges)
+        isempty(edge_list) && continue   # singleton gene, no partner to hit
 
-        ranked = sort([(rank_key(src(e), dst(e)), src(e), dst(e)) for e in comp_edges])
-        best_metric = ranked[1][1][1]
-        count(r -> r[1][1] == best_metric, ranked) > 1 && push!(tied_components, sort(comp))
+        ranked = sort([(rank_key(src(e), dst(e)), src(e), dst(e)) for e in edge_list])
+        best_metric = ranked[1][1][primary]
+        count(r -> r[1][primary] == best_metric, ranked) > 1 &&
+            push!(tied_components, sort(component))
 
         _, a, b = ranked[1]
-        q, s = _edge_query_subject(gf, a, b)
-        push!(query, index_to_id[q])
-        push!(subject, index_to_id[s])
-        gf.dN !== nothing && push!(dN_out, gf.dN[minmax(q, s)...])
-        gf.dS !== nothing && push!(dS_out, gf.dS[minmax(q, s)...])
-        gf.id_subject_query !== nothing && push!(sq_out, gf.id_subject_query[q, s])
-        gf.id_query_subject !== nothing && push!(qs_out, gf.id_query_subject[s, q])
+        gene, paralog = _edge_query_subject(gf, a, b)
+        push!(query, index_to_id[gene])
+        push!(subject, index_to_id[paralog])
+        isnothing(gf.dN) || push!(dN_out, gf.dN[minmax(gene, paralog)...])
+        isnothing(gf.dS) || push!(dS_out, gf.dS[minmax(gene, paralog)...])
+        isnothing(gf.id_subject_query) || push!(sq_out, gf.id_subject_query[gene, paralog])
+        isnothing(gf.id_query_subject) || push!(qs_out, gf.id_query_subject[paralog, gene])
     end
 
     if !isempty(tied_components)
@@ -508,209 +554,224 @@ function rbh(gf::GeneFamily; scoring::String = "mean")
         @warn "rbh: tied best-hit distance in $(length(tied_components)) group(s): $groups"
     end
 
-    cols = Pair{String,Vector}["query"=>query, "subject"=>subject]
-    gf.dN !== nothing && push!(cols, "dN" => dN_out)
-    gf.dS !== nothing && push!(cols, "dS" => dS_out)
-    gf.id_subject_query !== nothing && push!(cols, "id_subject_query" => sq_out)
-    gf.id_query_subject !== nothing && push!(cols, "id_query_subject" => qs_out)
-    return DataFrame(cols...)
-end
-
-function rbh_ds(paralog_df::DataFrame)
-    @assert typeof(paralog_df[1, 1]) <: AbstractString
-    @assert typeof(paralog_df[1, 2]) <: AbstractString
-    @assert typeof(paralog_df[1, 3]) <: AbstractFloat
-
-    unique_ids = unique(vcat(paralog_df[:, 1], paralog_df[:, 2]))
-    ids_to_ind_dict = Dict(unique_ids[i] => i for i in eachindex(unique_ids))
-    ind_to_ids_dict = Dict(i => unique_ids[i] for i in eachindex(unique_ids))
-
-    # Create a matrix of zeros
-    rbh_matrix = zeros(Float64, length(unique_ids), length(unique_ids))
-    orig_mat = zeros(Float64, length(unique_ids), length(unique_ids))
-
-    # Fill in the matrix, treating gene 'i' as the query and gene 'j' as the subject
-    for row in eachrow(paralog_df)
-
-        i = ids_to_ind_dict[row[1]]
-        j = ids_to_ind_dict[row[2]]
-
-        orig_mat[i, j] = row[3]
-        orig_mat[j, i] = row[3]
-        rbh_matrix[i, j] = row[3]
-        rbh_matrix[j, i] = row[3]
-    end
-
-    rbh_gene, rbh_paralog = String[], String[]
-    matched_inds = Int[]
-    score_i_origs, score_j_origs, min_scores, mean_scores =
-        Float64[], Float64[], Float64[], Float64[]
-    for i = 1:size(rbh_matrix)[1]
-
-        _, min_i = findmin(rbh_matrix[i, :])[1:2]
-        _, min_j = findmin(rbh_matrix[:, min_i])[1:2]
-        score_i_orig = orig_mat[i, min_i]
-        score_j_orig = orig_mat[min_i, i]
-        min_score = min(score_i_orig, score_j_orig)
-        mean_score = (score_i_orig + score_j_orig) / 2
-
-        if i == min_j && min_i ∉ matched_inds && min_j ∉ matched_inds
-
-            id_i = ind_to_ids_dict[min_i]
-            id_j = ind_to_ids_dict[min_j]
-
-            push!(rbh_gene, id_i)
-            push!(rbh_paralog, id_j)
-            push!(matched_inds, min_i)
-            push!(matched_inds, min_j)
-            push!(score_i_origs, score_i_orig)
-            push!(score_j_origs, score_j_orig)
-            push!(min_scores, min_score)
-            push!(mean_scores, mean_score)
-        end
-    end
-
-    return DataFrame(
-        "GeneID" => rbh_gene,
-        "ParalogID" => rbh_paralog,
-        "ds" => score_i_origs,
-        "min_ds" => min_scores,
-    )
+    columns = Pair{String,Vector}["query"=>query, "subject"=>subject]
+    isnothing(gf.dN) || push!(columns, "dN" => dN_out)
+    isnothing(gf.dS) || push!(columns, "dS" => dS_out)
+    isnothing(gf.id_subject_query) || push!(columns, "id_subject_query" => sq_out)
+    isnothing(gf.id_query_subject) || push!(columns, "id_query_subject" => qs_out)
+    return DataFrame(columns...)
 end
 
 """
-    rbh(paralog_df; scoring="max")
+Row and column best hits of a sparse score matrix held as
+`(row, column) => score`, over `n_genes` genes. Returns
+`(best_in_row, best_in_column)`, each a `Vector{Int}` of gene indices, `0` where
+a gene has no scored partner. `better(a, b)` decides whether `a` beats `b`
+(`>` for a similarity, `<` for a distance); ties go to the lowest index, so the
+result does not depend on iteration order.
+"""
+function _best_hits(scores::Dict{Tuple{Int,Int},Float64}, n_genes::Int, better::F) where {F}
+    best_in_row = zeros(Int, n_genes)
+    best_in_column = zeros(Int, n_genes)
+    row_best = Vector{Float64}(undef, n_genes)
+    column_best = Vector{Float64}(undef, n_genes)
 
-Identify reciprocal best hits (RBH) between paralogs based on similarity scores.
+    for ((row, column), score) in scores
+        if best_in_row[row] == 0 ||
+           better(score, row_best[row]) ||
+           (score == row_best[row] && column < best_in_row[row])
+            best_in_row[row] = column
+            row_best[row] = score
+        end
+        if best_in_column[column] == 0 ||
+           better(score, column_best[column]) ||
+           (score == column_best[column] && row < best_in_column[column])
+            best_in_column[column] = row
+            column_best[column] = score
+        end
+    end
+    return best_in_row, best_in_column
+end
 
-# Arguments
-- `paralog_df::DataFrame`: DataFrame with at least 4 columns:
-  1. GeneID (String)
-  2. ParalogID (String)
-  3. Percent identity from gene to paralog (Float), or dS value if using `scoring="ds"`
-  4. Percent identity from paralog to gene (Float), or ignored if using `scoring="ds"`
-- `scoring::String="max"`: Scoring method for determining best hits
-  - `"max"` or `"maximum"`: Use maximum of bidirectional scores
-  - `"mean"`, `"avg"`, or `"average"`: Use mean of bidirectional scores
-  - `"double_max"`: Use original bidirectional scores
-  - `"ds"`: Use dS values (column 3 should contain dS values)
-
-# Returns
-- `DataFrame`: Contains reciprocal best hit pairs with columns:
-  - `GeneID`: First gene in RBH pair
-  - `ParalogID`: Second gene in RBH pair
-  - `perc_1`: Original percent identity (gene → paralog)
-  - `perc_2`: Original percent identity (paralog → gene)
-  - `max_perc`: Maximum of the two scores
-  - `mean_perc`: Mean of the two scores
-
-# Examples
-```julia
-df = DataFrame(
-    GeneID = ["A", "B", "C"],
-    ParalogID = ["B", "A", "D"],
-    Perc1 = [95.0, 94.0, 80.0],
-    Perc2 = [94.0, 95.0, 85.0]
+# Score matrices for a flat paralog table: `original` holds the two directional
+# values as given, `ranked` the values best hits are chosen by (identical to
+# `original` under "double_max" and "ds"). Later rows overwrite earlier ones for
+# a repeated pair, and both are keyed by the gene indices of `id_to_index`.
+function _pair_matrices(
+    paralog_df::DataFrame,
+    id_to_index::Dict{<:Any,Int},
+    scoring::String,
 )
-rbh_pairs = rbh(df; scoring="max")
-```
+    original = Dict{Tuple{Int,Int},Float64}()
+    ranked = Dict{Tuple{Int,Int},Float64}()
+
+    for row in eachrow(paralog_df)
+        gene = id_to_index[string(row[1])]
+        paralog = id_to_index[string(row[2])]
+        forward = Float64(row[3])
+        backward = scoring == "ds" ? forward : Float64(row[4])
+
+        original[(gene, paralog)] = forward
+        original[(paralog, gene)] = backward
+        combined =
+            scoring == "max" ? max(forward, backward) :
+            scoring == "mean" ? (forward + backward) / 2 : nothing
+        ranked[(gene, paralog)] = isnothing(combined) ? forward : combined
+        ranked[(paralog, gene)] = isnothing(combined) ? backward : combined
+    end
+
+    return original, ranked
+end
+
+# Genes that are each other's best hit and not already paired, as
+# `(gene, best_partner)` pairs in ascending gene order.
+function _reciprocal_pairs(
+    ranked::Dict{Tuple{Int,Int},Float64},
+    n_genes::Int,
+    better::F,
+) where {F}
+    best_in_row, best_in_column = _best_hits(ranked, n_genes, better)
+    matched = Set{Int}()
+    pairs = Tuple{Int,Int}[]
+
+    for gene = 1:n_genes
+        partner = best_in_row[gene]
+        (partner == 0 || best_in_column[partner] != gene) && continue
+        (gene in matched || partner in matched) && continue
+        push!(matched, gene)
+        push!(matched, partner)
+        push!(pairs, (gene, partner))
+    end
+    return pairs
+end
+
+"""
+    rbh(paralog_df::DataFrame; scoring = "max") -> DataFrame
+
+Identify reciprocal best hits (RBH) between paralogs listed one pair per row.
+
+`paralog_df` needs at least three columns (four unless `scoring = "ds"`):
+
+1. `GeneID` (`String`)
+2. `ParalogID` (`String`)
+3. percent identity gene → paralog, or the pair's dS when `scoring = "ds"`
+4. percent identity paralog → gene (ignored when `scoring = "ds"`)
+
+`scoring` picks the value pairs are ranked by:
+
+- `"max"`/`"maximum"` (default): the larger of the two directions
+- `"mean"`/`"avg"`/`"average"`: their mean
+- `"double_max"`: each direction on its own
+- `"ds"`: column 3 read as a dS value and ranked **ascending** (see
+  [`rbh_ds`](@ref))
+
+A pair is kept when each gene is the other's best hit and neither has already
+been paired. Returns a `DataFrame` of `GeneID`, `ParalogID`, `perc_1`, `perc_2`
+(the two original scores), `max_perc` and `mean_perc`; `scoring = "ds"` returns
+[`rbh_ds`](@ref)'s columns instead. An empty input gives an empty, correctly
+shaped result.
+
+**NOTE:** only scored pairs are ranked. A gene absent from a pair has no best
+hit there, rather than being treated as scoring zero against it.
 """
 function rbh(paralog_df::DataFrame; scoring::String = "max")
-
-    scoring = lowercase(scoring)
-
-    if !(scoring in ["max", "maximum", "double_max", "mean", "average", "avg", "ds"])
-
-        error(
+    canonical = _canonical_scoring(scoring)
+    canonical in ("max", "mean", "double_max", "ds") || throw(
+        ArgumentError(
             "Invalid scoring method. Must be 'ds', 'max', 'maximum', 'double_max', 'mean', 'avg', or 'average'.",
-        )
-    end
+        ),
+    )
+    canonical == "ds" && return rbh_ds(paralog_df)
 
-    scoring =
-        scoring in ["max", "maximum"] ? "max" :
-        scoring in ["mean", "avg", "average"] ? "mean" : scoring
+    _check_pair_columns(paralog_df, 4)
+    ids, id_to_index = _index_pair_ids(paralog_df)
+    original, ranked = _pair_matrices(paralog_df, id_to_index, canonical)
 
-    if scoring == "ds"
-        return rbh_ds(paralog_df)
-    end
-
-    @assert typeof(paralog_df[1, 1]) <: AbstractString
-    @assert typeof(paralog_df[1, 2]) <: AbstractString
-    @assert typeof(paralog_df[1, 3]) <: AbstractFloat
-    @assert typeof(paralog_df[1, 4]) <: AbstractFloat
-
-    unique_ids = unique(vcat(paralog_df[:, 1], paralog_df[:, 2]))
-    ids_to_ind_dict = Dict(unique_ids[i] => i for i in eachindex(unique_ids))
-    ind_to_ids_dict = Dict(i => unique_ids[i] for i in eachindex(unique_ids))
-
-    # Create a matrix of zeros
-    rbh_matrix = zeros(Float64, length(unique_ids), length(unique_ids))
-    orig_mat = zeros(Float64, length(unique_ids), length(unique_ids))
-
-    # Fill in the matrix, treating gene 'i' as the query and gene 'j' as the subject
-    for row in eachrow(paralog_df)
-
-        i = ids_to_ind_dict[row[1]]
-        j = ids_to_ind_dict[row[2]]
-
-        orig_mat[i, j] = row[3]
-        orig_mat[j, i] = row[4]
-
-        if scoring == "max"
-
-            max_perc_temp = max(row[3], row[4])
-            rbh_matrix[i, j] = max_perc_temp
-            rbh_matrix[j, i] = max_perc_temp
-        elseif scoring == "mean"
-
-            mean_perc_temp = (row[3] + row[4]) / 2
-            rbh_matrix[i, j] = mean_perc_temp
-            rbh_matrix[j, i] = mean_perc_temp
-        else
-
-            rbh_matrix[i, j] = orig_mat[i, j]
-            rbh_matrix[j, i] = orig_mat[j, i]
-        end
-    end
-
-    rbh_gene, rbh_paralog = String[], String[]
-    matched_inds = Int[]
-    perc_i_origs, perc_j_origs, max_percs, mean_percs =
-        Float64[], Float64[], Float64[], Float64[]
-
-    for i = 1:size(rbh_matrix)[1]
-
-        _, max_i = findmax(rbh_matrix[i, :])[1:2]
-        _, max_j = findmax(rbh_matrix[:, max_i])[1:2]
-        perc_i_orig = orig_mat[i, max_i]
-        perc_j_orig = orig_mat[max_i, i]
-        max_perc = max(perc_i_orig, perc_j_orig)
-        mean_perc = (perc_i_orig + perc_j_orig) / 2
-
-        if i == max_j && max_i ∉ matched_inds && max_j ∉ matched_inds
-
-            id_i = ind_to_ids_dict[max_i]
-            id_j = ind_to_ids_dict[max_j]
-
-            push!(rbh_gene, id_i)
-            push!(rbh_paralog, id_j)
-            push!(matched_inds, max_i)
-            push!(matched_inds, max_j)
-            push!(perc_i_origs, perc_i_orig)
-            push!(perc_j_origs, perc_j_orig)
-            push!(max_percs, max_perc)
-            push!(mean_percs, mean_perc)
-        end
+    gene_ids, paralog_ids = String[], String[]
+    forwards, reverses, maxima, means = Float64[], Float64[], Float64[], Float64[]
+    for (gene, partner) in _reciprocal_pairs(ranked, length(ids), >)
+        forward = get(original, (gene, partner), 0.0)
+        backward = get(original, (partner, gene), 0.0)
+        push!(gene_ids, ids[partner])
+        push!(paralog_ids, ids[gene])
+        push!(forwards, forward)
+        push!(reverses, backward)
+        push!(maxima, max(forward, backward))
+        push!(means, (forward + backward) / 2)
     end
 
     return DataFrame(
-        "GeneID" => rbh_gene,
-        "ParalogID" => rbh_paralog,
-        "perc_1" => perc_i_origs,
-        "perc_2" => perc_j_origs,
-        "max_perc" => max_percs,
-        "mean_perc" => mean_percs,
+        "GeneID" => gene_ids,
+        "ParalogID" => paralog_ids,
+        "perc_1" => forwards,
+        "perc_2" => reverses,
+        "max_perc" => maxima,
+        "mean_perc" => means,
     )
+end
+
+"""
+    rbh_ds(paralog_df::DataFrame) -> DataFrame
+
+Reciprocal best hits ranked by dS — the lowest value wins, dS being a distance
+rather than a similarity. Column 3 of `paralog_df` holds the pair's dS and is
+taken to apply in both directions; see [`rbh`](@ref) for the pairing rule.
+
+Returns a `DataFrame` of `GeneID`, `ParalogID`, `ds` and `min_ds`.
+"""
+function rbh_ds(paralog_df::DataFrame)
+    _check_pair_columns(paralog_df, 3)
+    ids, id_to_index = _index_pair_ids(paralog_df)
+    original, ranked = _pair_matrices(paralog_df, id_to_index, "ds")
+
+    gene_ids, paralog_ids = String[], String[]
+    ds_values, minima = Float64[], Float64[]
+    for (gene, partner) in _reciprocal_pairs(ranked, length(ids), <)
+        forward = get(original, (gene, partner), 0.0)
+        backward = get(original, (partner, gene), 0.0)
+        push!(gene_ids, ids[partner])
+        push!(paralog_ids, ids[gene])
+        push!(ds_values, forward)
+        push!(minima, min(forward, backward))
+    end
+
+    return DataFrame(
+        "GeneID" => gene_ids,
+        "ParalogID" => paralog_ids,
+        "ds" => ds_values,
+        "min_ds" => minima,
+    )
+end
+
+# Validate a flat paralog table: two ID columns followed by `n_columns - 2`
+# numeric ones.
+function _check_pair_columns(paralog_df::DataFrame, n_columns::Int)
+    ncol(paralog_df) >= n_columns || throw(
+        ArgumentError(
+            "`paralog_df` needs at least $n_columns columns, got $(ncol(paralog_df))",
+        ),
+    )
+    for column = 1:2
+        eltype(paralog_df[:, column]) <: AbstractString || throw(
+            ArgumentError(
+                "Column $column (\"$(names(paralog_df)[column])\") must contain gene IDs (strings), got element type $(eltype(paralog_df[:, column]))",
+            ),
+        )
+    end
+    for column = 3:n_columns
+        eltype(paralog_df[:, column]) <: Real || throw(
+            ArgumentError(
+                "Column $column (\"$(names(paralog_df)[column])\") must contain scores (numbers), got element type $(eltype(paralog_df[:, column]))",
+            ),
+        )
+    end
+    return nothing
+end
+
+# Gene IDs in first-appearance order, and the reverse lookup to their indices.
+function _index_pair_ids(paralog_df::DataFrame)
+    ids = unique(vcat(string.(paralog_df[:, 1]), string.(paralog_df[:, 2])))
+    return ids, Dict(id => index for (index, id) in enumerate(ids))
 end
 
 export GeneFamily,

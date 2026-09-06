@@ -1,12 +1,9 @@
 module Data
 
 using BED
-using BioGenerics
 using CSV
 using CodecZlib
 using DataFrames
-using Dates
-using GFF3
 using IntervalTrees
 using ..BitCodes
 using ..Reference
@@ -46,7 +43,7 @@ end
 
 """
 A variable in an experiment.
-Either it points to a set of covariates (child nodes) or contains data (leaf node). 
+Either it points to a set of covariates (child nodes) or contains data (leaf node).
 The `value` of the variable is really the name of the incoming edge.
 """
 struct Variable{T<:Number}
@@ -59,10 +56,8 @@ struct Variable{T<:Number}
         covariates::Union{Nothing,ImmutableDict{String,Variable{T}}},
         data::Union{Nothing,TabularData{T},BedData},
     ) where {T<:Number}
-        only_one = isnothing(covariates) ⊻ isnothing(data)
-        if !only_one
+        isnothing(covariates) ⊻ isnothing(data) ||
             throw(ArgumentError("Exactly one of `covariates` or `data` must be provided."))
-        end
         new{T}(value, covariates, data)
     end
 end
@@ -81,7 +76,6 @@ function _build_variables(
     depth::Int,
     nvars::Int,
 ) where {T<:Number,D}
-    variables = ImmutableDict{String,Variable{T}}()
     order = String[]
     groups = Dict{String,Vector{Tuple{Vector{String},D}}}()
     for entry in entries
@@ -90,6 +84,7 @@ function _build_variables(
         push!(get!(() -> Tuple{Vector{String},D}[], groups, key), entry)
     end
 
+    variables = ImmutableDict{String,Variable{T}}()
     for key in order
         group = groups[key]
         node = if depth == nvars
@@ -109,15 +104,15 @@ end
 # read as a table and matched against `genome` as `TabularData{T}` (its numeric
 # columns coerced to `T`).
 function _load_sample(::Type{T}, genome::Genome, path::AbstractString) where {T<:Number}
-    endswith(lowercase(String(path)), ".bed") && return load_bed(genome, String(path))
+    endswith(lowercase(path), ".bed") && return load_bed(genome, String(path))
 
-    df = CSV.read(path, DataFrame)
-    for col in names(df)[2:end]
-        df[!, col] = convert.(T, df[!, col])
+    data_frame = CSV.read(path, DataFrame)
+    for col in names(data_frame)[2:end]
+        data_frame[!, col] = convert.(T, data_frame[!, col])
     end
-    tab = load_table(genome, df)
-    tab === nothing && throw(ArgumentError("Could not load tabular data from \"$path\"."))
-    return tab
+    table = load_table(genome, data_frame)
+    isnothing(table) && throw(ArgumentError("Could not load tabular data from \"$path\"."))
+    return table
 end
 
 """
@@ -167,8 +162,8 @@ struct Experiment{T<:Number}
         D = Union{TabularData{T},BedData}
         tasks = map(eachrow(sample_sheet)) do row
             path = String(row[end])
-            values = String[string(row[c]) for c = 1:nvars]
-            Threads.@spawn (values, _load_sample(T, genome, path))
+            variable_values = String[string(row[c]) for c = 1:nvars]
+            Threads.@spawn (variable_values, _load_sample(T, genome, path))
         end
         entries = Tuple{Vector{String},D}[fetch(task) for task in tasks]
 
@@ -183,74 +178,61 @@ Experiment(genome::Genome, sample_sheet::DataFrame) =
 #= Methods =#
 
 """
-NOTE: This functions assumes that the first column is a list of 
-sample IDs (e.g., gene accessions or transcript accessions)
-and that all other columns are of the same numeric type.
+Match a data frame's rows against `genome` by ID, returning a `TabularData`.
+
+The first column must hold sample IDs (e.g. gene or transcript accessions) and
+every other column must be numeric; `nothing` is returned (with a warning) when
+that does not hold. Rows whose ID matches no feature keep a `nothing` sample
+slot. The whole table is resolved in a single O(features) genome walk, which
+stops early once every row has matched.
 """
 function load_table(genome::Genome, data_frame::DataFrame)
-    sample_col_correct =
-        typeof(Vector(data_frame[!, 1])) <: Array{S,1} where {S<:AbstractString}
-    data_cols_correct =
-        [
-            typeof(Vector(data_frame[!, i])) <: Array{N,1} where {N<:Number} for
-            i = 2:ncol(data_frame)
-        ] |> all
-    if !(sample_col_correct && data_cols_correct)
-        if !sample_col_correct
-            @warn "Sample column incorrect format"
-        end
-        if !data_cols_correct
-            @warn "Data columns incorrect format"
-        end
-        return nothing
-    end
+    sample_col_correct = eltype(data_frame[!, 1]) <: AbstractString
+    data_cols_correct = all(eltype(data_frame[!, i]) <: Number for i = 2:ncol(data_frame))
+    sample_col_correct || @warn "Sample column incorrect format"
+    data_cols_correct || @warn "Data columns incorrect format"
+    (sample_col_correct && data_cols_correct) || return nothing
 
-    # (sample_id, original 1-based row index) for every row of the table.
-    sample_names = collect(zip(data_frame[!, 1], 1:nrow(data_frame)))
+    n_rows = nrow(data_frame)
 
     # Output vector, parallel to the table rows. A slot stays `nothing` if its
     # sample ID never matches any feature's metadata ID. A match stores the
     # scaffold name and the full interval (start/end coords + 64-bit metadata
     # code), so the feature type can be filtered out of these later without
     # re-reading the table.
-    samples = Vector{Union{Nothing,Tuple{String,IntervalValue{UInt32,UInt64}}}}(
-        nothing,
-        length(sample_names),
-    )
+    samples =
+        Vector{Union{Nothing,Tuple{String,IntervalValue{UInt32,UInt64}}}}(nothing, n_rows)
 
-    # Samples still awaiting a match: sample_id => original row index. Using a
-    # Dict makes each match an O(1) lookup + "pop", so the whole search is
-    # O(features) and can stop early once every sample has been matched.
-    remaining = Dict{String,UInt32}()
-    sizehint!(remaining, length(sample_names))
-    for (id, idx) in sample_names
-        remaining[String(id)] = UInt32(idx)
+    # Samples still awaiting a match: sample_id => original row index. Popping a
+    # match makes the whole search O(features) with an early exit.
+    remaining = Dict{String,Int}()
+    sizehint!(remaining, n_rows)
+    for (row, id) in enumerate(data_frame[!, 1])
+        remaining[String(id)] = row
     end
 
-    # Walk every feature of every scaffold (all feature types) and match each
-    # feature's metadata ID against the remaining samples.
     for (scaffold_name, scaffold) in genome.scaffolds
         isempty(remaining) && break
 
         for interval in scaffold.features
-            # The 32-bit metadata index links this interval back to its metadata.
-            meta_idx = Reference.parse_index(interval.value)
-            id = Reference.get_metadata_id(genome, meta_idx)
+            id = Reference.get_metadata_id(genome, Reference.parse_index(interval.value))
             isnothing(id) && continue
 
             row = get(remaining, id, nothing)
-            if row !== nothing
+            if !isnothing(row)
                 samples[row] = (scaffold_name, interval)
-                delete!(remaining, id)   # pop the matched sample
+                delete!(remaining, id)
                 isempty(remaining) && break
             end
         end
     end
 
-    variables = Vector{AbstractString}(names(data_frame)[2:end])
-    table = Matrix(data_frame[!, 2:end])
-
-    return TabularData(genome, variables, samples, table)
+    return TabularData(
+        genome,
+        Vector{AbstractString}(names(data_frame)[2:end]),
+        samples,
+        Matrix(data_frame[!, 2:end]),
+    )
 end
 
 #= TabularData indexing =#
@@ -259,8 +241,10 @@ end
 # matrix (e.g. `tab[2, 2]`, `tab[1:10, :]`).
 Base.getindex(t::TabularData, inds...) = getindex(t.table, inds...)
 
-# Resolve the ID of a single sample by looking its metadata up in `genome`.
-# Returns `nothing` for empty slots or features without metadata.
+"""
+Resolve the ID of a single sample by looking its metadata up in `genome`.
+Returns `nothing` for empty slots or features without metadata.
+"""
 function sample_id(
     genome::Genome,
     sample::Union{Nothing,Tuple{String,IntervalValue{UInt32,UInt64}}},
@@ -269,26 +253,24 @@ function sample_id(
     return Reference.get_metadata_id(genome, Reference.parse_index(sample[2].value))
 end
 
+# Rows of `t` whose sample ID satisfies `matches`, in table order.
+_matching_rows(t::TabularData, matches::F) where {F} =
+    findall(sample -> matches(sample_id(t.genome, sample)), t.samples)
+
+# `t` restricted to `rows`, sharing nothing mutable with the original.
+_subset(t::TabularData, rows::AbstractVector{Int}) =
+    TabularData(t.genome, copy(t.variables), t.samples[rows], t.table[rows, :])
+
 """
-Look up a single sample by its (putative) ID string. Every sample's ID is
-resolved from the table's own genome and compared to `id`; the first match is
-returned as a one-row `TabularData`. Returns `nothing` when no sample matches.
+Look up a single sample by its (putative) ID string, returning the first match
+as a one-row `TabularData`, or `nothing` when no sample matches.
 
 This is intentionally O(samples) per lookup (it resolves each sample's ID on
 demand) rather than maintaining an ID index.
 """
 function Base.getindex(t::TabularData, id::AbstractString)
-    for (row, sample) in enumerate(t.samples)
-        if sample_id(t.genome, sample) == id
-            return TabularData(
-                t.genome,
-                copy(t.variables),
-                t.samples[row:row],
-                t.table[row:row, :],
-            )
-        end
-    end
-    return nothing
+    row = findfirst(sample -> sample_id(t.genome, sample) == id, t.samples)
+    return isnothing(row) ? nothing : _subset(t, [row])
 end
 
 """
@@ -299,14 +281,7 @@ original table.
 """
 function Base.getindex(t::TabularData, ids::AbstractVector{<:AbstractString})
     wanted = Set{String}(ids)
-    rows = Int[]
-    for (row, sample) in enumerate(t.samples)
-        sid = sample_id(t.genome, sample)
-        if !isnothing(sid) && sid in wanted
-            push!(rows, row)
-        end
-    end
-    return TabularData(t.genome, copy(t.variables), t.samples[rows], t.table[rows, :])
+    return _subset(t, _matching_rows(t, id -> !isnothing(id) && id in wanted))
 end
 
 """
@@ -318,18 +293,10 @@ function DataFrames.select(
     t::TabularData,
     variables::Union{AbstractString,AbstractVector{<:AbstractString}},
 )::Union{Nothing,TabularData}
-    variables = variables isa AbstractString ? [variables] : variables
-    if variables ∩ t.variables |> isempty
-        return nothing
-    end
-
-    var_indices = findall(v -> v in variables, t.variables)
-    return TabularData(
-        t.genome,
-        t.variables[var_indices],
-        t.samples,
-        t.table[:, var_indices],
-    )
+    wanted = variables isa AbstractString ? [variables] : variables
+    columns = findall(in(wanted), t.variables)
+    isempty(columns) && return nothing
+    return TabularData(t.genome, t.variables[columns], t.samples, t.table[:, columns])
 end
 
 """
@@ -339,35 +306,30 @@ own genome; unmatched samples become `missing`), followed by one column per
 entry in `variables` carrying the corresponding `table` column.
 """
 function DataFrames.DataFrame(t::TabularData)
-    df = DataFrame()
-    df[!, :ID] =
+    data_frame = DataFrame()
+    data_frame[!, :ID] =
         Union{Missing,String}[something(sample_id(t.genome, s), missing) for s in t.samples]
-    for (j, variable) in enumerate(t.variables)
-        df[!, string(variable)] = t.table[:, j]
+    for (column, variable) in enumerate(t.variables)
+        data_frame[!, string(variable)] = t.table[:, column]
     end
-    return df
+    return data_frame
 end
+
+#= BED data =#
 
 """
-Bit layout for the 64-bit metadata code attached to each BED interval.
-Bits 33-40 encode strand using the same scheme as gene intervals in `Scaffold`.
+Pack a BED interval's strand into a 64-bit metadata code. Bits 33-40 hold the
+package-wide 2-bit strand code (see `BitCodes`); every other bit is reserved.
 
-|  64-57  |  56-41  | 40-33  |          32-1          |
-|---------|---------|--------|------------------------|
-| <NULL>  | <NULL>  | Strand |        <NULL>          |
-
-- Bits  1-32 : reserved
-- Bits 33-40 : strand, as the package-wide 2-bit strand codes (see `BitCodes`:
-  0 = `+`, 1 = `-`, 2 = both, 3 = unknown/NA)
-- Bits 41-64 : reserved
+|  64-41  | 40-33  |   32-1   |
+|---------|--------|----------|
+| <NULL>  | Strand |  <NULL>  |
 """
-function pack_bed_code(strand::UInt8)
-    return set_field(UInt64(0), strand, BED_STRAND_SHIFT, BED_STRAND_WIDTH)
-end
+pack_bed_code(strand::UInt8) =
+    set_field(UInt64(0), strand, BED_STRAND_SHIFT, BED_STRAND_WIDTH)
 
-function parse_bed_strand(code::UInt64)
-    return UInt8(get_field(code, BED_STRAND_SHIFT, BED_STRAND_WIDTH))
-end
+"""Extract the strand code from a BED interval's metadata code."""
+parse_bed_strand(code::UInt64) = UInt8(get_field(code, BED_STRAND_SHIFT, BED_STRAND_WIDTH))
 
 """
 Convert a BED record's strand field to the package-wide 2-bit strand code
@@ -378,43 +340,48 @@ function bed_record_strand(record::BED.Record)
     return strand_code(BED.strand(record))
 end
 
+"""
+Load a BED file (optionally gzipped) into a [`BedData`](@ref) associated with
+`genome`. BED's 0-based half-open coordinates are converted to the 1-based
+closed intervals used by gene features.
+"""
 function load_bed(genome::Genome, file_path::String)
     scaffolds = Dict{String,IntervalTreeM64}()
 
     open(file_path) do fh
-        rdr =
+        reader =
             endswith(file_path, ".gz") ? BED.Reader(GzipDecompressorStream(fh)) :
             BED.Reader(fh)
 
         record = BED.Record()
         try
-            while !eof(rdr)
+            while !eof(reader)
                 empty!(record)
-                read!(rdr, record)
+                read!(reader, record)
                 # Process if filled: handles both normal reads and the last record
                 # in files without a trailing newline (EOFError thrown after fill).
-                if BED.isfilled(record)
-                    # BED uses 0-based half-open [start, end) coordinates;
-                    # convert to 1-based closed [start, end] to match gene intervals.
-                    # from GFF3 files.
-                    chrom = BED.chrom(record)
-                    start_pos = UInt32(BED.chromstart(record))
-                    end_pos = UInt32(BED.chromend(record))
+                BED.isfilled(record) || continue
 
-                    strand = bed_record_strand(record)
-                    code = pack_bed_code(strand)
-
-                    tree = get!(IntervalTreeM64, scaffolds, chrom)
-                    push!(tree, IntervalValue(start_pos, end_pos, code))
-                end
+                code = pack_bed_code(bed_record_strand(record))
+                tree = get!(IntervalTreeM64, scaffolds, BED.chrom(record))
+                push!(
+                    tree,
+                    IntervalValue(
+                        UInt32(BED.chromstart(record)),
+                        UInt32(BED.chromend(record)),
+                        code,
+                    ),
+                )
             end
         finally
-            close(rdr)
+            close(reader)
         end
     end
 
     return BedData(genome, scaffolds)
 end
+
+#= Set operations on interval trees =#
 
 """
 Given two `IntervalTreeM64` trees 'a' and 'b', return the tree representing their intersection,
@@ -426,66 +393,56 @@ be present in the return tree multiple times in fragments).
 """
 function intersect(tree_a::IntervalTreeM64, tree_b::IntervalTreeM64)::IntervalTreeM64
     intersection = IntervalTreeM64()
-    itr = IntervalTrees.intersect(tree_a, tree_b)
-    for overlap in itr
-        a = overlap[1].first:overlap[1].last
-        b = overlap[2].first:overlap[2].last
-        a_x_b = Base.intersect(a, b)
-        new_interval = IntervalValue(first(a_x_b), last(a_x_b), overlap[1].value)
-        push!(intersection, new_interval)
+    for (left, right) in IntervalTrees.intersect(tree_a, tree_b)
+        push!(
+            intersection,
+            IntervalValue(
+                max(left.first, right.first),
+                min(left.last, right.last),
+                left.value,
+            ),
+        )
     end
     return intersection
 end
 
+"""
+Intersect the `feature`-type features of `scaffold` with the matching scaffold
+of `bed_data`. Returns `nothing` when the scaffold is absent from `bed_data` or
+`feature` is not a known SO term.
+"""
 function intersect(
     scaffold::Scaffold,
     bed_data::BedData,
     feature::Union{AbstractString,Symbol},
 )
-    if !haskey(bed_data.scaffolds, scaffold.name)
-        return nothing
-    end
+    tree = get(bed_data.scaffolds, scaffold.name, nothing)
+    isnothing(tree) && return nothing
     feature_intervals = get_feature(scaffold, feature)
-    if isnothing(feature_intervals)
-        return nothing
-    end
-    return intersect(feature_intervals, bed_data.scaffolds[scaffold.name])
+    isnothing(feature_intervals) && return nothing
+    return intersect(feature_intervals, tree)
 end
 
-function intersect(
-    genome::Genome,
-    bed_data::BedData,
-    feature::Union{AbstractString,Symbol},
-)::Dict{String,IntervalTreeM64}
-    scaffolds = Dict{String,IntervalTreeM64}()
-    for (scaffold_name, scaffold) in genome.scaffolds
-        if haskey(bed_data.scaffolds, scaffold_name)
-            intersect_result = intersect(scaffold, bed_data, feature)
-            if !isnothing(intersect_result)
-                scaffolds[scaffold_name] = intersect_result
-            end
-        end
-    end
-    return scaffolds
-end
-
+"""
+Intersect every feature of `scaffold` with the matching scaffold of `bed_data`.
+Returns `nothing` when the scaffold is absent from `bed_data`.
+"""
 function intersect(scaffold::Scaffold, bed_data::BedData)::Union{Nothing,IntervalTreeM64}
-    if !haskey(bed_data.scaffolds, scaffold.name)
-        return nothing
-    end
-
-    return intersect(scaffold.features, bed_data.scaffolds[scaffold.name])
+    tree = get(bed_data.scaffolds, scaffold.name, nothing)
+    isnothing(tree) && return nothing
+    return intersect(scaffold.features, tree)
 end
 
-function intersect(genome::Genome, bed_data::BedData)::Dict{String,IntervalTreeM64}
+"""
+Intersect `genome` with `bed_data` scaffold by scaffold, restricted to
+`feature`-type features when one is given. Scaffolds with no intersection are
+omitted from the result.
+"""
+function intersect(genome::Genome, bed_data::BedData, args...)::Dict{String,IntervalTreeM64}
     scaffolds = Dict{String,IntervalTreeM64}()
     for (scaffold_name, scaffold) in genome.scaffolds
-        if haskey(bed_data.scaffolds, scaffold_name)
-            intersect_result = intersect(scaffold, bed_data)
-            if !isnothing(intersect_result)
-                scaffolds[scaffold_name] = intersect_result
-            end
-        end
+        result = intersect(scaffold, bed_data, args...)
+        isnothing(result) || (scaffolds[scaffold_name] = result)
     end
     return scaffolds
 end
@@ -509,23 +466,17 @@ How intervals are matched is controlled by `on`:
 - `:interval`           : match only when both `first` and `last` are equal.
 """
 function leftjoin(treeL::IntervalTreeM64, treeR::IntervalTreeM64, on::Symbol = :metadata)
-    if on === :metadata
-        return _leftjoin(treeL, treeR, iv -> iv.value, UInt64)
-    elseif on === :start
-        return _leftjoin(treeL, treeR, iv -> iv.first, UInt32)
-    elseif on === :end
-        return _leftjoin(treeL, treeR, iv -> iv.last, UInt32)
-    elseif on === :interval
+    on === :metadata && return _leftjoin(treeL, treeR, iv -> iv.value, UInt64)
+    on === :start && return _leftjoin(treeL, treeR, iv -> iv.first, UInt32)
+    on === :end && return _leftjoin(treeL, treeR, iv -> iv.last, UInt32)
+    on === :interval &&
         return _leftjoin(treeL, treeR, iv -> (iv.first, iv.last), Tuple{UInt32,UInt32})
-    else
-        throw(
-            ArgumentError(
-                "`on` must be one of :metadata, :start, :end, :interval (got :$on)",
-            ),
-        )
-    end
+    throw(
+        ArgumentError("`on` must be one of :metadata, :start, :end, :interval (got :$on)"),
+    )
 end
 
+# Left-join `treeL` against `treeR` on `keyfn`, whose return type is `KT`.
 function _leftjoin(
     treeL::IntervalTreeM64,
     treeR::IntervalTreeM64,
@@ -536,17 +487,17 @@ function _leftjoin(
 
     # Index the right tree by join key: key => right intervals sharing that key.
     right_index = Dict{KT,Vector{IV}}()
-    for r in treeR
-        push!(get!(() -> IV[], right_index, keyfn(r)), r)
+    for right in treeR
+        push!(get!(() -> IV[], right_index, keyfn(right)), right)
     end
 
     # For each left interval, emit one tuple per matching right interval, or a
     # single `(left, nothing)` tuple when there is no match. `flatten` keeps the
     # whole thing lazy.
     return Iterators.flatten(
-        let matches = get(right_index, keyfn(l), nothing)
-            matches === nothing ? ((l, nothing),) : ((l, r) for r in matches)
-        end for l in treeL
+        let matches = get(right_index, keyfn(left), nothing)
+            isnothing(matches) ? ((left, nothing),) : ((left, right) for right in matches)
+        end for left in treeL
     )
 end
 
@@ -557,13 +508,11 @@ that each base is covered by at most one resulting segment.
 """
 function merge_segments(tree::IntervalTreeM64)
     segments = Tuple{Int,Int}[]
-    ivs = sort!([(Int(iv.first), Int(iv.last)) for iv in tree])
-    for (s, e) in ivs
-        if !isempty(segments) && s <= segments[end][2]
-            last_s, last_e = segments[end]
-            segments[end] = (last_s, max(last_e, e))
+    for (start_pos, end_pos) in sort!([(Int(iv.first), Int(iv.last)) for iv in tree])
+        if !isempty(segments) && start_pos <= segments[end][2]
+            segments[end] = (segments[end][1], max(segments[end][2], end_pos))
         else
-            push!(segments, (s, e))
+            push!(segments, (start_pos, end_pos))
         end
     end
     return segments
@@ -577,8 +526,8 @@ function Base.show(io::IO, b::BedData)
 end
 
 function Base.show(io::IO, t::TabularData)
-    r, c = size(t.table)
-    print(io, "TabularData($(r)×$(c) $(eltype(t.table)))")
+    rows, columns = size(t.table)
+    print(io, "TabularData($(rows)×$(columns) $(eltype(t.table)))")
 end
 
 export BedData,

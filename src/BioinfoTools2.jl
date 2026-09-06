@@ -24,4 +24,5 @@ using .Modeling
 # `Methylation` is nested inside `Data`, but re-exported here as well so it can
 # still be reached (and `using`d) as `BioinfoTools2.Methylation`.
 export BitCodes, Data, Reference, Methylation, Paralogs, Plotting, Exploration, Modeling
+
 end

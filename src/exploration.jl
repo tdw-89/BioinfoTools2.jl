@@ -3,7 +3,6 @@ module Exploration
 # Scoped, not a blanket `using DataFrames` — that would also pull in
 # `DataFrames.leftjoin`, colliding with `Data.leftjoin` used by `coverage`.
 using DataFrames: DataFrame, nrow
-using Distributions
 using Interpolations
 using KernelDensity
 using SparseArrays
@@ -17,6 +16,8 @@ using ..Data
 # has no use for.
 using ..Data.Methylation:
     MethylationData, CTX_CPG, find_calls_in_range, get_context, get_depth, meth_fraction
+
+#= Per-feature coverage =#
 
 """
     coverage(data::BedData, feature; filter_zeros = false)
@@ -32,38 +33,31 @@ are omitted. Set `filter_zeros = true` to drop the uncovered (`0.0`) entries.
 """
 function coverage(
     data::BedData,
-    feature::Union{String,Symbol};
+    feature::Union{AbstractString,Symbol};
     filter_zeros::Bool = false,
 )::Dict{String,Vector{Float64}}
-
     intersection = Data.intersect(data.genome, data, feature)
     scaffolds = Dict{String,Vector{Float64}}()
-    for (scaffold_name, scaffold) in data.genome.scaffolds
-        if !haskey(intersection, scaffold_name)
-            continue
-        end
 
-        left_tree = scaffold.features
-        right_tree = intersection[scaffold_name]
-        iter = leftjoin(left_tree, right_tree)
-        frac_coverage = Float64[]
-        sizehint!(frac_coverage, length(left_tree))
-        for pair in iter
-            if isnothing(pair[2])
-                push!(frac_coverage, 0)
+    for (scaffold_name, scaffold) in data.genome.scaffolds
+        haskey(intersection, scaffold_name) || continue
+
+        feature_tree = scaffold.features
+        fractions = Float64[]
+        sizehint!(fractions, length(feature_tree))
+        for (whole, covered) in leftjoin(feature_tree, intersection[scaffold_name])
+            if isnothing(covered)
+                push!(fractions, 0.0)
             else
-                length_subject = pair[1].last - pair[1].first + 1
-                length_object = pair[2].last - pair[2].first + 1
-                @assert length_subject >= length_object
-                push!(frac_coverage, length_object / length_subject)
+                feature_length = whole.last - whole.first + 1
+                covered_length = covered.last - covered.first + 1
+                @assert feature_length >= covered_length
+                push!(fractions, covered_length / feature_length)
             end
         end
 
-        if filter_zeros
-            frac_coverage = frac_coverage |> filter(x -> x != 0)
-        end
-
-        scaffolds[scaffold_name] = frac_coverage
+        filter_zeros && filter!(!iszero, fractions)
+        scaffolds[scaffold_name] = fractions
     end
     return scaffolds
 end
@@ -77,9 +71,8 @@ Return, per scaffold, the mean per-base methylation level of each
 Each feature is scored by summing the methylation fraction of every call inside
 `[first, last]` and dividing by the feature's length, giving a value in
 `[0, 1]` on the same scale as the [`BedData`](@ref) method. **Bases with no call
-count as zero**: cytosines are sparse, so a score reflects methylation level and
-cytosine density together, not level alone. Calls are summed regardless of
-strand and context.
+count as zero**, so a score reflects methylation level and cytosine density
+together, not level alone. Calls are summed regardless of strand and context.
 
 Results are returned as a `Dict` mapping scaffold name to its vector of scores;
 scaffolds absent from `data` are omitted. Set `filter_zeros = true` to drop
@@ -91,32 +84,42 @@ function coverage(
     feature::Union{AbstractString,Symbol};
     filter_zeros::Bool = false,
 )::Dict{String,Vector{Float64}}
-
-    feature_intervals = get_feature(genome, feature)
     scaffolds = Dict{String,Vector{Float64}}()
-    for (scaffold_name, tree) in feature_intervals
+
+    for (scaffold_name, tree) in get_feature(genome, feature)
         haskey(data, scaffold_name) || continue
         calls = data[scaffold_name]
 
         mean_levels = Float64[]
         sizehint!(mean_levels, length(tree))
         for interval in tree
-            feature_length = Int(interval.last) - Int(interval.first) + 1
             total_fraction = 0.0
             for call in find_calls_in_range(calls, interval.first, interval.last)
                 fraction = meth_fraction(call)
                 # `meth_fraction` is NaN for a site with no coverage at all.
                 isnan(fraction) || (total_fraction += fraction)
             end
-            push!(mean_levels, total_fraction / feature_length)
+            push!(
+                mean_levels,
+                total_fraction / (Int(interval.last) - Int(interval.first) + 1),
+            )
         end
 
-        if filter_zeros
-            mean_levels = filter(!iszero, mean_levels)
-        end
+        filter_zeros && filter!(!iszero, mean_levels)
         scaffolds[scaffold_name] = mean_levels
     end
     return scaffolds
+end
+
+#= Density estimates =#
+
+# Fit a KDE to each scaffold's vector, mapping scaffolds with nothing to fit to
+# `nothing`.
+function _kde_by_scaffold(by_scaffold::Dict{String,Vector{Float64}})
+    return Dict{String,Union{Nothing,UnivariateKDE}}(
+        name => isempty(scores) ? nothing : KernelDensity.kde(scores) for
+        (name, scores) in by_scaffold
+    )
 end
 
 """
@@ -129,15 +132,8 @@ fit to each scaffold's vector of fractions. Returns a `Dict` mapping scaffold
 name to a `UnivariateKDE`, or to `nothing` when the scaffold has no fractions to
 fit (for example when `filter_zeros` removed them all).
 """
-function kde(data::BedData, feature::Union{String,Symbol}; filter_zeros::Bool = false)
-    frac_coverage = coverage(data, feature, filter_zeros = filter_zeros)
-    coverage_kde = Dict{String,Union{Nothing,UnivariateKDE}}()
-    for k in keys(frac_coverage)
-        coverage_kde[k] =
-            isempty(frac_coverage[k]) ? nothing : KernelDensity.kde(frac_coverage[k])
-    end
-    return coverage_kde
-end
+kde(data::BedData, feature::Union{AbstractString,Symbol}; filter_zeros::Bool = false) =
+    _kde_by_scaffold(coverage(data, feature; filter_zeros = filter_zeros))
 
 """
     kde(genome, data::MethylationData, feature; filter_zeros = false)
@@ -150,41 +146,57 @@ uncovered bases counted as zero — and a kernel density estimate is fit to each
 scaffold's vector. Returns a `Dict` mapping scaffold name to a `UnivariateKDE`,
 or to `nothing` when the scaffold has nothing to fit.
 """
-function kde(
+kde(
     genome::Genome,
     data::MethylationData,
     feature::Union{AbstractString,Symbol};
     filter_zeros::Bool = false,
-)
-    mean_levels = coverage(genome, data, feature; filter_zeros = filter_zeros)
-    level_kde = Dict{String,Union{Nothing,UnivariateKDE}}()
-    for (scaffold_name, levels) in mean_levels
-        level_kde[scaffold_name] = isempty(levels) ? nothing : KernelDensity.kde(levels)
-    end
-    return level_kde
-end
+) = _kde_by_scaffold(coverage(genome, data, feature; filter_zeros = filter_zeros))
 
+"""
+    kde(data::TabularData; filter_zeros = false, transform = identity)
+
+Estimate the distribution of every value in `data`'s table, after applying
+`transform`. Non-finite values are dropped, as are zeros when
+`filter_zeros = true`. Returns `nothing` when nothing is left to fit.
+"""
 function kde(data::TabularData; filter_zeros::Bool = false, transform::Function = identity)
-    flat = data.table |> vec |> xs -> map(transform, xs)
-    if filter_zeros
-        flat = filter(x -> x != 0, flat)
-    end
-    flat = filter(x -> !isnan(x) && isfinite(x), flat)
+    flat = [transform(value) for value in data.table]
+    filter!(value -> isfinite(value) && !(filter_zeros && iszero(value)), flat)
     return isempty(flat) ? nothing : KernelDensity.kde(flat)
 end
 
-# Assign `value` to a 1-based bin in `1:quantiles` given the sorted quantile
-# `edges` (length `quantiles + 1`). Values landing on an edge fall into the
-# lower bin; anything at or above the top edge lands in the last bin.
-function _quantile_bin(edges::AbstractVector, value::Real, quantiles::Int)
-    for i = 1:quantiles
-        value <= edges[i+1] && return i
-    end
-    return quantiles
+#= Quantile binning =#
+
+# Assign `value` to a 1-based bin in `1:n_bins` given the sorted quantile `edges`
+# (length `n_bins + 1`). Values landing on an edge fall into the lower bin;
+# anything at or above the top edge lands in the last bin.
+_quantile_bin(edges::AbstractVector, value::Real, n_bins::Int) =
+    min(searchsortedfirst(view(edges, 2:lastindex(edges)), value), n_bins)
+
+# Validate the arguments the rank-based `quantiles` methods share. `noun` names
+# what `ranking` selects, for the error message.
+function _check_ranking(n_bins::Int, ranking::Vector{String}, noun::String)
+    n_bins >= 1 ||
+        throw(ArgumentError("`quantiles` must be a positive integer (got $n_bins)"))
+    isempty(ranking) && throw(ArgumentError("`ranking` must name at least one $noun"))
+    return nothing
+end
+
+# Sort `ranking_keys` — tuples of ranking values with the original row index
+# last — and return `(row, bin)` pairs in ranked order, cutting the ranking into
+# `n_bins` equal-sized (up to an off-by-one) bins.
+function _ranked_bins(ranking_keys::Vector, n_bins::Int)
+    sort!(ranking_keys)
+    n_rows = length(ranking_keys)
+    return [
+        (key[end]::Int, cld(rank_pos * n_bins, n_rows)) for
+        (rank_pos, key) in enumerate(ranking_keys)
+    ]
 end
 
 """
-    quantiles(genome, data::TabularData; quantiles = 4, merge = mean)
+    quantiles(data::TabularData; quantiles = 4, merge = mean)
 
 Assign each sample in `data` to one of `quantiles` bins by a scalar summary of
 its row.
@@ -193,7 +205,7 @@ Each matched sample's row is collapsed to a number with `merge` (default
 `mean`); those values define `quantiles + 1` quantile edges, and every sample is
 placed in a 1-based bin (`1` = lowest values). Returns a flat vector of
 `(FeatureRecord, merged_value, quantile_index)` tuples, in the sample order of
-`data`. The `FeatureRecord` is looked up in `genome` by the sample's 32-bit
+`data`. The `FeatureRecord` is looked up in `data.genome` by the sample's 32-bit
 metadata index; unmatched samples and unresolvable features are skipped.
 
 # Keyword arguments
@@ -208,7 +220,7 @@ function quantiles(data::TabularData; quantiles::Int = 4, merge = mean)
     indices = UInt32[]
     merged = Float64[]
     for (row, sample) in enumerate(data.samples)
-        sample === nothing && continue
+        isnothing(sample) && continue
         push!(indices, Reference.parse_index(sample[2].value))
         push!(merged, Float64(merge(data.table[row, :])))
     end
@@ -223,9 +235,9 @@ function quantiles(data::TabularData; quantiles::Int = 4, merge = mean)
     # O(rows * features).
     records = data.genome[indices]
 
-    for (meta_idx, value) in zip(indices, merged)
-        record = get(records, meta_idx, nothing)
-        record === nothing && continue
+    for (meta_index, value) in zip(indices, merged)
+        record = get(records, meta_index, nothing)
+        isnothing(record) && continue
         push!(result, (record, value, _quantile_bin(edges, value, quantiles)))
     end
 
@@ -241,41 +253,39 @@ remaining tie broken by original sample order — then cut that ranking into
 `quantiles` equal-sized (up to an off-by-one) bins.
 
 Returns a flat vector of `(FeatureRecord, quantile_index)` tuples, in ranked
-order. The `FeatureRecord` is looked up in `genome` by the sample's 32-bit
+order. The `FeatureRecord` is looked up in `data.genome` by the sample's 32-bit
 metadata index; unmatched samples and unresolvable features are skipped, but
 (like every matched sample) still occupy a rank position and so still affect
 bin sizing.
 """
 function quantiles(data::TabularData, ranking::Vector{String}; quantiles::Int = 4)
-    quantiles >= 1 ||
-        throw(ArgumentError("`quantiles` must be a positive integer (got $quantiles)"))
-    isempty(ranking) && throw(ArgumentError("`ranking` must name at least one variable"))
+    _check_ranking(quantiles, ranking, "variable")
 
-    col_indices = map(ranking) do name
-        idx = findfirst(==(name), data.variables)
-        idx === nothing && throw(ArgumentError("Unknown ranking variable: \"$name\""))
-        idx
+    columns = map(ranking) do name
+        column = findfirst(==(name), data.variables)
+        isnothing(column) && throw(ArgumentError("Unknown ranking variable: \"$name\""))
+        column
     end
 
     # Matched samples only; the row index itself is the final tie-break.
     rows = findall(!isnothing, data.samples)
-    n = length(rows)
-    n == 0 && return Tuple{FeatureRecord,Int}[]
-
-    keyed = sort([(Tuple(data.table[row, c] for c in col_indices)..., row) for row in rows])
+    isempty(rows) && return Tuple{FeatureRecord,Int}[]
+    ranked = _ranked_bins(
+        [(Tuple(data.table[row, c] for c in columns)..., row) for row in rows],
+        quantiles,
+    )
 
     # Resolve every ranked sample's feature in one genome walk; a lookup per rank
     # position would be O(rows * features).
     meta_indices =
-        UInt32[Reference.parse_index(data.samples[key[end]][2].value) for key in keyed]
+        UInt32[Reference.parse_index(data.samples[row][2].value) for (row, _) in ranked]
     records = data.genome[meta_indices]
 
     result = Tuple{FeatureRecord,Int}[]
-    sizehint!(result, n)
-    for (rank_pos, meta_idx) in enumerate(meta_indices)
-        record = get(records, meta_idx, nothing)
-        record === nothing && continue
-        push!(result, (record, cld(rank_pos * quantiles, n)))
+    sizehint!(result, length(ranked))
+    for (meta_index, (_, bin)) in zip(meta_indices, ranked)
+        record = get(records, meta_index, nothing)
+        isnothing(record) || push!(result, (record, bin))
     end
     return result
 end
@@ -293,19 +303,20 @@ Returns `pairs` with a `"quantile"` column appended (1-based bin number); row
 order is unchanged.
 """
 function quantiles(pairs::DataFrame, ranking::Vector{String}; quantiles::Int = 4)
-    quantiles >= 1 ||
-        throw(ArgumentError("`quantiles` must be a positive integer (got $quantiles)"))
-    isempty(ranking) && throw(ArgumentError("`ranking` must name at least one column"))
+    _check_ranking(quantiles, ranking, "column")
     for name in ranking
         name in names(pairs) || throw(ArgumentError("Unknown ranking column: \"$name\""))
     end
 
-    n = nrow(pairs)
-    bins = Vector{Int}(undef, n)
-    if n > 0
-        order = sort([(Tuple(pairs[row, name] for name in ranking)..., row) for row = 1:n])
-        for (rank_pos, key) in enumerate(order)
-            bins[key[end]] = cld(rank_pos * quantiles, n)
+    n_rows = nrow(pairs)
+    bins = Vector{Int}(undef, n_rows)
+    if n_rows > 0
+        ranked = _ranked_bins(
+            [(Tuple(pairs[row, name] for name in ranking)..., row) for row = 1:n_rows],
+            quantiles,
+        )
+        for (row, bin) in ranked
+            bins[row] = bin
         end
     end
 
@@ -314,31 +325,34 @@ function quantiles(pairs::DataFrame, ranking::Vector{String}; quantiles::Int = 4
     return result
 end
 
+#= Genome-wide coverage frequency =#
+
 """
-Given a set of `BedData` measurements, compute how many of them cover each base
-of the genome. The genome is returned as a dictionary keyed by scaffold name,
-whose values are sparse arrays holding the per-base frequency (length = the
-largest interval end seen on that scaffold).
+    calculate_frequency(measurements; merge = true)
+
+Count how many of the `BedData` `measurements` cover each base of the genome,
+returning a `Dict` mapping scaffold name to a `SparseVector` of per-base
+frequencies (length = the largest interval end seen on that scaffold).
 
 When `merge` is `true` (the default), overlapping intervals *within a single
-measurement* are merged first (via [`merge_segments`](@ref)), so each measurement
-contributes at most 1 to a given base and the maximum possible value is the
-number of measurements. Set `merge = false` to skip this step when the intervals
-are already disjoint (e.g. ChIP-seq peak calls), in which case any within-measurement
-overlaps will stack.
+measurement* are merged first (via [`merge_segments`](@ref)), so each
+measurement contributes at most 1 to a given base and the maximum possible value
+is the number of measurements. Set `merge = false` to skip this step when the
+intervals are already disjoint (e.g. ChIP-seq peak calls), in which case any
+within-measurement overlaps will stack.
 
 The element type is chosen to fit the measurement count: `UInt8` for up to 255
 measurements and `UInt16` for up to 65535. More measurements raise an error.
 """
 function calculate_frequency(measurements::Vector{BedData}; merge::Bool = true)
-    n = length(measurements)
-    T = if n <= typemax(UInt8)
+    n_measurements = length(measurements)
+    T = if n_measurements <= typemax(UInt8)
         UInt8
-    elseif n <= typemax(UInt16)
+    elseif n_measurements <= typemax(UInt16)
         UInt16
     else
         error(
-            "calculate_frequency supports at most $(Int(typemax(UInt16))) BedData measurements (received $n)",
+            "calculate_frequency supports at most $(Int(typemax(UInt16))) BedData measurements (received $n_measurements)",
         )
     end
 
@@ -346,10 +360,8 @@ function calculate_frequency(measurements::Vector{BedData}; merge::Bool = true)
     # needs an indexable collection, so collect the set into a vector.
     scaffold_names = String[]
     seen = Set{String}()
-    for measurement in measurements
-        for name in keys(measurement.scaffolds)
-            name in seen || (push!(seen, name); push!(scaffold_names, name))
-        end
+    for measurement in measurements, name in keys(measurement.scaffolds)
+        name in seen || (push!(seen, name); push!(scaffold_names, name))
     end
 
     # Pre-populate every key so the parallel loop only overwrites existing
@@ -362,41 +374,47 @@ function calculate_frequency(measurements::Vector{BedData}; merge::Bool = true)
         # Difference array: +1 where a segment starts, -1 just past its end. The
         # running total while sweeping left-to-right is the per-base frequency
         # across measurements.
-        deltas = Dict{Int,Int}()
-        scaffold_len = 0
+        events = Tuple{Int,Int}[]
+        scaffold_length = 0
 
         for measurement in measurements
-            haskey(measurement.scaffolds, name) || continue
-            tree = measurement.scaffolds[name]
+            tree = get(measurement.scaffolds, name, nothing)
+            isnothing(tree) && continue
             segments =
                 merge ? merge_segments(tree) :
                 [(Int(iv.first), Int(iv.last)) for iv in tree]
-            for (s, e) in segments
-                deltas[s] = get(deltas, s, 0) + 1
-                deltas[e+1] = get(deltas, e + 1, 0) - 1
-                scaffold_len = max(scaffold_len, e)
+            for (start_pos, end_pos) in segments
+                push!(events, (start_pos, 1))
+                push!(events, (end_pos + 1, -1))
+                scaffold_length = max(scaffold_length, end_pos)
             end
         end
 
-        isempty(deltas) && continue
+        isempty(events) && continue
+        sort!(events)
 
         # Sweep the breakpoints in order, emitting a value for every covered base.
-        breakpoints = sort!(collect(keys(deltas)))
         indices = Int[]
-        values = T[]
-        coverage = 0
-        for k in eachindex(breakpoints)
-            p = breakpoints[k]
-            coverage += deltas[p]
-            if coverage > 0 && k < length(breakpoints)
-                for base = p:(breakpoints[k+1]-1)
+        counts = T[]
+        depth = 0
+        event = 1
+        n_events = length(events)
+        while event <= n_events
+            position = events[event][1]
+            while event <= n_events && events[event][1] == position
+                depth += events[event][2]
+                event += 1
+            end
+            # The final breakpoint always closes the last segment (depth 0).
+            if depth > 0 && event <= n_events
+                for base = position:(events[event][1]-1)
                     push!(indices, base)
-                    push!(values, T(coverage))
+                    push!(counts, T(depth))
                 end
             end
         end
 
-        genome[name] = sparsevec(indices, values, scaffold_len)
+        genome[name] = sparsevec(indices, counts, scaffold_length)
     end
 
     return genome
@@ -409,8 +427,7 @@ together with the number of measurements (`n`) they were computed from.
 `features` maps a feature ID to a `SparseVector{UInt32}` of raw overlap counts —
 one entry per base of the (flanked) feature, oriented in the direction of
 transcription (index 1 is the feature's 5' end). Dividing a count by `n` gives
-the fraction of measurements covering that base; the raw count is kept so it can
-be stored exactly in 32 bits.
+the fraction of measurements covering that base.
 """
 struct FeatureFrequency
     n::Int
@@ -426,10 +443,9 @@ Project a per-base `frequency` dictionary (as returned by
 For each feature, the padded region `[first - flank, last + flank]` is sliced out
 of its scaffold's frequency vector and re-indexed to a 1-based position within
 the region. Features on the negative strand are reversed so index 1 always lands
-at the feature's 5' end. The result is returned as a [`FeatureFrequency`](@ref):
-a mapping from feature ID to a `SparseVector{UInt32}` of raw overlap counts, plus
-the measurement count `n` so per-base frequencies can be recovered by division.
-Features whose metadata ID cannot be resolved are skipped.
+at the feature's 5' end. The result is returned as a [`FeatureFrequency`](@ref),
+carrying the measurement count `n` so per-base frequencies can be recovered by
+division. Features whose metadata ID cannot be resolved are skipped.
 """
 function feature_frequency(
     genome::Genome,
@@ -438,44 +454,45 @@ function feature_frequency(
     n::Integer;
     flank::Integer = 500,
 )
-    feature_intervals = get_feature(genome, feature)
     features = Dict{String,SparseVector{UInt32,Int}}()
 
-    for (scaffold, tree) in feature_intervals
-        counts = get(frequency, scaffold, nothing)
+    for (scaffold_name, tree) in get_feature(genome, feature)
+        counts = get(frequency, scaffold_name, nothing)
         # Nonzero (base, count) pairs for this scaffold, ascending by position.
-        nzi, nzv = counts === nothing ? (Int[], UInt32[]) : findnz(counts)
+        base_indices, base_counts = isnothing(counts) ? (Int[], UInt32[]) : findnz(counts)
 
-        for iv in tree
-            code = iv.value
+        for interval in tree
+            code = interval.value
             feature_id = Reference.get_metadata_id(genome, Reference.parse_index(code))
-            feature_id === nothing && continue
+            isnothing(feature_id) && continue
             negative = Reference.parse_strand(code) == get_strand('-')
 
-            region_start = max(1, Int(iv.first) - flank)
-            region_end = Int(iv.last) + flank
-            region_len = region_end - region_start + 1
+            region_start = max(1, Int(interval.first) - flank)
+            region_end = Int(interval.last) + flank
 
             # Slice of nonzero bases falling inside the padded region.
-            lo = searchsortedfirst(nzi, region_start)
-            hi = searchsortedlast(nzi, region_end)
-            len = max(hi - lo + 1, 0)
-            idxs = Vector{Int}(undef, len)
-            vals = Vector{UInt32}(undef, len)
-            for (j, k) in enumerate(lo:hi)
-                base = nzi[k]
+            first_entry = searchsortedfirst(base_indices, region_start)
+            last_entry = searchsortedlast(base_indices, region_end)
+            n_entries = max(last_entry - first_entry + 1, 0)
+            indices = Vector{Int}(undef, n_entries)
+            counts_in_region = Vector{UInt32}(undef, n_entries)
+            for (slot, entry) in enumerate(first_entry:last_entry)
+                base = base_indices[entry]
                 # Map genomic base to a 1-based position within the region,
                 # reversing for negative-strand features so index 1 stays at the
                 # 5' end.
-                idxs[j] = negative ? region_end - base + 1 : base - region_start + 1
-                vals[j] = UInt32(nzv[k])
+                indices[slot] = negative ? region_end - base + 1 : base - region_start + 1
+                counts_in_region[slot] = UInt32(base_counts[entry])
             end
-            features[feature_id] = sparsevec(idxs, vals, region_len)
+            features[feature_id] =
+                sparsevec(indices, counts_in_region, region_end - region_start + 1)
         end
     end
 
     return FeatureFrequency(n, features)
 end
+
+#= Per-feature methylation levels =#
 
 """
 Minimum read depth a call must have to enter a methylation profile. Shallow
@@ -489,15 +506,11 @@ const DEFAULT_MIN_DEPTH = UInt32(5)
 
 Turn a read depth into the statistical weight the profile functions give it, by
 applying `weight_transform` (`identity` for linear weighting, `log`, `sqrt`, …).
+The depth is converted to `Float64` first, since depths are stored unsigned.
 
-The depth is converted to `Float64` before the transform sees it: depths are
-stored unsigned, where an expression as ordinary as `-depth` would wrap to a
-huge positive number instead of going negative.
-
-Throws an `ArgumentError` for a weight that is negative or not finite, which
-would otherwise silently corrupt a weighted mean. Note that a transform may
-legitimately return `0` — `log(1) == 0` — which drops that observation; prefer
-`log1p` over `log` unless that is what you want.
+Throws an `ArgumentError` for a weight that is negative or not finite. Note that
+a transform may legitimately return `0` — `log(1) == 0` — which drops that
+observation; prefer `log1p` over `log` unless that is what you want.
 """
 @inline function weight_of(depth::Real, weight_transform)
     weight = Float64(weight_transform(Float64(depth)))
@@ -527,11 +540,11 @@ end
 Per-feature, per-base methylation levels, together with the filters they were
 built under.
 
-The methylation counterpart of [`FeatureFrequency`](@ref). It is a separate type
-because the two carry different quantities: `FeatureFrequency` holds overlap
-*counts* to be divided by a measurement count, whereas this holds a *level* per
-base plus the depth it rests on, and needs to distinguish an unmeasured base
-from one measured at zero.
+The methylation counterpart of [`FeatureFrequency`](@ref), kept separate because
+the two carry different quantities: `FeatureFrequency` holds overlap *counts* to
+be divided by a measurement count, whereas this holds a *level* per base plus
+the depth it rests on, and must distinguish an unmeasured base from one measured
+at zero.
 """
 struct MethylationFrequency
     min_depth::UInt32
@@ -569,24 +582,21 @@ function feature_frequency(
     context::Union{Nothing,Integer} = CTX_CPG,
 )
     min_depth_bits = UInt32(min_depth)
-    context_bits = context === nothing ? nothing : UInt8(context)
-
-    feature_intervals = get_feature(genome, feature)
+    context_bits = isnothing(context) ? nothing : UInt8(context)
     features = Dict{String,FeatureLevels}()
 
-    for (scaffold_name, tree) in feature_intervals
+    for (scaffold_name, tree) in get_feature(genome, feature)
         haskey(data, scaffold_name) || continue
         calls = data[scaffold_name]
 
         for interval in tree
             code = interval.value
             feature_id = Reference.get_metadata_id(genome, Reference.parse_index(code))
-            feature_id === nothing && continue
+            isnothing(feature_id) && continue
             negative = Reference.parse_strand(code) == get_strand('-')
 
             region_start = Int(interval.first) - flank
             region_end = Int(interval.last) + flank
-            region_length = region_end - region_start + 1
 
             region_calls = find_calls_in_range(calls, max(1, region_start), region_end)
             indices = Int[]
@@ -606,9 +616,7 @@ function feature_frequency(
                     index += 1
                     depth = get_depth(call)
                     depth < min_depth_bits && continue
-                    context_bits === nothing ||
-                        get_context(call) == context_bits ||
-                        continue
+                    isnothing(context_bits) || get_context(call) == context_bits || continue
                     fraction = meth_fraction(call)
                     isnan(fraction) && continue
                     # Always linear in depth: this pools reads at one cytosine
@@ -628,6 +636,7 @@ function feature_frequency(
                 push!(weight_values, UInt32(min(depth_total, Int(typemax(UInt32)))))
             end
 
+            region_length = region_end - region_start + 1
             features[feature_id] = FeatureLevels(
                 sparsevec(indices, level_values, region_length),
                 sparsevec(indices, weight_values, region_length),
@@ -637,6 +646,8 @@ function feature_frequency(
 
     return MethylationFrequency(min_depth_bits, context_bits, features)
 end
+
+#= Metagene profiles =#
 
 """
 Iterate the `(position, count)` pairs of `counts` that could contribute a nonzero
@@ -649,6 +660,21 @@ _nonzero_bases(counts::SparseVector) =
 
 _nonzero_bases(counts::AbstractVector) =
     ((base, count) for (base, count) in enumerate(counts) if count != 0)
+
+# Position in a `2 * flank + body_bins` profile that base `base` of a
+# `2 * flank + body_length` region falls in. Flanks stay per base; a body base
+# is mapped by `body_slot`, which either interpolates or bins it.
+@inline function _profile_slot(
+    base::Int,
+    flank::Int,
+    body_length::Int,
+    body_slot::F,
+) where {F}
+    base <= flank && return base
+    # Past the body: shift by however much the body shrank.
+    base > flank + body_length && return base - body_length
+    return -1
+end
 
 """
     gene_profile(counts, n_measurements; flank = 500, body_bins = 100)
@@ -663,10 +689,9 @@ than `2 * flank + 2` (no room for a body of at least two bases).
 `counts` is typically a `SparseVector` from [`FeatureFrequency`](@ref) holding a
 few thousand nonzeros in a region tens of kilobases long, and most features carry
 none at all, so only the stored entries are visited and the body is materialised
-densely only when one falls inside it — densifying the whole region per feature
-costs gigabytes across a genome. Positions with no count take
-`0.0 / n_measurements`, not a literal zero, because the dense predecessor divided
-before anything could mask an `n_measurements` of `0`.
+densely only when one falls inside it. Positions with no count take
+`0.0 / n_measurements`, which is `NaN` rather than `0.0` when `n_measurements`
+is `0`.
 """
 function gene_profile(
     counts::AbstractVector,
@@ -685,8 +710,8 @@ function gene_profile(
     unmeasured = 0.0 / n_measurements
     profile = fill(unmeasured, 2 * flank + body_bins)
     # Allocated on the first count landing in the body, and left `nothing` when
-    # none does — an all-zero body interpolates to all-zero (or all-`NaN`) whatever
-    # its length, so the fill above already holds the answer.
+    # none does — an all-zero body interpolates to the fill above whatever its
+    # length.
     body = nothing
 
     for (base, count) in _nonzero_bases(counts)
@@ -697,12 +722,12 @@ function gene_profile(
             # Past the body: shift by however much the body shrank.
             profile[base-body_length+body_bins] = frequency
         else
-            body === nothing && (body = fill(unmeasured, body_length))
+            isnothing(body) && (body = fill(unmeasured, body_length))
             body[base-flank] = frequency
         end
     end
 
-    if body !== nothing
+    if !isnothing(body)
         binned = linear_interpolation(range(0, 1; length = body_length), body).(
             range(0, 1; length = body_bins),
         )
@@ -748,18 +773,33 @@ function gene_profile(
     region_length = length(feature_levels.levels)
     region_length < 2 * flank + 2 && return nothing
 
-    profile_levels = zeros(Float64, 2 * flank + body_bins)
-    profile_weights = zeros(Float64, 2 * flank + body_bins)
-    weighted_sums = zeros(Float64, 2 * flank + body_bins)
+    n_slots = 2 * flank + body_bins
+    profile_levels = zeros(Float64, n_slots)
+    profile_weights = zeros(Float64, n_slots)
+    weighted_sums = zeros(Float64, n_slots)
 
     body_length = region_length - 2 * flank
-    nonzero_indices, nonzero_weights = findnz(feature_levels.weights)
+    weight_bases, base_weights = findnz(feature_levels.weights)
+    level_bases, base_levels = findnz(feature_levels.levels)
 
-    for (entry, base) in enumerate(nonzero_indices)
-        depth = nonzero_weights[entry]
+    # `levels` and `weights` share a sparsity pattern in practice but need not,
+    # so both stored-entry lists — each ascending — are walked in step rather
+    # than indexing `levels` per base, which would binary search it every time.
+    level_entry = 1
+    n_level_entries = length(level_bases)
+
+    for (entry, base) in enumerate(weight_bases)
+        depth = base_weights[entry]
         depth == 0 && continue
         weight = weight_by_depth ? weight_of(depth, weight_transform) : 1.0
         weight == 0 && continue
+
+        while level_entry <= n_level_entries && level_bases[level_entry] < base
+            level_entry += 1
+        end
+        level =
+            level_entry <= n_level_entries && level_bases[level_entry] == base ?
+            Float64(base_levels[level_entry]) : 0.0
 
         # Flanks stay per base; body bases fold into one of `body_bins` bins.
         slot = if base <= flank
@@ -771,7 +811,7 @@ function gene_profile(
             flank + cld((base - flank) * body_bins, body_length)
         end
 
-        weighted_sums[slot] += Float64(feature_levels.levels[base]) * weight
+        weighted_sums[slot] += level * weight
         profile_weights[slot] += weight
     end
 
@@ -802,7 +842,7 @@ function mean_gene_profile(
     for (gene_id, counts) in feature_frequency.features
         gene_id in exclude && continue
         profile = gene_profile(counts, feature_frequency.n; flank, body_bins)
-        profile === nothing && continue
+        isnothing(profile) && continue
         accumulator .+= profile
         n_genes += 1
     end
@@ -829,7 +869,7 @@ genes are averaged together; `false` weights every measured base and every
 contributing gene equally. `weight_transform` reshapes depth into weight —
 `identity` for linear, `log`/`sqrt` to compress the advantage of deeply covered
 sites — and is applied once per base, so both levels of averaging inherit the
-same scheme. See [`weight_of`](@ref).
+same scheme. See [`weight_of`](@ref) and `docs/weighting.md`.
 
 Genes listed in `exclude`, or whose region is too short for a body, are skipped.
 """
@@ -853,7 +893,7 @@ function mean_gene_profile(
             weight_by_depth,
             weight_transform,
         )
-        profile === nothing && continue
+        isnothing(profile) && continue
 
         for slot in eachindex(weighted_sums)
             # `gene_profile` already applied `weight_transform` to each base, so
@@ -883,6 +923,5 @@ export coverage,
     DEFAULT_MIN_DEPTH,
     gene_profile,
     mean_gene_profile
-
 
 end
