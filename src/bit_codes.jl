@@ -16,14 +16,12 @@ calls in `Methylation`).
 | `0x02` | both (`.`)       |
 | `0x03` | unknown / NA     |
 
-Two bits is the narrowest field any of the code layouts allocates (the
-methylation payload has only 2 bits to spare), so it is the width every layout
-encodes to. Wider strand fields — `Reference`/`Data` keep an 8-bit slot — simply
-leave the upper bits of the field zero.
+Two bits is the narrowest strand field any layout allocates; wider fields —
+`Reference` and `Data` keep an 8-bit slot — leave their upper bits zero.
 
 **NOTE:** `0x00` means *forward*, not *unknown*: a zeroed code decodes to `+`.
-Always write a strand explicitly (use [`STRAND_NA`](@ref) when there isn't one)
-rather than relying on a default-initialized code.
+Always write a strand explicitly, using [`STRAND_NA`](@ref) when there isn't
+one.
 """
 const STRAND_FWD = UInt8(0)
 const STRAND_REV = UInt8(1)
@@ -33,15 +31,24 @@ const STRAND_NA = UInt8(3)
 """Width, in bits, of the canonical strand encoding."""
 const STRAND_WIDTH = 2
 
+"""`GenomicFeatures.Strand` for each canonical strand code, in code order."""
+const STRANDS = (
+    GFF3.GenomicFeatures.STRAND_POS,
+    GFF3.GenomicFeatures.STRAND_NEG,
+    GFF3.GenomicFeatures.STRAND_BOTH,
+    GFF3.GenomicFeatures.STRAND_NA,
+)
+
+"""Strand character for each canonical strand code, in code order."""
+const STRAND_CHARS = ('+', '-', '.', '?')
+
 #= Generic bit-field helpers =#
 
 """Mask covering the low `width` bits of `T`."""
 @inline field_mask(::Type{T}, width::Integer) where {T<:Unsigned} =
     (one(T) << width) - one(T)
 
-"""
-Read the `width`-bit field based at bit `shift` (0-based) out of `code`.
-"""
+"""Read the `width`-bit field based at bit `shift` (0-based) out of `code`."""
 @inline get_field(code::T, shift::Integer, width::Integer) where {T<:Unsigned} =
     (code >> shift) & field_mask(T, width)
 
@@ -75,50 +82,21 @@ end
 
 """Encode a `GenomicFeatures.Strand` as its canonical 2-bit code."""
 function strand_code(strand::Strand)
-    if strand == GFF3.GenomicFeatures.STRAND_POS
-        STRAND_FWD
-    elseif strand == GFF3.GenomicFeatures.STRAND_NEG
-        STRAND_REV
-    elseif strand == GFF3.GenomicFeatures.STRAND_BOTH
-        STRAND_BOTH
-    else
-        STRAND_NA
-    end
+    index = findfirst(==(strand), STRANDS)
+    return index === nothing ? STRAND_NA : UInt8(index - 1)
 end
 
 """Encode a strand character (`+`, `-`, `.`) as its canonical 2-bit code."""
 function strand_code(strand::Char)
-    if strand == '+'
-        STRAND_FWD
-    elseif strand == '-'
-        STRAND_REV
-    elseif strand == '.'
-        STRAND_BOTH
-    else
-        STRAND_NA
-    end
+    index = findfirst(==(strand), STRAND_CHARS)
+    return index === nothing ? STRAND_NA : UInt8(index - 1)
 end
 
 """Decode a canonical 2-bit strand code back to a `GenomicFeatures.Strand`."""
-function decode_strand(code::Integer)
-    bits = UInt8(code & 0x03)
-    if bits == STRAND_FWD
-        GFF3.GenomicFeatures.STRAND_POS
-    elseif bits == STRAND_REV
-        GFF3.GenomicFeatures.STRAND_NEG
-    elseif bits == STRAND_BOTH
-        GFF3.GenomicFeatures.STRAND_BOTH
-    else
-        GFF3.GenomicFeatures.STRAND_NA
-    end
-end
+@inline decode_strand(code::Integer) = @inbounds STRANDS[(code&0x03)+1]
 
 """Render a canonical 2-bit strand code as a character (`+`, `-`, `.`, `?`)."""
-function strand_char(code::Integer)
-    bits = UInt8(code & 0x03)
-    return bits == STRAND_FWD ? '+' :
-           bits == STRAND_REV ? '-' : bits == STRAND_BOTH ? '.' : '?'
-end
+@inline strand_char(code::Integer) = @inbounds STRAND_CHARS[(code&0x03)+1]
 
 """Convert a strand character (`+`, `-`, `.`) to a `GenomicFeatures.Strand`."""
 get_strand(strand::Char) = decode_strand(strand_code(strand))
@@ -144,27 +122,20 @@ Pack a feature's metadata index, strand and SO term into a single 64-bit code:
 bits wide, so its upper 6 bits are always zero.
 """
 function pack_metadata(index::UInt32, strand::UInt8, so_term::UInt16)
-    code = UInt64(0)
-    code = set_field(code, index, INDEX_SHIFT, INDEX_WIDTH)
+    code = set_field(UInt64(0), index, INDEX_SHIFT, INDEX_WIDTH)
     code = set_field(code, strand, STRAND_SHIFT, STRAND_FIELD_WIDTH)
-    code = set_field(code, so_term, SO_SHIFT, SO_WIDTH)
-    return code
+    return set_field(code, so_term, SO_SHIFT, SO_WIDTH)
 end
 
 """Extract the 32-bit metadata index from a feature code (see [`pack_metadata`](@ref))."""
-function parse_index(code::UInt64)
-    return UInt32(get_field(code, INDEX_SHIFT, INDEX_WIDTH))
-end
+@inline parse_index(code::UInt64) = UInt32(get_field(code, INDEX_SHIFT, INDEX_WIDTH))
 
 """Extract the strand from a feature code as a `GenomicFeatures.Strand` (see [`pack_metadata`](@ref))."""
-function parse_strand(code::UInt64)
-    return decode_strand(get_field(code, STRAND_SHIFT, STRAND_FIELD_WIDTH))
-end
+@inline parse_strand(code::UInt64) =
+    decode_strand(get_field(code, STRAND_SHIFT, STRAND_FIELD_WIDTH))
 
 """Extract the 16-bit SO term code from a feature code (see [`pack_metadata`](@ref))."""
-function parse_so_term(code::UInt64)
-    return UInt16(get_field(code, SO_SHIFT, SO_WIDTH))
-end
+@inline parse_so_term(code::UInt64) = UInt16(get_field(code, SO_SHIFT, SO_WIDTH))
 
 export STRAND_FWD,
     STRAND_REV,

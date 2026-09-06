@@ -1,13 +1,11 @@
 """
 Single-base methylation calls.
 
-A submodule of [`Data`](@ref) because methylation is just another per-sample
-signal sitting on top of a reference sequence. It is, however, the one such
-signal that is purely *positional*: nothing here touches a `Genome`, a
-`Scaffold` or any of `Data`'s interval types, and the only thing it shares with
-the rest of the package is the `BitCodes` packing vocabulary. Keep it that way —
-the independence is what lets a whole-genome call set stay an 8-byte-per-site,
-memory-mappable block.
+A per-sample signal like the rest of [`Data`](@ref), but a purely *positional*
+one: nothing here touches a `Genome`, a `Scaffold` or any of `Data`'s interval
+types, and the only thing shared with the rest of the package is the `BitCodes`
+packing vocabulary. Keep it that way, so a whole-genome call set stays one flat,
+8-byte-per-site, memory-mappable block.
 """
 module Methylation
 
@@ -33,12 +31,8 @@ const STRAND_FIELD_WIDTH = STRAND_WIDTH   # 2 bits; bits 28-31 stay reserved
 
 """
 Largest total read depth the 16-bit depth field can hold. Depths above this
-saturate here rather than wrapping into a neighbouring field.
-
-Saturating the depth does **not** corrupt the methylation level: the percentage
-is encoded from the true counts before the depth is clamped, so a site covered
-by a million reads still reports its level accurately and only its depth is
-recorded as "at least [`MAX_COUNT`](@ref)".
+saturate rather than wrapping into a neighbouring field; the methylation level
+is encoded before the clamp and so stays accurate either way.
 """
 const MAX_COUNT = UInt32(65535)
 
@@ -65,7 +59,11 @@ const CTX_CHG = UInt8(1)
 const CTX_CHH = UInt8(2)
 const CTX_UNKNOWN = UInt8(3)
 
+"""Context label for each context code, in code order."""
 const CONTEXT_LABELS = (:CpG, :CHG, :CHH, :unknown)
+
+"""Narrow `value` to the two bits a payload's context or strand field holds."""
+@inline two_bit_code(value::Integer) = UInt8(value) & 0x03
 
 """
 A single genomic cytosine's aggregated methylation calls, packed into 8 bytes.
@@ -86,12 +84,10 @@ A single genomic cytosine's aggregated methylation calls, packed into 8 bytes.
 - Bits 26-27 : strand, as the package-wide 2-bit strand codes (see `BitCodes`)
 - Bits 28-31 : reserved for future quality/SNP flags
 
-The methylated and unmethylated counts are *reconstructed* rather than
-stored (see [`get_meth`](@ref)), and the reconstruction is exact for every site
-with a depth of 255 or less — that is, for essentially every site in a real
-bisulfite library. Deeper than that the counts can be off by a read or two,
-while the depth itself stays exact and the level stays within half a
-quantization step (0.196 percentage points).
+The methylated and unmethylated counts are *reconstructed* rather than stored
+(see [`get_meth`](@ref)): the reconstruction is exact up to a depth of 255 and
+off by at most a read or two beyond that, while the depth stays exact and the
+level stays within half a quantization step (0.196 percentage points).
 
 Read IDs from the source alignment are deliberately discarded.
 """
@@ -103,11 +99,10 @@ end
 """
 Per-scaffold aggregated methylation calls.
 
-Each value is a `StructArray{AggregatedCall}` sorted ascending by `pos` (ties —
-the same position on different strands or in different contexts — are ordered by
-context, then strand), which is what lets [`find_calls_in_range`](@ref) binary
-search it. Scaffolds are kept separate so a single sequence's calls stay one
-contiguous, memory-mappable block.
+Each value is a `StructArray{AggregatedCall}` sorted ascending by [`sort_key`](@ref)
+— position, then context, then strand — which is what lets
+[`find_calls_in_range`](@ref) binary search it. Scaffolds are kept separate so a
+single sequence's calls stay one contiguous, memory-mappable block.
 """
 struct MethylationData
     scaffolds::Dict{String,StructArray{AggregatedCall}}
@@ -120,11 +115,10 @@ MethylationData() = MethylationData(Dict{String,StructArray{AggregatedCall}}())
 """
     encode_percent(percent)
 
-Map a methylation percentage in `[0, 100]` onto the payload's 8-bit field, a
-plain linear scaling onto `[0, MAX_PERCENT_CODE]` rounded (half up) to the
-nearest code. Values outside `[0, 100]` clamp to the ends of the range, and
-`NaN` — the level [`meth_percent`](@ref) reports for an uncovered site — encodes
-as `0`, which is what an uncovered site stores anyway.
+Map a methylation percentage in `[0, 100]` onto the payload's 8-bit field,
+scaling linearly onto `[0, MAX_PERCENT_CODE]` and rounding half up. Values
+outside `[0, 100]` clamp to the ends of the range, and `NaN` — the level
+[`meth_percent`](@ref) reports for an uncovered site — encodes as `0`.
 """
 @inline function encode_percent(percent::Real)
     (isnan(percent) || percent <= 0) && return UInt8(0)
@@ -183,16 +177,32 @@ regardless.
     Int64(MAX_COUNT) : meth_count + unmeth_count
 
 """
+    pack_fields(code, depth, context, strand)
+
+Lay an already-encoded percentage code, a depth and the metadata into the 32-bit
+payload; the shared tail of [`pack_payload`](@ref) and
+[`pack_percent_payload`](@ref). `depth` saturates at [`MAX_COUNT`](@ref).
+"""
+@inline function pack_fields(code::UInt8, depth::Integer, context::Integer, strand::Integer)
+    payload = set_field(
+        UInt32(0),
+        clamp_field(depth, UInt32, DEPTH_WIDTH),
+        DEPTH_SHIFT,
+        DEPTH_WIDTH,
+    )
+    payload = set_field(payload, code, PERCENT_SHIFT, PERCENT_WIDTH)
+    payload = set_field(payload, context, CONTEXT_SHIFT, CONTEXT_WIDTH)
+    return set_field(payload, strand, STRAND_SHIFT, STRAND_FIELD_WIDTH)
+end
+
+"""
     pack_payload(meth, unmeth, context, strand)
 
-Pack read counts and metadata into an [`AggregatedCall`](@ref) payload.
-
-The counts are stored as a total depth plus a methylation percentage rather than
-verbatim (see [`AggregatedCall`](@ref)), so they are recovered by
-[`get_meth`](@ref)/[`get_unmeth`](@ref) exactly whenever their sum is 255 or
-less. The percentage is computed from the counts as given, so it stays accurate
-even when the depth itself saturates at [`MAX_COUNT`](@ref); negative counts are
-floored at zero.
+Pack read counts and metadata into an [`AggregatedCall`](@ref) payload. The
+counts are stored as a total depth plus a methylation percentage rather than
+verbatim (see [`AggregatedCall`](@ref)); the percentage is computed from the
+counts as given, so it stays accurate even when the depth saturates. Negative
+counts are floored at zero.
 """
 function pack_payload(
     meth::Integer,
@@ -214,40 +224,16 @@ end
     pack_percent_payload(percent, depth, context, strand)
 
 Pack a methylation *level* and a read depth into an [`AggregatedCall`](@ref)
-payload directly — the natural constructor when the level is what you have (a
+payload directly — the constructor to use when the level is what you have (a
 model fit, a smoothed estimate, a percentage column) rather than a pair of
-counts. `percent` is clamped to `[0, 100]` and `depth` to
-`[0, MAX_COUNT]`.
+counts. `percent` is clamped to `[0, 100]` and `depth` to `[0, MAX_COUNT]`.
 """
-function pack_percent_payload(
+pack_percent_payload(
     percent::Real,
     depth::Integer,
     context::Integer = CTX_CPG,
     strand::Integer = STRAND_NA,
-)
-    return pack_fields(encode_percent(percent), depth, context, strand)
-end
-
-"""
-    pack_fields(code, depth, context, strand)
-
-Lay an already-encoded percentage code, a depth and the metadata into the 32-bit
-payload; the shared tail of [`pack_payload`](@ref) and
-[`pack_percent_payload`](@ref).
-"""
-@inline function pack_fields(code::UInt8, depth::Integer, context::Integer, strand::Integer)
-    payload = UInt32(0)
-    payload = set_field(
-        payload,
-        clamp_field(depth, UInt32, DEPTH_WIDTH),
-        DEPTH_SHIFT,
-        DEPTH_WIDTH,
-    )
-    payload = set_field(payload, code, PERCENT_SHIFT, PERCENT_WIDTH)
-    payload = set_field(payload, context, CONTEXT_SHIFT, CONTEXT_WIDTH)
-    payload = set_field(payload, strand, STRAND_SHIFT, STRAND_FIELD_WIDTH)
-    return payload
-end
+) = pack_fields(encode_percent(percent), depth, context, strand)
 
 """
     AggregatedCall(pos, meth, unmeth, context, strand)
@@ -266,7 +252,7 @@ AggregatedCall(
 """
 Total read depth at a site, exact up to [`MAX_COUNT`](@ref). A depth of exactly
 `MAX_COUNT` means the field saturated and the true depth is only known to be at
-least that; the methylation level is unaffected either way.
+least that.
 """
 @inline get_depth(payload::UInt32) = get_field(payload, DEPTH_SHIFT, DEPTH_WIDTH)
 
@@ -330,7 +316,7 @@ site has no coverage at all. The stored level rescaled — see
 end
 
 # Every accessor also works directly on a call.
-for f in (
+for accessor in (
     :get_meth,
     :get_unmeth,
     :get_depth,
@@ -342,10 +328,15 @@ for f in (
     :meth_percent,
     :meth_fraction,
 )
-    @eval @inline $f(call::AggregatedCall) = $f(call.payload)
+    @eval @inline $accessor(call::AggregatedCall) = $accessor(call.payload)
 end
 
 @inline BitCodes.get_strand(call::AggregatedCall) = get_strand(call.payload)
+
+"""Ordering key keeping call arrays in (position, context, strand) order."""
+@inline sort_key(call::AggregatedCall) =
+    (UInt64(call.pos) << 32) | (UInt64(get_context(call)) << 2) |
+    UInt64(get_strand_code(call))
 
 #= StructArray construction and search =#
 
@@ -383,24 +374,24 @@ end
 
 Return the calls whose position falls inside the closed interval
 `[start_pos, stop_pos]`, as a **view** into `calls`: another
-`StructArray{AggregatedCall}`, but one whose columns are views of the originals,
-so nothing is copied (memory-mapped columns included) and the result can itself
-be range-queried.
+`StructArray{AggregatedCall}` whose columns are views of the originals, so
+nothing is copied and the result can itself be range-queried.
 
-Binary searches the contiguous `pos` column, so a lookup costs `O(log n)`
-regardless of how many sites the scaffold holds. Returns an empty view when the
-range holds no calls or when `stop_pos < start_pos`.
+Binary searches the contiguous `pos` column, so a lookup costs `O(log n)`.
+Returns an empty view when the range holds no calls or when
+`stop_pos < start_pos`.
 """
 function find_calls_in_range(
     calls::StructArray{AggregatedCall},
     start_pos::Integer,
     stop_pos::Integer,
 )
-    positions = calls.pos
     stop_pos < start_pos && return view(calls, 1:0)
-    lo = searchsortedfirst(positions, start_pos)
-    hi = searchsortedlast(positions, stop_pos)
-    return view(calls, lo:hi)
+    positions = calls.pos
+    return view(
+        calls,
+        searchsortedfirst(positions, start_pos):searchsortedlast(positions, stop_pos),
+    )
 end
 
 """
@@ -487,13 +478,12 @@ end
     infer_strand(path)
 
 Infer which strand a Bismark methylation-extractor file reports on from its
-name. Bismark splits its output by alignment strand, and the strand is *only*
-recorded in the file name — the file's own second column is the methylation
-state (`+` = methylated, `-` = unmethylated), not a strand.
+name: `OT`/`CTOT` files report cytosines on the forward strand, `OB`/`CTOB`
+files on the reverse strand. Returns [`STRAND_NA`](@ref) when the name matches
+neither.
 
-`OT`/`CTOT` files report cytosines on the forward strand, `OB`/`CTOB` files
-report cytosines on the reverse strand. Returns [`STRAND_NA`](@ref) when the
-name matches neither.
+The strand is *only* recorded in the file name — the file's own second column is
+the methylation state (`+` = methylated, `-` = unmethylated), not a strand.
 """
 function infer_strand(path::AbstractString)
     name = basename(String(path))
@@ -536,13 +526,13 @@ five expected fields; those are skipped rather than aborting a load.
     tab_after_position > tab_after_scaffold + 1 || return nothing
     lastindex(line) >= tab_after_position + 1 || return nothing
 
-    scaffold = SubString(line, tab_after_state + 1, tab_after_scaffold - 1)
     position = parse_uint32(codeunits(line), tab_after_scaffold + 1, tab_after_position - 1)
     position === nothing && return nothing
 
     call = decode_call(line[tab_after_position+1])
     call === nothing && return nothing
 
+    scaffold = SubString(line, tab_after_state + 1, tab_after_scaffold - 1)
     return (scaffold, position, call[1], call[2])
 end
 
@@ -555,9 +545,9 @@ Sort/group key for one raw methylation-extractor call:
 |--- pos (bits 63-32) ---|--- unused (31-5) ---|-cx (4-3)-|-st (2-1)-|-meth (0)-|
 ```
 
-`sort!` over these keys therefore orders records by position, and every record
-for one site forms a contiguous run sharing `key >>> 1`, which
-[`aggregate_keys!`](@ref) collapses in a single scan with no hashing.
+Sorting these orders records by position, and every record for one site forms a
+contiguous run sharing `key >>> 1`, which [`aggregate_keys!`](@ref) collapses in
+a single scan with no hashing.
 """
 @inline site_key(position::UInt32, context::UInt8, strand::UInt8, is_methylated::Bool) =
     (UInt64(position) << 32) | (UInt64(context) << 3) | (UInt64(strand) << 1) |
@@ -586,9 +576,9 @@ function aggregate_keys!(keys::Vector{UInt64})
 
     positions = UInt32[]
     payloads = UInt32[]
+    n_keys = length(keys)
 
     index = 1
-    n_keys = length(keys)
     while index <= n_keys
         site = keys[index] >>> 1
         meth_count = 0
@@ -619,7 +609,7 @@ per-site counts (see [`load_bismark(::AbstractString)`](@ref) for the file-based
 method, which also infers `strand` from the file name).
 """
 function load_bismark(io::IO; strand::Integer = STRAND_NA)
-    strand_bits = UInt8(strand) & 0x03
+    strand_bits = two_bit_code(strand)
     keys_by_scaffold = Dict{String,Vector{UInt64}}()
 
     for line in eachline(io)
@@ -637,11 +627,11 @@ function load_bismark(io::IO; strand::Integer = STRAND_NA)
         push!(bucket, site_key(position, context, strand_bits, is_methylated))
     end
 
-    scaffolds = Dict{String,StructArray{AggregatedCall}}()
-    for (scaffold, bucket) in keys_by_scaffold
-        scaffolds[scaffold] = aggregate_keys!(bucket)
-    end
-    return MethylationData(scaffolds)
+    return MethylationData(
+        Dict{String,StructArray{AggregatedCall}}(
+            scaffold => aggregate_keys!(bucket) for (scaffold, bucket) in keys_by_scaffold
+        ),
+    )
 end
 
 """
@@ -657,20 +647,16 @@ Each input line is one *read's* call at one cytosine:
 ```
 
 Read IDs are discarded and calls at the same site are summed, so the result is
-one 8-byte [`AggregatedCall`](@ref) per (position, context, strand) rather than
-one entry per read. The call letter supplies the context and the methylation
-state (`Z`/`z` = CpG, `X`/`x` = CHG, `H`/`h` = CHH, `U`/`u` = unknown; uppercase
-means methylated), while `strand` comes from the file name — see
-[`infer_strand`](@ref) — because Bismark records it nowhere else. Pass `strand`
-explicitly for files whose names don't follow the convention.
+one 8-byte [`AggregatedCall`](@ref) per (position, context, strand). The call
+letter supplies the context and the methylation state (`Z`/`z` = CpG,
+`X`/`x` = CHG, `H`/`h` = CHH, `U`/`u` = unknown; uppercase means methylated),
+while `strand` comes from the file name — see [`infer_strand`](@ref). Pass
+`strand` explicitly for files whose names don't follow the convention.
 
 The version header, blank lines, and any malformed line are skipped.
 """
-function load_bismark(path::AbstractString; strand::Integer = infer_strand(path))
-    return open_maybe_gzip(path) do io
-        load_bismark(io; strand = strand)
-    end
-end
+load_bismark(path::AbstractString; strand::Integer = infer_strand(path)) =
+    open_maybe_gzip(io -> load_bismark(io; strand = strand), path)
 
 """
     open_maybe_gzip(f, path)
@@ -713,12 +699,36 @@ end
 """
     find_tab(buffer, from_index, line_stop)
 
-Next tab at or after `from_index`, or `nothing` if there is none by `line_stop`.
+Index of the next tab in `buffer[from_index:line_stop]`, or `nothing` when the
+range holds none.
 """
 @inline function find_tab(buffer::Vector{UInt8}, from_index::Int, line_stop::Int)
-    from_index > line_stop && return nothing
-    tab = findnext(==(TAB), buffer, from_index)
-    (tab === nothing || tab > line_stop) && return nothing
+    @inbounds for index = from_index:line_stop
+        buffer[index] == TAB && return index
+    end
+    return nothing
+end
+
+"""
+    skip_fields(buffer, from_index, line_stop, n_fields)
+
+Index of the tab ending the `n_fields`-th field starting at `from_index`, or
+`nothing` when the line runs out of fields first.
+"""
+@inline function skip_fields(
+    buffer::Vector{UInt8},
+    from_index::Int,
+    line_stop::Int,
+    n_fields::Int,
+)
+    tab = 0
+    index = from_index
+    for _ = 1:n_fields
+        found = find_tab(buffer, index, line_stop)
+        found === nothing && return nothing
+        tab = found
+        index = found + 1
+    end
     return tab
 end
 
@@ -748,28 +758,27 @@ the six expected fields; those are skipped rather than aborting a load.
     tab_after_scaffold = find_tab(buffer, line_start, line_stop)
     tab_after_scaffold === nothing && return nothing
     tab_after_scaffold > line_start || return nothing        # empty scaffold name
+
     tab_after_start = find_tab(buffer, tab_after_scaffold + 1, line_stop)
     tab_after_start === nothing && return nothing
-    tab_after_stop = find_tab(buffer, tab_after_start + 1, line_stop)
-    tab_after_stop === nothing && return nothing
-    tab_after_percent = find_tab(buffer, tab_after_stop + 1, line_stop)
+
+    # The end coordinate and the methylation percentage are both redundant.
+    tab_after_percent = skip_fields(buffer, tab_after_start + 1, line_stop, 2)
     tab_after_percent === nothing && return nothing
+
     tab_after_meth = find_tab(buffer, tab_after_percent + 1, line_stop)
     tab_after_meth === nothing && return nothing
-    line_stop >= tab_after_meth + 1 || return nothing        # empty unmeth count
+    tab_after_unmeth = find_tab(buffer, tab_after_meth + 1, line_stop)
 
     position = parse_uint32(buffer, tab_after_scaffold + 1, tab_after_start - 1)
-    position === nothing && return nothing
     meth_count = parse_uint32(buffer, tab_after_percent + 1, tab_after_meth - 1)
-    meth_count === nothing && return nothing
-
-    tab_after_unmeth = find_tab(buffer, tab_after_meth + 1, line_stop)
     unmeth_count = parse_uint32(
         buffer,
         tab_after_meth + 1,
         tab_after_unmeth === nothing ? line_stop : tab_after_unmeth - 1,
     )
-    unmeth_count === nothing && return nothing
+    (position === nothing || meth_count === nothing || unmeth_count === nothing) &&
+        return nothing
 
     return (tab_after_scaffold - 1, position, meth_count, unmeth_count)
 end
@@ -824,10 +833,8 @@ function collapse_cov!(buffer::CovBuffer, context::UInt8, strand::UInt8)
     end
 
     n_records = length(positions)
-    site_positions = UInt32[]
-    site_payloads = UInt32[]
-    sizehint!(site_positions, n_records)
-    sizehint!(site_payloads, n_records)
+    site_positions = sizehint!(UInt32[], n_records)
+    site_payloads = sizehint!(UInt32[], n_records)
 
     index = 1
     while index <= n_records
@@ -855,8 +862,8 @@ const COV_CHUNK_BYTES = 1 << 22   # 4 MiB
 """
     ChunkPool(chunk_bytes, capacity)
 
-Free list of `chunk_bytes`-sized read buffers. Reading a whole file allocates a
-few hundred MiB of these otherwise, all of it immediately garbage.
+Free list of `chunk_bytes`-sized read buffers, so that reading a whole file does
+not allocate (and immediately discard) hundreds of MiB of them.
 
 `capacity` must be at least the number of buffers that can be alive at once, so
 that [`recycle_chunk!`](@ref) never blocks.
@@ -995,9 +1002,8 @@ const MIN_COV_LINE_BYTES = 16
 Presize a new [`CovBuffer`](@ref) so its vectors do not re-pay the doubling ramp
 in every chunk. `n_records` is the chunk's record ceiling and `rank` is how many
 scaffolds the chunk has already opened: the first buffer gets the ceiling, each
-later one half of the previous. Exact for a `.cov` sorted by scaffold (one or
-two per chunk), and for a chunk holding many the reservations still sum to under
-twice the ceiling.
+later one half of the previous, so the reservations sum to under twice the
+ceiling however many scaffolds a chunk holds.
 """
 @inline function reserve_cov!(buffer::CovBuffer, n_records::Int, rank::Int)
     reserved = max(256, rank > 20 ? 0 : n_records >> (rank - 1))
@@ -1009,38 +1015,84 @@ end
 
 """
 How many of a chunk's scaffold names a lookup scans before falling back to the
-`Dict` (see [`parse_cov_chunk`](@ref)).
+`Dict` (see [`ScaffoldCache`](@ref)).
 """
 const COV_NAME_SCAN_LIMIT = 64
+
+"""
+The scaffold buffers one [`parse_cov_chunk`](@ref) call has opened, plus the two
+byte-matching layers that keep a lookup from allocating a `String` per record:
+`last_name`/`last_buffer`, which a `.cov` grouped by scaffold hits for long
+runs, and a scan of `names`, which covers a file that interleaves scaffolds.
+`slots` is the `Dict` fallback for a chunk holding more scaffolds than
+[`COV_NAME_SCAN_LIMIT`](@ref).
+"""
+mutable struct ScaffoldCache
+    slots::Dict{String,Int}
+    names::Vector{String}
+    buffers::Vector{CovBuffer}
+    last_name::String
+    last_buffer::CovBuffer
+    n_records::Int
+end
+
+ScaffoldCache(n_records::Int) =
+    ScaffoldCache(Dict{String,Int}(), String[], CovBuffer[], "", CovBuffer(), n_records)
+
+"""
+    scaffold_buffer!(cache, buffer, name_start, name_stop)
+
+Buffer for the scaffold named by `buffer[name_start:name_stop]`, opening (and
+presizing) a new one the first time a name is seen.
+"""
+function scaffold_buffer!(
+    cache::ScaffoldCache,
+    buffer::Vector{UInt8},
+    name_start::Int,
+    name_stop::Int,
+)
+    name_matches(buffer, name_start, name_stop, cache.last_name) && return cache.last_buffer
+
+    slot = 0
+    if length(cache.names) <= COV_NAME_SCAN_LIMIT
+        for candidate in eachindex(cache.names)
+            if name_matches(buffer, name_start, name_stop, cache.names[candidate])
+                slot = candidate
+                break
+            end
+        end
+    end
+
+    if slot == 0
+        name = String(buffer[name_start:name_stop])
+        slot = get(cache.slots, name, 0)
+        if slot == 0
+            push!(cache.names, name)
+            push!(
+                cache.buffers,
+                reserve_cov!(CovBuffer(), cache.n_records, length(cache.names)),
+            )
+            slot = length(cache.names)
+            cache.slots[name] = slot
+        end
+    end
+
+    cache.last_name = cache.names[slot]
+    cache.last_buffer = cache.buffers[slot]
+    return cache.last_buffer
+end
 
 """
     parse_cov_chunk(chunk)
 
 Parse the whole coverage lines in `chunk` into per-scaffold [`CovBuffer`](@ref)s,
-keyed by scaffold name and holding records in the order they appear.
-
-A `Dict` lookup needs the scaffold column as a `String`, i.e. an allocation per
-record, so two byte-matching layers sit in front of it: the previous record's
-scaffold, which a `.cov` grouped by scaffold repeats for long runs, then a scan
-of the names this chunk has already opened, which covers a file that interleaves
-scaffolds. [`COV_NAME_SCAN_LIMIT`](@ref) caps the scan so that many distinct
-scaffolds in one chunk fall back to the `Dict` rather than turning the lookup
-quadratic.
+keyed by scaffold name and holding records in the order they appear. Scaffold
+names are resolved through a [`ScaffoldCache`](@ref).
 """
 function parse_cov_chunk(chunk::CovChunk)
     bytes = chunk.bytes
     stop_index = chunk.stop_index
-
-    buffers = Dict{String,CovBuffer}()
-    seen_names = String[]
-    seen_buffers = CovBuffer[]
-    n_records = (stop_index - chunk.start_index + 1) ÷ MIN_COV_LINE_BYTES
-
-    # Last scaffold seen, and its buffer. `parse_cov_record` rejects an empty
-    # scaffold column, so `""` never matches and this placeholder is never
-    # written into.
-    cached_name = ""
-    cached_buffer = CovBuffer()
+    cache = ScaffoldCache((stop_index - chunk.start_index + 1) ÷ MIN_COV_LINE_BYTES)
 
     line_start = chunk.start_index
     while line_start <= stop_index
@@ -1055,46 +1107,15 @@ function parse_cov_chunk(chunk::CovChunk)
         record = parse_cov_record(bytes, line_start, line_stop)
         if record !== nothing
             scaffold_stop, position, meth_count, unmeth_count = record
-            if !name_matches(bytes, line_start, scaffold_stop, cached_name)
-                found = 0
-                if length(seen_names) <= COV_NAME_SCAN_LIMIT
-                    for candidate in eachindex(seen_names)
-                        if name_matches(
-                            bytes,
-                            line_start,
-                            scaffold_stop,
-                            seen_names[candidate],
-                        )
-                            found = candidate
-                            break
-                        end
-                    end
-                end
-
-                if found != 0
-                    cached_name = seen_names[found]
-                    cached_buffer = seen_buffers[found]
-                else
-                    name = String(bytes[line_start:scaffold_stop])
-                    buffer = get(buffers, name, nothing)
-                    if buffer === nothing
-                        buffer = reserve_cov!(CovBuffer(), n_records, length(buffers) + 1)
-                        buffers[name] = buffer
-                        push!(seen_names, name)
-                        push!(seen_buffers, buffer)
-                    end
-                    cached_name = name
-                    cached_buffer = buffer
-                end
-            end
-            push_cov!(cached_buffer, position, meth_count, unmeth_count)
+            buffer = scaffold_buffer!(cache, bytes, line_start, scaffold_stop)
+            push_cov!(buffer, position, meth_count, unmeth_count)
         end
 
         at_end && break
         line_start = newline + 1
     end
 
-    return buffers
+    return Dict{String,CovBuffer}(zip(cache.names, cache.buffers))
 end
 
 """
@@ -1152,17 +1173,14 @@ function parse_cov_parallel(io::IO, n_workers::Int)
     end
 
     merged = Dict{String,CovBuffer}()
-    for (_, parsed) in results
-        for (scaffold, buffer) in parsed
-            existing = get(merged, scaffold, nothing)
-            if existing === nothing
-                reserve_cov!(buffer, totals[scaffold], 1)
-                merged[scaffold] = buffer
-            else
-                append!(existing.positions, buffer.positions)
-                append!(existing.meth_counts, buffer.meth_counts)
-                append!(existing.unmeth_counts, buffer.unmeth_counts)
-            end
+    for (_, parsed) in results, (scaffold, buffer) in parsed
+        existing = get(merged, scaffold, nothing)
+        if existing === nothing
+            merged[scaffold] = reserve_cov!(buffer, totals[scaffold], 1)
+        else
+            append!(existing.positions, buffer.positions)
+            append!(existing.meth_counts, buffer.meth_counts)
+            append!(existing.unmeth_counts, buffer.unmeth_counts)
         end
     end
     return merged
@@ -1185,11 +1203,9 @@ function load_cov_stream(io::IO, context::UInt8, strand::UInt8, n_workers::Int)
         Threads.@spawn collapsed[index] = collapse_cov!(buffers[scaffold], context, strand)
     end
 
-    scaffolds = Dict{String,StructArray{AggregatedCall}}()
-    for (index, scaffold) in enumerate(scaffold_names)
-        scaffolds[scaffold] = collapsed[index]
-    end
-    return MethylationData(scaffolds)
+    return MethylationData(
+        Dict{String,StructArray{AggregatedCall}}(zip(scaffold_names, collapsed)),
+    )
 end
 
 """
@@ -1202,7 +1218,7 @@ and the per-scaffold collapse over the scaffolds, so this needs `julia -t auto`
 to be worth anything. The result is the same at any thread count.
 """
 load_bismark_cov(io::IO; context::Integer = CTX_CPG, strand::Integer = STRAND_NA) =
-    load_cov_stream(io, UInt8(context) & 0x03, UInt8(strand) & 0x03, Threads.nthreads())
+    load_cov_stream(io, two_bit_code(context), two_bit_code(strand), Threads.nthreads())
 
 """
     load_bismark_cov(path; context = CTX_CPG, strand = infer_strand(path))
@@ -1220,38 +1236,33 @@ records [`load_bismark`](@ref) reads. Each line is one cytosine:
 
 Coordinates are already 1-based and `start == end` for a single cytosine, so
 `start` is taken as the position and `end` ignored. The percentage column is
-ignored as well — it is derivable from the two counts, which are the more
-precise source — and the counts go straight into an [`AggregatedCall`](@ref),
-whose depth saturates at [`MAX_COUNT`](@ref). Repeated lines for the same
-position (concatenated files) are summed, and each scaffold's calls are sorted
-by position.
+ignored as well, the counts being the more precise source, and those go straight
+into an [`AggregatedCall`](@ref) whose depth saturates at [`MAX_COUNT`](@ref).
+Repeated lines for the same position (concatenated files) are summed, and each
+scaffold's calls are sorted by position.
 
 A `.cov` file records **neither the context nor the strand**, so both are
 supplied by the caller:
 
-- `context` defaults to [`CTX_CPG`](@ref) because Bismark's default coverage
-  output is CpG-only. Pass the right code for a single-context `--CX` run, or
+- `context` defaults to [`CTX_CPG`](@ref), Bismark's default coverage output
+  being CpG-only. Pass the right code for a single-context `--CX` run, or
   [`CTX_UNKNOWN`](@ref) for a mixed-context one — a mixed file cannot be split
-  by context after the fact, since the information simply is not in it.
+  by context after the fact.
 - `strand` defaults to whatever [`infer_strand`](@ref) makes of the file name,
-  which is [`STRAND_NA`](@ref) for the usual whole-sample coverage file (its
-  counts are pooled across strands anyway). Pass a code explicitly for coverage
-  generated from one strand's extractor output.
+  which is [`STRAND_NA`](@ref) for the usual strand-pooled whole-sample file.
+  Pass a code explicitly for coverage generated from one strand's extractor
+  output.
 
 Blank lines and any line without the six expected fields are skipped, as are
 lines whose numeric fields are not plain runs of digits (a sign or padding
 spaces count as malformed). Parsing is threaded — see
 [`load_bismark_cov(::IO)`](@ref).
 """
-function load_bismark_cov(
+load_bismark_cov(
     path::AbstractString;
     context::Integer = CTX_CPG,
     strand::Integer = infer_strand(path),
-)
-    return open_maybe_gzip(path) do io
-        load_bismark_cov(io; context = context, strand = strand)
-    end
-end
+) = open_maybe_gzip(io -> load_bismark_cov(io; context = context, strand = strand), path)
 
 """
 Default ceiling on how many `.cov` files [`load_bismark_cov`](@ref) reads at
@@ -1273,10 +1284,9 @@ function mapping a path to a code (`strand` defaults to inferring it from each
 file's name).
 
 Up to `max_concurrent_files` files are read at once, gated by a semaphore, and
-the available threads are split between them. Reading files concurrently is what
-overlaps the parts of a load that a single file cannot parallelize — chiefly
-gzip decompression, which is serial per stream. Merging still follows `paths`
-order, so the result does not depend on which file finishes first.
+the available threads are split between them; that overlaps the part of a load a
+single file cannot parallelize, chiefly gzip decompression. Merging follows
+`paths` order, so the result does not depend on which file finishes first.
 """
 function load_bismark_cov(
     paths::AbstractVector{<:AbstractString};
@@ -1291,8 +1301,8 @@ function load_bismark_cov(
     gate = Base.Semaphore(n_concurrent)
 
     tasks = map(paths) do path
-        file_context = UInt8(context isa Function ? context(path) : context) & 0x03
-        file_strand = UInt8(strand isa Function ? strand(path) : strand) & 0x03
+        file_context = two_bit_code(context isa Function ? context(path) : context)
+        file_strand = two_bit_code(strand isa Function ? strand(path) : strand)
         Threads.@spawn Base.acquire(gate) do
             open_maybe_gzip(path) do io
                 load_cov_stream(io, file_context, file_strand, workers_per_file)
@@ -1303,6 +1313,8 @@ function load_bismark_cov(
     return merge_calls(fetch(task) for task in tasks)
 end
 
+#= Merging =#
+
 """
     merge_calls(datasets)
 
@@ -1311,49 +1323,58 @@ position, context and strand: their depths add (saturating at
 [`MAX_COUNT`](@ref)) and their levels are pooled in proportion to those depths.
 
 Merging goes through the reconstructed counts (see [`get_meth`](@ref)), so it is
-exact for the depths those are exact at, and merging is not perfectly
-associative once a site is deep enough for the level's quantization to bite.
+exact for the depths those are exact at, and is not perfectly associative once a
+site is deep enough for the level's quantization to bite.
 """
 function merge_calls(datasets)
     scaffolds = Dict{String,StructArray{AggregatedCall}}()
-    for data in datasets
-        for (chrom, calls) in data.scaffolds
-            existing = get(scaffolds, chrom, nothing)
-            scaffolds[chrom] =
-                existing === nothing ? calls : merge_scaffold(existing, calls)
-        end
+    for data in datasets, (scaffold, calls) in data.scaffolds
+        existing = get(scaffolds, scaffold, nothing)
+        scaffolds[scaffold] = existing === nothing ? calls : merge_scaffold(existing, calls)
     end
     return MethylationData(scaffolds)
+end
+
+# Copy `calls[from_index:end]` onto the output columns of `merge_scaffold`.
+@inline function _append_tail!(
+    positions::Vector{UInt32},
+    payloads::Vector{UInt32},
+    calls::StructArray{AggregatedCall},
+    from_index::Int,
+)
+    append!(positions, view(calls.pos, from_index:length(calls)))
+    append!(payloads, view(calls.payload, from_index:length(calls)))
+    return nothing
 end
 
 """
     merge_scaffold(left, right)
 
-Merge two sorted call arrays for the same scaffold, summing sites that share a
-position, context and strand. Both inputs are ordered by [`sort_key`](@ref), so
-this is a merge of two ordered runs.
+Merge two [`sort_key`](@ref)-ordered call arrays for the same scaffold, summing
+sites that share a position, context and strand.
 """
 function merge_scaffold(
     left::StructArray{AggregatedCall},
     right::StructArray{AggregatedCall},
 )
-    positions = UInt32[]
-    payloads = UInt32[]
-    sizehint!(positions, length(left) + length(right))
-    sizehint!(payloads, length(left) + length(right))
+    n_left, n_right = length(left), length(right)
+    positions = sizehint!(UInt32[], n_left + n_right)
+    payloads = sizehint!(UInt32[], n_left + n_right)
 
     left_index, right_index = 1, 1
-    while left_index <= length(left) || right_index <= length(right)
-        take_left =
-            right_index > length(right) || (
-                left_index <= length(left) &&
-                sort_key(left[left_index]) <= sort_key(right[right_index])
-            )
-        if take_left &&
-           left_index <= length(left) &&
-           right_index <= length(right) &&
-           sort_key(left[left_index]) == sort_key(right[right_index])
-            left_call, right_call = left[left_index], right[right_index]
+    while left_index <= n_left && right_index <= n_right
+        left_call, right_call = left[left_index], right[right_index]
+        left_key, right_key = sort_key(left_call), sort_key(right_call)
+
+        if left_key < right_key
+            push!(positions, left_call.pos)
+            push!(payloads, left_call.payload)
+            left_index += 1
+        elseif right_key < left_key
+            push!(positions, right_call.pos)
+            push!(payloads, right_call.payload)
+            right_index += 1
+        else
             push!(positions, left_call.pos)
             push!(
                 payloads,
@@ -1366,24 +1387,14 @@ function merge_scaffold(
             )
             left_index += 1
             right_index += 1
-        elseif take_left
-            push!(positions, left[left_index].pos)
-            push!(payloads, left[left_index].payload)
-            left_index += 1
-        else
-            push!(positions, right[right_index].pos)
-            push!(payloads, right[right_index].payload)
-            right_index += 1
         end
     end
 
+    _append_tail!(positions, payloads, left, left_index)
+    _append_tail!(positions, payloads, right, right_index)
+
     return aggregated_calls(positions, payloads)
 end
-
-"""Ordering key keeping merged arrays in (position, context, strand) order."""
-@inline sort_key(call::AggregatedCall) =
-    (UInt64(call.pos) << 32) | (UInt64(get_context(call)) << 2) |
-    UInt64(get_strand_code(call))
 
 #= Arrow I/O =#
 
@@ -1393,10 +1404,9 @@ end
 Write one scaffold's calls to an Apache Arrow file as two `UInt32` columns
 (`pos`, `payload`) — the same struct-of-arrays layout they have in memory.
 
-`compress` accepts `:zstd`, `:lz4`, or `nothing` for no compression. Note the
-tradeoff: compressed files are much smaller, but
-[`read_methylation_arrow`](@ref) has to decompress them into memory, whereas an
-uncompressed file is memory-mapped and costs no resident memory until touched.
+`compress` accepts `:zstd`, `:lz4`, or `nothing` for no compression. The
+tradeoff: compressed files are much smaller, but only an uncompressed one can be
+memory-mapped by [`read_methylation_arrow`](@ref).
 """
 function write_methylation_arrow(
     filepath::AbstractString,
@@ -1411,12 +1421,9 @@ end
     read_methylation_arrow(filepath)
 
 Read an Arrow file written by [`write_methylation_arrow`](@ref) back into a
-`StructArray{AggregatedCall}`.
-
-The table is memory-mapped, and the returned `StructArray` wraps the Arrow
-columns directly rather than copying them, so an uncompressed file costs no
-resident memory until its pages are touched. Compressed files are decompressed
-into memory by Arrow on read.
+`StructArray{AggregatedCall}` wrapping the Arrow columns directly rather than
+copying them. An uncompressed file is memory-mapped and costs no resident memory
+until its pages are touched; a compressed one is decompressed into memory.
 """
 function read_methylation_arrow(filepath::AbstractString)
     table = Arrow.Table(filepath)
@@ -1432,16 +1439,19 @@ end
 """Name of the scaffold manifest written alongside a dataset's Arrow files."""
 const MANIFEST_NAME = "scaffolds.tsv"
 
+"""Reduce a scaffold name to something safe to use as a file name."""
+sanitize_name(name::AbstractString) = replace(String(name), r"[^A-Za-z0-9._-]" => "_")
+
 """
     write_methylation(dir, data; compress = :zstd)
 
 Write a whole [`MethylationData`](@ref) to `dir`, one Arrow file per scaffold
 plus a `scaffolds.tsv` manifest mapping scaffold names to file names.
 
-Keeping each scaffold in its own file is what makes large datasets workable:
-a range query only ever needs the one file to be mapped. The manifest exists
-because scaffold names are not always valid file names, so the file name is a
-sanitized version and the true name is recorded in the manifest.
+One file per scaffold keeps a range query to a single mapped file. The manifest
+exists because scaffold names are not always valid file names: the file name is
+a [`sanitize_name`](@ref)d version, deduplicated with a numeric suffix, and the
+true name is recorded in the manifest.
 """
 function write_methylation(
     dir::AbstractString,
@@ -1452,8 +1462,8 @@ function write_methylation(
     manifest = Tuple{String,String}[]
     used = Set{String}()
 
-    for chrom in sort!(collect(keys(data.scaffolds)))
-        stem = sanitize_name(chrom)
+    for scaffold in sort!(collect(keys(data.scaffolds)))
+        stem = sanitize_name(scaffold)
         # Two different scaffold names can sanitize to the same stem.
         candidate = stem
         suffix = 1
@@ -1466,15 +1476,15 @@ function write_methylation(
         filename = "$(candidate).arrow"
         write_methylation_arrow(
             joinpath(dir, filename),
-            data.scaffolds[chrom];
+            data.scaffolds[scaffold];
             compress = compress,
         )
-        push!(manifest, (chrom, filename))
+        push!(manifest, (scaffold, filename))
     end
 
     open(joinpath(dir, MANIFEST_NAME), "w") do io
-        for (chrom, filename) in manifest
-            println(io, chrom, '\t', filename)
+        for (scaffold, filename) in manifest
+            println(io, scaffold, '\t', filename)
         end
     end
 
@@ -1495,19 +1505,14 @@ function read_methylation(dir::AbstractString)
 
     scaffolds = Dict{String,StructArray{AggregatedCall}}()
     for line in eachline(manifest_path)
-        isempty(line) && continue
         tab = findfirst('\t', line)
         tab === nothing && continue
-        chrom = String(SubString(line, 1, tab - 1))
-        filename = String(SubString(line, tab + 1))
-        scaffolds[chrom] = read_methylation_arrow(joinpath(dir, filename))
+        scaffolds[String(SubString(line, 1, tab - 1))] =
+            read_methylation_arrow(joinpath(dir, String(SubString(line, tab + 1))))
     end
 
     return MethylationData(scaffolds)
 end
-
-"""Reduce a scaffold name to something safe to use as a file name."""
-sanitize_name(name::AbstractString) = replace(String(name), r"[^A-Za-z0-9._-]" => "_")
 
 #= Base.show overloads =#
 
@@ -1533,11 +1538,11 @@ function Base.show(io::IO, call::AggregatedCall)
 end
 
 function Base.show(io::IO, data::MethylationData)
-    n = length(data.scaffolds)
+    n_scaffolds = length(data.scaffolds)
     sites = n_sites(data)
     print(
         io,
-        "MethylationData($(n) scaffold$(n == 1 ? "" : "s"), $(sites) site$(sites == 1 ? "" : "s"))",
+        "MethylationData($(n_scaffolds) scaffold$(n_scaffolds == 1 ? "" : "s"), $(sites) site$(sites == 1 ? "" : "s"))",
     )
 end
 
