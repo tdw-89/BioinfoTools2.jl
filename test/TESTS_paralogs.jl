@@ -1,5 +1,5 @@
 using BioinfoTools2
-using BioinfoTools2.Paralogs
+using BioinfoTools2.Homologs.Paralogs
 using BioinfoTools2.Reference
 using DataFrames
 using Graphs
@@ -195,7 +195,7 @@ end
 # Tests for the GeneFamily(genome, pairs) constructor
 # ============================================================================
 @testset "GeneFamily constructor" begin
-    GF = BioinfoTools2.Paralogs.GeneFamily   # not exported from Paralogs
+    GF = BioinfoTools2.Homologs.Paralogs.GeneFamily   # not exported from Paralogs
 
     # chr1 carries g1,g2,g3 (starts 100/300/500); chr2 carries g4,g5 (50/90).
     # Linear indices follow scaffold-name then start order, but every test
@@ -419,7 +419,7 @@ end
 # Tests for Base.show(::GeneFamily)
 # ============================================================================
 @testset "GeneFamily show" begin
-    GF = BioinfoTools2.Paralogs.GeneFamily
+    GF = BioinfoTools2.Homologs.Paralogs.GeneFamily
     genes = [
         ("chr1", 100, 200, "+", "g1"),
         ("chr1", 300, 400, "-", "g2"),
@@ -452,7 +452,7 @@ end
 # Tests for GeneFamily getindex overloads
 # ============================================================================
 @testset "GeneFamily getindex" begin
-    GF = BioinfoTools2.Paralogs.GeneFamily
+    GF = BioinfoTools2.Homologs.Paralogs.GeneFamily
     genes = [
         ("chr1", 100, 200, "+", "g1"),
         ("chr1", 300, 400, "-", "g2"),
@@ -551,7 +551,7 @@ end
 # Tests for the *_graph conversion functions
 # ============================================================================
 @testset "GeneFamily graph conversions" begin
-    GF = BioinfoTools2.Paralogs.GeneFamily
+    GF = BioinfoTools2.Homologs.Paralogs.GeneFamily
     genes = [
         ("chr1", 100, 200, "+", "g1"),
         ("chr1", 300, 400, "-", "g2"),
@@ -628,7 +628,7 @@ end
 # Tests for rbh(::GeneFamily) - per-component reciprocal best hit
 # ============================================================================
 @testset "rbh(::GeneFamily)" begin
-    GF = BioinfoTools2.Paralogs.GeneFamily
+    GF = BioinfoTools2.Homologs.Paralogs.GeneFamily
     genes = [
         ("chr1", 100, 110, "+", "g1"),
         ("chr1", 200, 210, "+", "g2"),
