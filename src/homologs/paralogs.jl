@@ -1,3 +1,9 @@
+"""
+Homology *within* a genome: gene families of paralogous pairs, the relation
+matrices over them, and reciprocal-best-hit detection.
+
+See [`Orthologs`](@ref) for the between-genome counterpart.
+"""
 module Paralogs
 
 using DataFrames
@@ -6,7 +12,8 @@ using SimpleWeightedGraphs
 using SparseArrays
 using StructArrays
 
-using ..Reference
+# Nested one level deeper than the other modules, so `Reference` is three dots up.
+using ...Reference
 
 """Relation matrix an optional `pairs` column name maps to, or `nothing`."""
 function _match_relation(colname)

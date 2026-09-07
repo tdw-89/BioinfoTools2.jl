@@ -27,7 +27,8 @@ end
 
 """
 A bare `(start_pos, end_pos, code)` interval, for callers that need no scaffold
-or vocabulary context (e.g. `Paralogs.GeneFamily`'s per-scaffold `StructArray`s).
+or vocabulary context (e.g. `Homologs.Paralogs.GeneFamily`'s per-scaffold
+`StructArray`s).
 """
 struct IntervalSimple
     start_pos::UInt32

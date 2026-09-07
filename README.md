@@ -29,7 +29,8 @@ Pkg.add([
 | `Reference` | The in-memory genome: `Species` → `Genome` → `Scaffold` → interval tree of GFF3 features. |
 | `Data` | Sample-level data loaded against a `Genome`: `BedData`, `TabularData`, `Experiment`, and interval set operations. |
 | `Data.Methylation` | Single-base methylation calls, packed 8 bytes per site, with Bismark loaders and Arrow I/O. |
-| `Paralogs` | `GeneFamily` — paralog pair relations as sparse matrices — plus reciprocal-best-hit detection. |
+| `Homologs.Paralogs` | `GeneFamily` — paralog pair relations as sparse matrices — plus reciprocal-best-hit detection. |
+| `Homologs.Orthologs` | Between-genome orthology (placeholder). |
 | `Exploration` | Coverage, density estimates, quantile binning and metagene profiles over the above. |
 | `Modeling` | Statistical models (placeholder). |
 | `Plotting` | Figures (placeholder). |
