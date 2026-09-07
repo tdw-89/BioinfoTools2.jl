@@ -27,7 +27,7 @@ end
 
 """
 A bare `(start_pos, end_pos, code)` interval, for callers that need no scaffold
-or vocabulary context (e.g. `Homologs.Paralogs.GeneFamily`'s per-scaffold
+or vocabulary context (e.g. `Homologs.Paralogs.ParalogGroup`'s per-scaffold
 `StructArray`s).
 """
 struct IntervalSimple

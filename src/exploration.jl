@@ -293,7 +293,7 @@ end
 """
     quantiles(pairs::DataFrame, ranking::Vector{String}; quantiles::Int = 4) -> DataFrame
 
-Rank the rows of a paralog-pair table (shaped like `GeneFamily`'s constructor
+Rank the rows of a paralog-pair table (shaped like `ParalogGroup`'s constructor
 input, or `rbh`'s output) by the named `ranking` columns — the first entry
 primary, each subsequent entry breaking ties in the one before it, and any
 remaining tie broken by original row order — then cut that ranking into
