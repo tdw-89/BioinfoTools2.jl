@@ -648,6 +648,227 @@ end
 end
 
 # ============================================================================
+# Tests for add_duplications_of (OrthoFinder Duplications.tsv ingestion)
+# ============================================================================
+@testset "add_duplications_of" begin
+    PG = BioinfoTools2.Homologs.Paralogs.ParalogGroup
+    depths_of = BioinfoTools2.Homologs.Paralogs._newick_depths
+
+    # Shaped like OrthoFinder's own tree. For `human`'s ancestors the depths are
+    # N0 = 1, N1 = 2, N2 = 3, and the terminal `human` = 4.
+    tree = "(mouse:0.08,(macaque:0.02,(human:0.01,(bonobo:0.004,chimp:0.004)N3:0.003)N2:0.005)N1:0.08)N0;"
+
+    # An OrthoFinder-shaped results directory, returning its Duplications.tsv.
+    function duplications_file(rows; newick = tree)
+        root = mktempdir()
+        mkpath(joinpath(root, "Species_Tree"))
+        mkpath(joinpath(root, "Gene_Duplication_Events"))
+        write(joinpath(root, "Species_Tree", "SpeciesTree_rooted_node_labels.txt"), newick)
+        path = joinpath(root, "Gene_Duplication_Events", "Duplications.tsv")
+        open(path, "w") do io
+            println(
+                io,
+                join(
+                    (
+                        "Orthogroup",
+                        "Species Tree Node",
+                        "Gene Tree Node",
+                        "Support",
+                        "Type",
+                        "Genes 1",
+                        "Genes 2",
+                    ),
+                    '\t',
+                ),
+            )
+            for row in rows
+                println(io, join(row, '\t'))
+            end
+        end
+        return path
+    end
+
+    genes = [
+        ("chr1", 100, 200, "+", "g1"),
+        ("chr1", 300, 400, "-", "g2"),
+        ("chr1", 500, 600, "+", "g3"),
+        ("chr1", 700, 800, "+", "g4"),
+    ]
+    genome = genome_from_genes(genes)
+    # g1-g2, g1-g3 and g3-g4 are pairs; only two of them are duplications the
+    # file records.
+    pairs = DataFrame(
+        q = ["g1", "g1", "g3"],
+        s = ["g2", "g3", "g4"],
+        dS = [0.5, 0.7, 0.9],
+        id_subject_query = [90.0, 80.0, 70.0],
+        id_query_subject = [91.0, 81.0, 71.0],
+    )
+    pg = PG(genome, pairs)
+
+    rows = [
+        # A non-terminal node, with a non-target species mixed into both sides.
+        ("OG0", "N2", "n1", "1.0", "Non-Terminal", "human_g1, mouse_g9", "human_g2"),
+        # A terminal node is labelled with the species name itself.
+        ("OG0", "human", "n2", "1.0", "Terminal", "human_g3", "human_g4"),
+        # Another species' duplication, which must not contribute anything.
+        ("OG1", "N1", "n3", "1.0", "Non-Terminal", "mouse_g1", "mouse_g2"),
+    ]
+
+    @testset "depths come from the tree, never the node number" begin
+        depths = depths_of(tree)
+        @test depths["N0"] == 1
+        @test depths["N1"] == 2
+        @test depths["N2"] == 3
+        @test depths["human"] == 4
+        @test depths["bonobo"] == depths["chimp"] == 5
+        @test depths["mouse"] == 2
+
+        # OrthoFinder numbers nodes by traversal order, so a number can run
+        # against depth; the nesting is what counts.
+        reversed = depths_of("(a,(b,(c,d)N1)N2)N3;")
+        @test reversed["N3"] == 1 && reversed["N2"] == 2 && reversed["N1"] == 3
+    end
+
+    @testset "annotates matched pairs and drops the rest" begin
+        local result
+        result = @test_logs (:warn, r"dropped 1 pair") add_duplications_of(
+            pg,
+            duplications_file(rows),
+            "human",
+        )
+
+        # Only the two recorded duplications remain, all four genes with them.
+        @test nnz(result.topology) == 4
+        @test sort(collect(keys(result.id_to_index))) == ["g1", "g2", "g3", "g4"]
+        @test lca_label(result, "g1", "g2") == "N2"
+        @test lca_label(result, "g3", "g4") == "human"
+        @test sort(result.lca_labels) == ["N2", "human"]
+
+        depth(a, b) =
+            result.lca_depth[minmax(result.id_to_index[a], result.id_to_index[b])...]
+        @test depth("g1", "g2") == 3.0
+        @test depth("g3", "g4") == 4.0
+
+        # The unrecorded pair loses its edge *and* the values it carried.
+        @test !result.topology[result.id_to_index["g1"], result.id_to_index["g3"]]
+        @test nnz(result.dS) == 2
+        @test result.dS[minmax(result.id_to_index["g1"], result.id_to_index["g2"])...] ==
+              0.5
+        @test result.id_subject_query[result.id_to_index["g1"], result.id_to_index["g2"]] ==
+              90.0
+
+        # Every surviving pair has a depth, so ranking by it now works.
+        @test nrow(rbh(result; levels = [:lca_depth, :dS])) == 2
+
+        # `pg` itself is untouched.
+        @test nnz(pg.topology) == 6
+        @test pg.lca === nothing
+    end
+
+    @testset "a gene left without a partner goes too" begin
+        # Only g1-g2 is recorded, so g3 and g4 lose their only pairs.
+        local result
+        result = @test_logs (:warn, r"dropped 2 pair\(s\).*2 gene") add_duplications_of(
+            pg,
+            duplications_file(rows[1:1]),
+            "human",
+        )
+        @test sort(collect(keys(result.id_to_index))) == ["g1", "g2"]
+        @test sort(collect(keys(result.intervals))) == ["chr1"]
+        @test length(result.intervals["chr1"]) == 2
+    end
+
+    @testset "overwrites any LCA the group already carried" begin
+        stale = PG(
+            genome,
+            DataFrame(
+                q = ["g1"],
+                s = ["g2"],
+                dS = [0.5],
+                lca = ["Stale"],
+                lca_depth = [99.0],
+            ),
+        )
+        result = add_duplications_of(stale, duplications_file(rows), "human")
+        @test lca_label(result, "g1", "g2") == "N2"
+        @test result.lca_labels == ["N2"]     # the stale label is gone entirely
+        @test result.lca_depth[minmax(
+            result.id_to_index["g1"],
+            result.id_to_index["g2"],
+        )...] == 3.0
+    end
+
+    @testset "species prefixes are matched whole, underscores and all" begin
+        # `pongo_abelii_g1` must not be read as species `pongo`.
+        pongo_tree = "(mouse:0.1,(pongo:0.1,pongo_abelii:0.1)N1:0.1)N0;"
+        pongo_rows = [(
+            "OG0",
+            "pongo_abelii",
+            "n1",
+            "1.0",
+            "Terminal",
+            "pongo_abelii_g1, pongo_g3",
+            "pongo_abelii_g2",
+        )]
+        path = duplications_file(pongo_rows; newick = pongo_tree)
+
+        result =
+            @test_logs (:warn, r"dropped") add_duplications_of(pg, path, "pongo_abelii")
+        @test sort(collect(keys(result.id_to_index))) == ["g1", "g2"]
+        @test lca_label(result, "g1", "g2") == "pongo_abelii"
+
+        # `pongo`'s own row names only g3, which pairs with nothing here.
+        @test_throws ArgumentError add_duplications_of(pg, path, "pongo")
+    end
+
+    @testset "min_support and transform" begin
+        weak = [("OG0", "N2", "n1", "0.3", "Non-Terminal", "human_g1", "human_g2")]
+        path = duplications_file(weak)
+        @test lca_label(add_duplications_of(pg, path, "human"), "g1", "g2") == "N2"
+        @test_throws ArgumentError add_duplications_of(pg, path, "human"; min_support = 0.5)
+
+        # Names needing a fix-up before they match the genome's IDs.
+        renamed = [("OG0", "N2", "n1", "1.0", "Non-Terminal", "human_G1", "human_G2")]
+        renamed_path = duplications_file(renamed)
+        @test_throws ArgumentError add_duplications_of(pg, renamed_path, "human")
+        result = add_duplications_of(pg, renamed_path, "human"; transform = lowercase)
+        @test lca_label(result, "g1", "g2") == "N2"
+    end
+
+    @testset "input problems are errors, not silence" begin
+        path = duplications_file(rows)
+
+        # A species the tree doesn't hold.
+        @test_throws ArgumentError add_duplications_of(pg, path, "zebrafish")
+
+        # No species tree to take depths from.
+        orphan = joinpath(mktempdir(), "Duplications.tsv")
+        cp(path, orphan)
+        @test_throws ArgumentError add_duplications_of(pg, orphan, "human")
+        @test lca_label(
+            add_duplications_of(
+                pg,
+                orphan,
+                "human";
+                species_tree = joinpath(
+                    dirname(dirname(path)),
+                    "Species_Tree",
+                    "SpeciesTree_rooted_node_labels.txt",
+                ),
+            ),
+            "g1",
+            "g2",
+        ) == "N2"
+
+        # A file that isn't a Duplications.tsv at all.
+        wrong = duplications_file(rows)
+        write(wrong, "not\ta\tduplications\tfile\n")
+        @test_throws ArgumentError add_duplications_of(pg, wrong, "human")
+    end
+end
+
+# ============================================================================
 # Tests for rbh's `levels` ranking precedence
 # ============================================================================
 @testset "rbh ranking levels" begin

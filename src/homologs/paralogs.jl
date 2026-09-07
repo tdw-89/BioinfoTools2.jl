@@ -569,6 +569,252 @@ Same as [`id_subject_query_graph`](@ref), for `pg.id_query_subject` (stored
 """
 id_query_subject_graph(pg::ParalogGroup) = _weighted_directed_graph(pg.id_query_subject)
 
+#= OrthoFinder duplication ingestion =#
+
+"""
+Depth of every labelled node of the Newick tree in `newick`, the root at 1.
+
+A label's depth is its parenthesis nesting level plus one, so an internal label
+(`N3`) and a terminal one (a species name) are read the same way and no tree
+needs building. Branch lengths are skipped.
+"""
+function _newick_depths(newick::AbstractString)
+    depths = Dict{String,Int}()
+    level = 0
+    label_start = 0
+    label_level = 0
+    reading_length = false
+
+    for (index, char) in pairs(newick)
+        if char in ('(', ')', ',', ';', ':')
+            if label_start > 0
+                label = strip(newick[label_start:prevind(newick, index)])
+                isempty(label) || (depths[String(label)] = label_level + 1)
+                label_start = 0
+            end
+            reading_length = char == ':'
+            char == '(' && (level += 1)
+            char == ')' && (level -= 1)
+        elseif !reading_length && label_start == 0 && !isspace(char)
+            label_start = index
+            label_level = level
+        end
+    end
+    return depths
+end
+
+"""Species tree OrthoFinder writes alongside a `Duplications.tsv`."""
+_species_tree_path(duplications::AbstractString) = joinpath(
+    dirname(dirname(duplications)),
+    "Species_Tree",
+    "SpeciesTree_rooted_node_labels.txt",
+)
+
+"""
+Genes of one species in a `Genes 1`/`Genes 2` field: those carrying `prefix`,
+with it stripped and `transform` applied.
+
+The prefix cannot be found by splitting on the first `_`, since a species name
+may hold one itself (`pongo_abelii_XP_054409609.1`).
+"""
+function _species_genes(
+    field::AbstractString,
+    prefix::AbstractString,
+    transform::F,
+) where {F}
+    genes = String[]
+    for name in eachsplit(field, ',')
+        name = strip(name)
+        startswith(name, prefix) || continue
+        push!(genes, String(transform(chop(name; head = length(prefix), tail = 0))))
+    end
+    return genes
+end
+
+# Restrict `m`'s stored entries to the cells `keep` admits. Done over `findnz`
+# rather than by multiplying with a mask, which would prune the explicit zeros a
+# meaningful dN/dS of 0 relies on.
+function _mask_relation(m::SparseMatrixCSC, keep::F, n_genes::Integer) where {F}
+    rows, cols, vals = findnz(m)
+    selected = findall(entry -> keep(rows[entry], cols[entry]), eachindex(rows))
+    return sparse(rows[selected], cols[selected], vals[selected], n_genes, n_genes, max)
+end
+
+"""
+    add_duplications_of(pg::ParalogGroup, path, species; species_tree = nothing,
+                        min_support = 0.0, transform = identity) -> ParalogGroup
+
+Annotate `pg`'s pairs with the duplication each descends from, read from an
+OrthoFinder `Gene_Duplication_Events/Duplications.tsv` at `path`, and return a
+**new** group — `ParalogGroup` is immutable.
+
+Only `species`' own duplications are read: a row counts when `Genes 1` *and*
+`Genes 2` both carry a gene of `species`, which is exactly the condition for the
+row's node to be an ancestor of `species`, and so for the depths collected here
+to lie on one lineage. Every cross-pair of those genes that `pg` already holds
+takes the row's `Species Tree Node` as its `lca` and that node's depth as its
+`lca_depth`; a pair reported at two nodes keeps the shallower, which is the one
+that actually separates it. Rows below `min_support`, or whose support cannot be
+read, are skipped.
+
+`lca`/`lca_depth` are **overwritten**, not merged. A pair left without one is
+dropped, together with the relation values it carried and any gene thereby left
+without a partner, so the result can always be ranked by `:lca_depth`.
+
+Depths come from `SpeciesTree_rooted_node_labels.txt`, found next to `path`
+unless `species_tree` says otherwise, and are never inferred from the node
+*number*: OrthoFinder numbers nodes by traversal order, which follows depth only
+on a ladder-shaped tree.
+
+`transform` maps an OrthoFinder gene name — species prefix already stripped — to
+the ID `pg` knows it by. Names `pg` does not hold are ignored.
+"""
+function add_duplications_of(
+    pg::ParalogGroup,
+    path::AbstractString,
+    species::AbstractString;
+    species_tree::Union{Nothing,AbstractString} = nothing,
+    min_support::Real = 0.0,
+    transform = identity,
+)
+    tree_path = something(species_tree, _species_tree_path(path))
+    isfile(tree_path) ||
+        throw(ArgumentError("No species tree at \"$tree_path\"; pass `species_tree`"))
+    depths = _newick_depths(read(tree_path, String))
+    haskey(depths, species) ||
+        throw(ArgumentError("\"$species\" is not a node of \"$tree_path\""))
+
+    prefix = species * "_"
+    # (lo, hi) => (node, depth), over `pg`'s own gene indices.
+    annotations = Dict{Tuple{Int,Int},Tuple{String,Int}}()
+    n_conflicts = 0
+
+    open(path) do io
+        header = split(readline(io), '\t')
+        function column(name)
+            index = findfirst(==(name), header)
+            isnothing(index) && throw(
+                ArgumentError(
+                    "\"$path\" has no \"$name\" column; is it a Duplications.tsv?",
+                ),
+            )
+            return index
+        end
+        node_column, support_column = column("Species Tree Node"), column("Support")
+        first_column, second_column = column("Genes 1"), column("Genes 2")
+        n_columns = max(node_column, support_column, first_column, second_column)
+
+        indices(field) = [
+            pg.id_to_index[gene] for gene in _species_genes(field, prefix, transform) if
+            haskey(pg.id_to_index, gene)
+        ]
+
+        for line in eachline(io)
+            fields = split(line, '\t')
+            length(fields) >= n_columns || continue
+
+            support = tryparse(Float64, strip(fields[support_column]))
+            (isnothing(support) || support < min_support) && continue
+
+            node = String(strip(fields[node_column]))
+            depth = get(depths, node, 0)
+            depth == 0 && continue
+
+            left = indices(fields[first_column])
+            isempty(left) && continue
+            right = indices(fields[second_column])
+            isempty(right) && continue
+
+            for a in left, b in right
+                (a == b || !pg.topology[a, b]) && continue
+                pair = minmax(a, b)
+                recorded = get(annotations, pair, nothing)
+                if isnothing(recorded)
+                    annotations[pair] = (node, depth)
+                elseif recorded[2] != depth
+                    n_conflicts += 1
+                    recorded[2] > depth && (annotations[pair] = (node, depth))
+                end
+            end
+        end
+    end
+
+    isempty(annotations) && throw(
+        ArgumentError(
+            "No pair of `pg` matched a duplication of \"$species\" in \"$path\"; check `species` and `transform`",
+        ),
+    )
+
+    # Every node kept is an ancestor of `species`, so one lineage: two nodes at
+    # one depth would break the comparability `lca_depth` rests on.
+    depth_of_node = Dict{String,Int}()
+    for (node, depth) in values(annotations)
+        depth_of_node[node] = depth
+    end
+    allunique(values(depth_of_node)) || throw(
+        ArgumentError(
+            "Nodes $(join(sort!(collect(keys(depth_of_node))), ", ")) do not lie on one lineage of \"$tree_path\"",
+        ),
+    )
+
+    n_genes = _n_genes(pg)
+    edge_i, edge_j = UInt32[], UInt32[]
+    lca_v, depth_v = UInt32[], Float64[]
+    labels = String[]
+    codes = Dict{String,UInt32}()
+    # Sorted, so the interned label order does not follow Dict hash order.
+    for pair in sort!(collect(keys(annotations)))
+        node, depth = annotations[pair]
+        push!(edge_i, pair[1])
+        push!(edge_j, pair[2])
+        push!(depth_v, Float64(depth))
+        push!(lca_v, get!(codes, node) do
+            push!(labels, node)
+            UInt32(length(labels))
+        end)
+    end
+
+    kept = Set(zip(edge_i, edge_j))
+    kept_cell(row, col) = minmax(row, col) in kept
+    masked(matrix) =
+        isnothing(matrix) ? nothing : _mask_relation(matrix, kept_cell, n_genes)
+
+    n_dropped_pairs = nnz(pg.topology) ÷ 2 - length(edge_i)
+    kept_genes = sort!(unique(vcat(Int.(edge_i), Int.(edge_j))))
+    n_dropped_genes = n_genes - length(kept_genes)
+    if n_dropped_pairs > 0
+        orphans =
+            n_dropped_genes > 0 ? ", leaving $n_dropped_genes gene(s) without a partner" :
+            ""
+        @warn "add_duplications_of: dropped $n_dropped_pairs pair(s) with no duplication recorded$orphans"
+    end
+    n_conflicts > 0 &&
+        @warn "add_duplications_of: $n_conflicts pair(s) reported at more than one node; kept the shallowest"
+
+    annotated = ParalogGroup(
+        _RawFields(),
+        pg.intervals,
+        pg.scaffold_ranges,
+        pg.id_to_index,
+        sparse(
+            vcat(edge_i, edge_j),
+            vcat(edge_j, edge_i),
+            trues(2 * length(edge_i)),
+            n_genes,
+            n_genes,
+            |,
+        ),
+        masked(pg.dN),
+        masked(pg.dS),
+        masked(pg.id_subject_query),
+        masked(pg.id_query_subject),
+        sparse(edge_i, edge_j, depth_v, n_genes, n_genes, max),
+        sparse(edge_i, edge_j, lca_v, n_genes, n_genes, min),
+        labels,
+    )
+    return annotated[kept_genes]
+end
+
 #= Reciprocal best hits =#
 
 """
@@ -684,6 +930,10 @@ function _level_value(pg::ParalogGroup, level::Symbol, a::Integer, b::Integer, s
     return -edge_identity(pg, _edge_query_subject(pg, a, b)..., scoring)
 end
 
+# First few of `indices`, so a warning naming a large component stays readable.
+_truncated(indices, limit = 4) =
+    join(Iterators.take(indices, limit), ", ") * (length(indices) > limit ? ", …" : "")
+
 """
     rbh(pg::ParalogGroup; scoring::String = "mean", levels = nothing) -> DataFrame
 
@@ -770,8 +1020,8 @@ function rbh(pg::ParalogGroup; scoring::String = "mean", levels = nothing)
     end
 
     if !isempty(tied_components)
-        groups = join(("[$(join(c, ", "))]" for c in tied_components), ", ")
-        @warn "rbh: tied best-hit distance in $(length(tied_components)) group(s): $groups"
+        groups = join(("[$(_truncated(c))]" for c in first(tied_components, 3)), ", ")
+        @warn "rbh: tied best-hit rank in $(length(tied_components)) group(s): $groups$(length(tied_components) > 3 ? ", …" : "")"
     end
 
     columns = Pair{String,Vector}["query"=>query, "subject"=>subject]
@@ -997,6 +1247,7 @@ function _index_pair_ids(paralog_df::DataFrame)
 end
 
 export ParalogGroup,
+    add_duplications_of,
     dN_graph,
     dS_graph,
     edge_identity,
