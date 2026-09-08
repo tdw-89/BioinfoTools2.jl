@@ -436,4 +436,24 @@ end
             @test isempty(s.genome[UInt32[typemax(UInt32)]])
         end
     end
+
+    @testset "feature_id" begin
+        species = Species("C. elegans")
+        add_features!(GFF_SINGLE, species.genome)
+        scaffold = first(values(species.genome.scaffolds))
+        intervals = collect(scaffold.features)
+
+        ids = [feature_id(species.genome, interval) for interval in intervals[1:20]]
+        @test all(!isnothing, ids)
+        # It resolves exactly what the record carries, without rebuilding one.
+        records = [
+            feature_record(species.genome, scaffold.name, interval) for
+            interval in intervals[1:20]
+        ]
+        @test ids == [record.id for record in records]
+
+        # An interval whose metadata index points past the store has no ID.
+        stray = Reference.IntervalValue(UInt32(1), UInt32(2), UInt64(typemax(UInt32)))
+        @test feature_id(species.genome, stray) === nothing
+    end
 end

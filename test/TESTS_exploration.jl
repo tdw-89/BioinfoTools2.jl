@@ -878,4 +878,55 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             end
         end
     end  # methylation
+
+    # ========================================================================
+    # Tests for the profile/frequency helpers
+    # ========================================================================
+    @testset "profile helpers" begin
+        EX = BioinfoTools2.Exploration
+
+        @testset "_region_index - reversed on the negative strand" begin
+            # Region [101, 110]: base 101 is the 5' end forwards, 110 backwards.
+            forward = [EX._region_index(base, 101, 110, false) for base = 101:110]
+            reverse = [EX._region_index(base, 101, 110, true) for base = 101:110]
+            @test forward == collect(1:10)
+            @test reverse == collect(10:-1:1)
+        end
+
+        @testset "_flank_slot - flanks per base, body deferred" begin
+            # flank 3, body 5 bases, 2 body bins: an 11-base region into 8 slots.
+            slots = [EX._flank_slot(base, 3, 5, 2) for base = 1:11]
+            @test slots[1:3] == [1, 2, 3]        # upstream flank, per base
+            @test all(iszero, slots[4:8])        # body, left to the caller
+            @test slots[9:11] == [6, 7, 8]       # downstream, shifted by the body
+        end
+
+        @testset "_frequency_eltype - narrowest type that fits" begin
+            @test EX._frequency_eltype(1) === UInt8
+            @test EX._frequency_eltype(255) === UInt8
+            @test EX._frequency_eltype(256) === UInt16
+            @test EX._frequency_eltype(65535) === UInt16
+            @test_throws ErrorException EX._frequency_eltype(65536)
+        end
+
+        @testset "_sweep_events - overlapping segments stack" begin
+            # Two measurements covering [2, 4] and [3, 6] of a 6-base scaffold.
+            events = sort!([(2, 1), (5, -1), (3, 1), (7, -1)])
+            frequency = EX._sweep_events(events, 6, UInt8)
+            @test length(frequency) == 6
+            @test collect(frequency) == UInt8[0, 1, 2, 2, 1, 1]
+        end
+
+        @testset "_sweep_events - a single segment" begin
+            frequency = EX._sweep_events([(3, 1), (5, -1)], 4, UInt8)
+            @test collect(frequency) == UInt8[0, 0, 1, 1]
+        end
+
+        @testset "_quantile_bin - edges fall into the lower bin" begin
+            edges = [0.0, 1.0, 2.0, 3.0, 4.0]
+            bins =
+                [EX._quantile_bin(edges, value, 4) for value in (0.0, 1.0, 2.5, 4.0, 9.0)]
+            @test bins == [1, 1, 3, 4, 4]
+        end
+    end
 end

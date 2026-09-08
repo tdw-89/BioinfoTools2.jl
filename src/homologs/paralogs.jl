@@ -15,7 +15,46 @@ using StructArrays
 # Nested one level deeper than the other modules, so `Reference` is three dots up.
 using ...Reference
 
-"""Relation matrix an optional `pairs` column name maps to, or `nothing`."""
+#= Shared helpers =#
+
+"""
+Given a `count` and a singular `noun`, phrase the two together. Returns e.g.
+`"1 pair"` or `"3 pairs"`.
+"""
+_plural(count::Integer, noun::AbstractString) = "$count $noun$(count == 1 ? "" : "s")"
+
+"""
+Given a table `column` required to hold `T` values (described by `expected`),
+check its element type. Returns `nothing`, or throws an `ArgumentError` naming
+the column after `role`.
+"""
+function _require_eltype(
+    df::DataFrame,
+    column::Integer,
+    ::Type{T},
+    expected::AbstractString,
+    role::AbstractString = "Column",
+) where {T}
+    eltype(df[:, column]) <: T && return nothing
+    throw(
+        ArgumentError(
+            "$role $column (\"$(names(df)[column])\") must contain $expected, got element type $(eltype(df[:, column]))",
+        ),
+    )
+end
+
+"""
+Given an interning table, look `name` up in it, appending it when new. Returns
+its 1-based code, so that a 0 is never a valid code.
+"""
+function _intern!(labels::Vector{String}, codes::Dict{String,UInt32}, name::AbstractString)
+    return get!(codes, String(name)) do
+        push!(labels, String(name))
+        UInt32(length(labels))
+    end
+end
+
+"""Given a `pairs` column name, return the relation it maps to, or `nothing`."""
 function _match_relation(colname)
     key = lowercase(String(colname))
     key == "dn" && return :dN
@@ -37,9 +76,43 @@ constructor).
 """
 const IDENTITY_RELATIONS = (:id_subject_query, :id_query_subject)
 
-# Marker distinguishing the raw-fields constructor (below) from the public
-# `ParalogGroup(genome, pairs)` one; kept unexported so ordinary callers can't
-# reach it and reintroduce arbitrary construction.
+#= Relation matrix construction =#
+
+"""
+Given coordinates and values over `n_genes` genes, build a relation matrix.
+Returns a `SparseMatrixCSC` in which `combine` settles a repeated cell and an
+explicit zero survives, so a meaningful dN or dS of 0 is not pruned.
+"""
+_relation(rows, cols, vals, n_genes::Integer, combine = max) =
+    sparse(UInt32.(rows), UInt32.(cols), vals, n_genes, n_genes, combine)
+
+"""
+Given one end of each edge in `edge_i`/`edge_j`, build the adjacency over
+`n_genes` genes. Returns a symmetric `SparseMatrixCSC{Bool}` setting both
+`[a, b]` and `[b, a]`.
+"""
+_topology(edge_i, edge_j, n_genes::Integer) = sparse(
+    UInt32.(vcat(edge_i, edge_j)),
+    UInt32.(vcat(edge_j, edge_i)),
+    trues(2 * length(edge_i)),
+    n_genes,
+    n_genes,
+    |,
+)
+
+"""
+Given two gene indices, read the single cell a symmetric relation stores their
+pair in. Returns `matrix[min(a, b), max(a, b)]`.
+"""
+@inline _tri(matrix::SparseMatrixCSC, a::Integer, b::Integer) = matrix[minmax(a, b)...]
+
+#= ParalogGroup =#
+
+"""
+Marker distinguishing the raw-fields `ParalogGroup` constructor from the public
+`ParalogGroup(genome, pairs)` one. Kept unexported, so ordinary callers cannot
+reach it and reintroduce arbitrary construction.
+"""
 struct _RawFields end
 
 struct ParalogGroup
@@ -70,275 +143,80 @@ struct ParalogGroup
     lca_labels::Vector{String}
 
     """
-        ParalogGroup(genome::Reference.Genome, pairs::DataFrame)
+        ParalogGroup(genome, pairs::DataFrame)
 
-    Build a `ParalogGroup` from a reference `genome` and a paralog-pair table.
+    Given a reference `genome` and a table of paralog pairs, index the genes
+    those pairs connect and build the relation matrices over them. Returns a
+    `ParalogGroup`. `docs/paralog_group.md` lists the column names matched out
+    of columns 3-8 and the layout each relation matrix follows.
 
-    `pairs` has 2-8 columns; the first two are required and taken by position,
-    the rest optional and matched to the relation matrices *by name*
-    (case-insensitive):
-
-    1. Query ID (`String`; mandatory)
-    2. Subject ID (`String`; mandatory)
-    3. `dN`               → pairwise dN (Float; optional)
-    4. `dS`               → pairwise dS (Float; optional)
-    5. `id_subject_query` → % identity subject → query (Float; optional)
-    6. `id_query_subject` → % identity query → subject (Float; optional)
-    7. `lca`              → last common ancestor of the pair (`String`; optional)
-    8. `lca_depth`        → depth of that ancestor (Float; optional)
-
-    Every matrix is `n_genes x n_genes` over those indices, oriented so the axis
-    you look up by is the (column-major) fast axis:
-
-    - `topology`         — symmetric `Bool` adjacency; a pair sets both `[a, b]`
-      and `[b, a]`, so the relation is undirected.
-    - `dN`, `dS`         — symmetric by definition, so stored **once** in the
-      upper triangle: the value for genes `a`, `b` is at `[min(a, b), max(a, b)]`.
-    - `id_subject_query` — %ID subject → query with **subjects on the columns**
-      (`[query, subject]`), so `M[:, s]` gathers subject `s`'s scores in O(nnz).
-    - `id_query_subject` — %ID query → subject with **queries on the columns**
-      (`[subject, query]`), so `M[:, q]` gathers query `q`'s scores in O(nnz).
-    - `lca_depth`        — symmetric and upper-triangular like dN/dS: the depth
-      of the speciation event preceding the pair's duplication, higher being
-      more recent. A paralog group lives in one species, whose ancestors form a
-      single lineage, so every duplication maps onto that one chain and depths
-      **are** comparable across pairs — equal depth is the same ancestral
-      lineage. Number the root 1: 0 is reserved for "not recorded", and
-      [`rbh`](@ref) refuses to rank by it.
-    - `lca`              — symmetric, so stored in the upper triangle like
-      dN/dS, but holding a 1-based index into `lca_labels` rather than a value;
-      read it back with [`lca_label`](@ref). An empty label is taken as unknown
-      and left unstored, and a repeated pair keeps the first label seen.
-
-    Only genes that end up **weakly connected** join the group: a row is kept
-    when both IDs resolve against `genome` and the pair shows some similarity,
-    and a gene is indexed only if it appears in a kept row. Two rules drop rows
-    up front, each warning about how many it took:
-
-    - a `NaN` in any matched numeric column — `NaN != NaN` would break the
-      symmetry the `*_graph` views check;
-    - a 0 in *every* matched %ID column, i.e. no alignment in either direction.
-      A pair with no %ID column at all is taken on trust.
-
-    Repeated or reciprocal entries for a cell collapse to one value.
-
-    See `getindex` for per-gene (`pg[i]`/`pg["id"]`) and sub-group
-    (`pg[indices]`/`pg[ids]`) indexing, and `topology_graph`/`dN_graph`/
-    `dS_graph`/`id_subject_query_graph`/`id_query_subject_graph` for `Graphs`/
-    `SimpleWeightedGraphs` views of the relation matrices.
+    Rows carrying a `NaN`, or 0% identity in every direction, are dropped with a
+    warning, and a gene is indexed only once a pair leaves it with a partner.
     """
     function ParalogGroup(genome::Reference.Genome, pairs::DataFrame)
         ncol(pairs) >= 2 ||
             throw(ArgumentError("`pairs` needs at least a query and a subject column"))
+        _require_eltype(pairs, 1, AbstractString, "gene IDs (strings)", "Query ID column")
+        _require_eltype(pairs, 2, AbstractString, "gene IDs (strings)", "Subject ID column")
 
-        for (column, role) in ((1, "Query"), (2, "Subject"))
-            eltype(pairs[:, column]) <: AbstractString || throw(
-                ArgumentError(
-                    "$role ID column (column $column, \"$(names(pairs)[column])\") must contain strings, got element type $(eltype(pairs[:, column]))",
-                ),
-            )
-        end
-
-        # Match the optional value columns to their target matrices by name.
-        # `lca` is categorical, so it is kept apart from the numeric relations.
-        value_columns = Dict{Symbol,Int}()
-        lca_column = nothing
-        for column = 3:ncol(pairs)
-            field = _match_relation(names(pairs)[column])
-            isnothing(field) && continue
-            field === :lca ? (lca_column = column) : (value_columns[field] = column)
-        end
-
-        for (field, column) in value_columns
-            eltype(pairs[:, column]) <: Real || throw(
-                ArgumentError(
-                    "Column \"$(names(pairs)[column])\" (matched to `$field`) must contain numeric values, got element type $(eltype(pairs[:, column]))",
-                ),
-            )
-        end
-
-        if !isnothing(lca_column)
-            eltype(pairs[:, lca_column]) <: AbstractString || throw(
-                ArgumentError(
-                    "Column \"$(names(pairs)[lca_column])\" (matched to `lca`) must contain ancestor names (strings), got element type $(eltype(pairs[:, lca_column]))",
-                ),
-            )
-        end
-
-        if !isempty(value_columns)
-            keep = trues(nrow(pairs))
-            for column in values(value_columns)
-                keep .&= .!isnan.(pairs[:, column])
-            end
-            n_dropped = count(!, keep)
-            if n_dropped > 0
-                @warn "ParalogGroup: dropped $n_dropped row$(n_dropped == 1 ? "" : "s") with a NaN relation value"
-                pairs = pairs[keep, :]
-            end
-        end
-
-        # A pair scoring 0 in every %ID direction it reports is no pair at all.
-        identity_columns =
-            [value_columns[f] for f in IDENTITY_RELATIONS if haskey(value_columns, f)]
-        if !isempty(identity_columns)
-            keep = falses(nrow(pairs))
-            for column in identity_columns
-                keep .|= .!iszero.(pairs[:, column])
-            end
-            n_dropped = count(!, keep)
-            if n_dropped > 0
-                @warn "ParalogGroup: dropped $n_dropped row$(n_dropped == 1 ? "" : "s") with 0% identity in every direction"
-                pairs = pairs[keep, :]
-            end
-        end
+        value_columns, lca_column = _pair_value_columns(pairs)
+        pairs = _filter_pair_rows(pairs, value_columns)
 
         query_ids = string.(pairs[:, 1])
         subject_ids = string.(pairs[:, 2])
-        lca_names = isnothing(lca_column) ? String[] : string.(pairs[:, lca_column])
         # Materialised up front: indexing a DataFrame cell per row is both
         # type-unstable and far slower than indexing a `Vector{Float64}`.
         values_by_field = Dict{Symbol,Vector{Float64}}(
             field => Float64.(pairs[:, column]) for (field, column) in value_columns
         )
 
-        # Resolve every ID to its feature.
-        records = genome[unique(vcat(query_ids, subject_ids))]
-
-        # A gene joins the group only through a pair whose *other* end also
-        # resolved, so no isolated vertex can reach the matrices below.
-        resolved = Set(record.id for record in records)
-        connected = Set{String}()
-        for row in eachindex(query_ids)
-            query, subject = query_ids[row], subject_ids[row]
-            (query in resolved && subject in resolved) || continue
-            push!(connected, query)
-            push!(connected, subject)
-        end
-
-        # Group the found features by scaffold, discarding repeated IDs.
-        scaffold_intervals = Dict{String,Vector{Reference.IntervalSimple}}()
-        scaffold_id_lists = Dict{String,Vector{String}}()
-        seen = Set{String}()
-        for record in records
-            (record.id in connected && !(record.id in seen)) || continue
-            push!(seen, record.id)
-            push!(
-                get!(scaffold_intervals, record.chromosome, Reference.IntervalSimple[]),
+        records = _connected_records(genome, query_ids, subject_ids)
+        intervals, scaffold_ranges, id_to_index = _layout_genes(
+            (
+                record.chromosome,
                 Reference.IntervalSimple(record.start_pos, record.end_pos, record.code),
-            )
-            push!(get!(scaffold_id_lists, record.chromosome, String[]), record.id)
-        end
-
-        # Lay the scaffolds out end to end, ordering the genes within each by
-        # position, and remember where every gene lands in the linear indexing.
-        intervals = Dict{String,StructArray{Reference.IntervalSimple}}()
-        scaffold_ranges = Dict{String,UnitRange{Int}}()
-        id_to_index = Dict{String,Int}()
-        cursor = 1
-        for name in sort!(collect(keys(scaffold_intervals)))
-            scaffold_ivs = scaffold_intervals[name]
-            ids = scaffold_id_lists[name]
-            order = sortperm(
-                eachindex(scaffold_ivs);
-                by = k -> (scaffold_ivs[k].start_pos, scaffold_ivs[k].end_pos, ids[k]),
-            )
-
-            n_scaffold_genes = length(order)
-            scaffold_ranges[name] = cursor:(cursor+n_scaffold_genes-1)
-            intervals[name] = StructArray(scaffold_ivs[order])
-            for (offset, k) in enumerate(order)
-                id_to_index[ids[k]] = cursor + offset - 1
-            end
-            cursor += n_scaffold_genes
-        end
-        n_genes = cursor - 1
-
-        has(field) = haskey(value_columns, field)
-
-        # Per-matrix coordinates/values, each oriented so the axis you look up
-        # by is the (fast) column axis; dN/dS are symmetric and fold into a
-        # single upper triangle. See the docstring for the exact conventions.
-        topo_i, topo_j = UInt32[], UInt32[]
-        tri_i, tri_j = UInt32[], UInt32[]          # shared upper-triangle coords
-        dN_v, dS_v, depth_v = Float64[], Float64[], Float64[]
-        sq_i, sq_j, sq_v = UInt32[], UInt32[], Float64[]
-        qs_i, qs_j, qs_v = UInt32[], UInt32[], Float64[]
-        lca_i, lca_j, lca_v = UInt32[], UInt32[], UInt32[]
-        lca_labels = String[]
-        lca_codes = Dict{String,UInt32}()
-
-        want_tri = has(:dN) || has(:dS) || has(:lca_depth)
-        for row = 1:nrow(pairs)
-            query, subject = query_ids[row], subject_ids[row]
-            (haskey(id_to_index, query) && haskey(id_to_index, subject)) || continue
-            query_index, subject_index = id_to_index[query], id_to_index[subject]
-
-            push!(topo_i, query_index)
-            push!(topo_j, subject_index)
-
-            if want_tri
-                lo, hi = minmax(query_index, subject_index)
-                push!(tri_i, lo)
-                push!(tri_j, hi)
-                has(:dN) && push!(dN_v, values_by_field[:dN][row])
-                has(:dS) && push!(dS_v, values_by_field[:dS][row])
-                has(:lca_depth) && push!(depth_v, values_by_field[:lca_depth][row])
-            end
-
-            if has(:id_subject_query)
-                push!(sq_i, query_index)          # subjects on the column axis
-                push!(sq_j, subject_index)
-                push!(sq_v, values_by_field[:id_subject_query][row])
-            end
-            if has(:id_query_subject)
-                push!(qs_i, subject_index)        # queries on the column axis
-                push!(qs_j, query_index)
-                push!(qs_v, values_by_field[:id_query_subject][row])
-            end
-            if !isnothing(lca_column) && !isempty(lca_names[row])
-                code = get!(lca_codes, lca_names[row]) do
-                    push!(lca_labels, lca_names[row])
-                    UInt32(length(lca_labels))
-                end
-                lo, hi = minmax(query_index, subject_index)
-                push!(lca_i, lo)
-                push!(lca_j, hi)
-                push!(lca_v, code)
-            end
-        end
-
-        # `max` collapses repeated/reciprocal writes to one value rather than
-        # summing them; topology is symmetrised (both directions) and ORed.
-        topology = sparse(
-            vcat(topo_i, topo_j),
-            vcat(topo_j, topo_i),
-            trues(2 * length(topo_i)),
-            n_genes,
-            n_genes,
-            |,
+                record.id,
+            ) for record in records
         )
-        relation(rows, cols, vals) = sparse(rows, cols, vals, n_genes, n_genes, max)
+        n_genes = length(id_to_index)
+
+        queries, subjects, rows = _pair_edges(query_ids, subject_ids, id_to_index)
+        lower, upper = _upper_triangle(queries, subjects)
+
+        # Symmetric relations fold into the shared upper triangle; the directed
+        # ones are oriented so the axis you look up by is the fast (column) one.
+        symmetric(field) =
+            haskey(value_columns, field) ?
+            _relation(lower, upper, values_by_field[field][rows], n_genes) : nothing
+        directed(field, matrix_rows, matrix_cols) =
+            haskey(value_columns, field) ?
+            _relation(matrix_rows, matrix_cols, values_by_field[field][rows], n_genes) :
+            nothing
+
+        lca, lca_labels =
+            isnothing(lca_column) ? (nothing, String[]) :
+            _lca_relation(lower, upper, string.(pairs[:, lca_column]), rows, n_genes)
 
         return new(
             intervals,
             scaffold_ranges,
             id_to_index,
-            topology,
-            has(:dN) ? relation(tri_i, tri_j, dN_v) : nothing,
-            has(:dS) ? relation(tri_i, tri_j, dS_v) : nothing,
-            has(:id_subject_query) ? relation(sq_i, sq_j, sq_v) : nothing,
-            has(:id_query_subject) ? relation(qs_i, qs_j, qs_v) : nothing,
-            has(:lca_depth) ? relation(tri_i, tri_j, depth_v) : nothing,
-            # `min` keeps the first label seen, codes being assigned in order.
-            isnothing(lca_column) ? nothing :
-            sparse(lca_i, lca_j, lca_v, n_genes, n_genes, min),
+            _topology(queries, subjects, n_genes),
+            symmetric(:dN),
+            symmetric(:dS),
+            directed(:id_subject_query, queries, subjects),
+            directed(:id_query_subject, subjects, queries),
+            symmetric(:lca_depth),
+            lca,
             lca_labels,
         )
     end
 
-    # Internal-only: build directly from already-resolved fields, used by the
-    # sub-group `getindex` methods below. The `_RawFields` marker keeps this
-    # unreachable from `ParalogGroup(...)` calls outside this module.
+    """
+    Given already-resolved fields, build a group directly. Returns it; the
+    [`_RawFields`](@ref) marker keeps this unreachable from `ParalogGroup(...)`
+    calls outside the module, so [`_rebuild`](@ref) is the only way in.
+    """
     function ParalogGroup(
         ::_RawFields,
         intervals::Dict{String,StructArray{Reference.IntervalSimple}},
@@ -375,15 +253,232 @@ _n_genes(pg::ParalogGroup) = size(pg.topology, 1)
 """Reverse of `pg.id_to_index`: linear gene index to gene ID."""
 _index_to_id(pg::ParalogGroup) = Dict(index => id for (id, index) in pg.id_to_index)
 
-function Base.show(io::IO, pg::ParalogGroup)
+"""
+Given a per-relation `relation(field)` transform, build a group carrying `pg`'s
+identity. Returns a new `ParalogGroup`, taking every field not passed as a
+keyword from `pg` unchanged.
+"""
+function _rebuild(
+    pg::ParalogGroup,
+    relation::F;
+    intervals = pg.intervals,
+    scaffold_ranges = pg.scaffold_ranges,
+    id_to_index = pg.id_to_index,
+    topology = pg.topology,
+    lca_labels = pg.lca_labels,
+) where {F}
+    return ParalogGroup(
+        _RawFields(),
+        intervals,
+        scaffold_ranges,
+        id_to_index,
+        topology,
+        relation(:dN),
+        relation(:dS),
+        relation(:id_subject_query),
+        relation(:id_query_subject),
+        relation(:lca_depth),
+        relation(:lca),
+        lca_labels,
+    )
+end
+
+#= Constructor stages =#
+
+"""
+Given a `pairs` table, match its optional columns to the relations they carry
+and check their element types. Returns `(value_columns, lca_column)`, a
+`Symbol => column` map of the numeric relations plus the categorical `lca`
+column, which is `nothing` when absent.
+"""
+function _pair_value_columns(pairs::DataFrame)
+    value_columns = Dict{Symbol,Int}()
+    lca_column = nothing
+    for column = 3:ncol(pairs)
+        field = _match_relation(names(pairs)[column])
+        isnothing(field) && continue
+        field === :lca ? (lca_column = column) : (value_columns[field] = column)
+    end
+
+    for column in values(value_columns)
+        _require_eltype(pairs, column, Real, "numbers", "Relation column")
+    end
+    isnothing(lca_column) || _require_eltype(
+        pairs,
+        lca_column,
+        AbstractString,
+        "ancestor names (strings)",
+        "Ancestor column",
+    )
+    return value_columns, lca_column
+end
+
+"""
+Given a row mask and the `reason` the rejected rows failed it, restrict `pairs`
+to the rows `keep` admits. Returns the survivors, warning with a count whenever
+anything is dropped.
+"""
+function _drop_rows(pairs::DataFrame, keep::AbstractVector{Bool}, reason::AbstractString)
+    n_dropped = count(!, keep)
+    n_dropped == 0 && return pairs
+    @warn "ParalogGroup: dropped $(_plural(n_dropped, "row")) $reason"
+    return pairs[keep, :]
+end
+
+"""
+Given the matched numeric columns of `pairs`, drop the rows that describe no
+pair at all. Returns the surviving rows.
+
+A `NaN` would break the symmetry the `*_graph` views check, and a 0 in every
+matched %ID column is no alignment in either direction; a table carrying no %ID
+column is taken on trust.
+"""
+function _filter_pair_rows(pairs::DataFrame, value_columns::Dict{Symbol,Int})
+    if !isempty(value_columns)
+        keep = trues(nrow(pairs))
+        for column in values(value_columns)
+            keep .&= .!isnan.(pairs[:, column])
+        end
+        pairs = _drop_rows(pairs, keep, "with a NaN relation value")
+    end
+
+    identity_columns =
+        [value_columns[f] for f in IDENTITY_RELATIONS if haskey(value_columns, f)]
+    if !isempty(identity_columns)
+        keep = falses(nrow(pairs))
+        for column in identity_columns
+            keep .|= .!iszero.(pairs[:, column])
+        end
+        pairs = _drop_rows(pairs, keep, "with 0% identity in every direction")
+    end
+    return pairs
+end
+
+"""
+Given every row's query and subject ID, resolve them against `genome` and keep
+the features paired with another resolved one. Returns those `FeatureRecord`s,
+each at most once, so no isolated vertex can reach the relation matrices.
+"""
+function _connected_records(genome::Reference.Genome, query_ids, subject_ids)
+    records = genome[unique(vcat(query_ids, subject_ids))]
+    resolved = Set(record.id for record in records)
+
+    connected = Set{String}()
+    for row in eachindex(query_ids)
+        query, subject = query_ids[row], subject_ids[row]
+        (query in resolved && subject in resolved) || continue
+        push!(connected, query)
+        push!(connected, subject)
+    end
+
+    seen = Set{String}()
+    return filter(records) do record
+        (record.id in connected && !(record.id in seen)) || return false
+        push!(seen, record.id)
+        return true
+    end
+end
+
+"""
+Given `(scaffold, interval, id)` triples, lay the scaffolds out end to end and
+order the genes within each by position. Returns
+`(intervals, scaffold_ranges, id_to_index)`, a group's linear gene indexing.
+"""
+function _layout_genes(genes)
+    Entry = Tuple{Reference.IntervalSimple,String}
+    by_scaffold = Dict{String,Vector{Entry}}()
+    for (scaffold, interval, id) in genes
+        push!(get!(by_scaffold, scaffold, Entry[]), (interval, id))
+    end
+
+    intervals = Dict{String,StructArray{Reference.IntervalSimple}}()
+    scaffold_ranges = Dict{String,UnitRange{Int}}()
+    id_to_index = Dict{String,Int}()
+    cursor = 1
+    for name in sort!(collect(keys(by_scaffold)))
+        on_scaffold = sort!(
+            by_scaffold[name];
+            by = entry -> (entry[1].start_pos, entry[1].end_pos, entry[2]),
+        )
+        scaffold_ranges[name] = cursor:(cursor+length(on_scaffold)-1)
+        intervals[name] =
+            StructArray(Reference.IntervalSimple[interval for (interval, _) in on_scaffold])
+        for (offset, (_, id)) in enumerate(on_scaffold)
+            id_to_index[id] = cursor + offset - 1
+        end
+        cursor += length(on_scaffold)
+    end
+    return intervals, scaffold_ranges, id_to_index
+end
+
+"""
+Given every row's query and subject ID, resolve the rows whose ends are both
+indexed. Returns `(query_indices, subject_indices, rows)` as parallel vectors.
+"""
+function _pair_edges(query_ids, subject_ids, id_to_index::Dict{String,Int})
+    queries, subjects, rows = Int[], Int[], Int[]
+    for row in eachindex(query_ids)
+        query = get(id_to_index, query_ids[row], 0)
+        subject = get(id_to_index, subject_ids[row], 0)
+        (query == 0 || subject == 0) && continue
+        push!(queries, query)
+        push!(subjects, subject)
+        push!(rows, row)
+    end
+    return queries, subjects, rows
+end
+
+"""
+Given the two ends of each pair, order them. Returns `(lower, upper)`, the
+upper-triangle cell a symmetric relation stores each pair in.
+"""
+_upper_triangle(queries::Vector{Int}, subjects::Vector{Int}) = (
+    Int[min(query, subject) for (query, subject) in zip(queries, subjects)],
+    Int[max(query, subject) for (query, subject) in zip(queries, subjects)],
+)
+
+"""
+Given each pair's ancestor name, build the `lca` relation over `n_genes` genes.
+Returns `(matrix, labels)`, the matrix holding 1-based codes into `labels`.
+
+An empty name is taken as unknown and left unstored, and a repeated pair keeps
+the first name seen.
+"""
+function _lca_relation(lower, upper, names::Vector{String}, rows::Vector{Int}, n_genes)
+    labels = String[]
+    codes = Dict{String,UInt32}()
+    cell_i, cell_j, cell_codes = Int[], Int[], UInt32[]
+    for (entry, row) in enumerate(rows)
+        isempty(names[row]) && continue
+        push!(cell_i, lower[entry])
+        push!(cell_j, upper[entry])
+        push!(cell_codes, _intern!(labels, codes, names[row]))
+    end
+    # `min` keeps the first name seen, codes being assigned in order.
+    return _relation(cell_i, cell_j, cell_codes, n_genes, min), labels
+end
+
+#= Gene lookup =#
+
+"""Given a gene index, check it lies within `pg`. Returns it as an `Int`."""
+function _gene_index(pg::ParalogGroup, index::Integer)
     n = _n_genes(pg)
-    n_scaffolds = length(pg.scaffold_ranges)
-    n_pairs = nnz(pg.topology) ÷ 2
+    1 <= index <= n || throw(ArgumentError("gene index $index out of bounds (1:$n)"))
+    return Int(index)
+end
+
+"""Given a gene ID, look up its linear index in `pg`. Returns it as an `Int`."""
+function _gene_index(pg::ParalogGroup, id::AbstractString)
+    haskey(pg.id_to_index, id) || throw(ArgumentError("Unknown gene ID: \"$id\""))
+    return pg.id_to_index[id]
+end
+
+function Base.show(io::IO, pg::ParalogGroup)
     present = [String(field) for field in RELATIONS if !isnothing(getfield(pg, field))]
     isnothing(pg.lca) || push!(present, "lca")
     print(
         io,
-        "ParalogGroup($n gene$(n == 1 ? "" : "s"), $n_scaffolds scaffold$(n_scaffolds == 1 ? "" : "s"), $n_pairs pair$(n_pairs == 1 ? "" : "s"); relations: $(isempty(present) ? "none" : join(present, ", ")))",
+        "ParalogGroup($(_plural(_n_genes(pg), "gene")), $(_plural(length(pg.scaffold_ranges), "scaffold")), $(_plural(nnz(pg.topology) ÷ 2, "pair")); relations: $(isempty(present) ? "none" : join(present, ", ")))",
     )
 end
 
@@ -391,153 +486,115 @@ end
     pg[i::Integer]
     pg[id::AbstractString]
 
-Return column `i` (or the column for gene `id`) from every relation matrix
-present on `pg`, as a `Dict{Symbol, Vector}` keyed by `:topology` and whichever
-of `:dN`, `:dS`, `:id_subject_query`, `:id_query_subject`, `:lca_depth`, `:lca`
-are non-`nothing`. The `:lca` entry holds the ancestor *names*, `""` where the
-pair has none.
+Given a gene, gather its column from every relation matrix present on `pg`.
+Returns a `Dict{Symbol, Vector}` keyed by `:topology` and the relations `pg`
+holds, `:lca` surfacing ancestor names rather than codes.
 
-`dN`/`dS`/`lca_depth`/`lca` store only their upper triangle (see the
-`ParalogGroup` docstring), so column `i` alone only surfaces partners with a
-smaller index; combine with row `i` for the complete symmetric relation.
-
-A relation stores an explicit zero, so a recorded 0 is a real value here; a 0
-for a pair that was never recorded looks identical, and `:topology` in the same
-dict is the authority on which pairs exist at all.
+**NOTE:** the symmetric relations store only their upper triangle, so a column
+alone surfaces just the partners with a smaller index; and since a stored 0 is a
+real value, `:topology` is the authority on which pairs exist.
 """
 function Base.getindex(pg::ParalogGroup, i::Integer)
-    n = _n_genes(pg)
-    1 <= i <= n || throw(ArgumentError("gene index $i out of bounds (1:$n)"))
-    columns = Dict{Symbol,Vector}(:topology => Vector(pg.topology[:, i]))
+    gene = _gene_index(pg, i)
+    columns = Dict{Symbol,Vector}(:topology => Vector(pg.topology[:, gene]))
     for field in RELATIONS
         matrix = getfield(pg, field)
-        isnothing(matrix) || (columns[field] = Vector(matrix[:, i]))
+        isnothing(matrix) || (columns[field] = Vector(matrix[:, gene]))
     end
-    isnothing(pg.lca) ||
-        (columns[:lca] = [iszero(code) ? "" : pg.lca_labels[code] for code in pg.lca[:, i]])
+    isnothing(pg.lca) || (
+        columns[:lca] =
+            [iszero(code) ? "" : pg.lca_labels[code] for code in pg.lca[:, gene]]
+    )
     return columns
 end
 
-function Base.getindex(pg::ParalogGroup, id::AbstractString)
-    haskey(pg.id_to_index, id) || throw(ArgumentError("Unknown gene ID: \"$id\""))
-    return pg[pg.id_to_index[id]]
-end
+Base.getindex(pg::ParalogGroup, id::AbstractString) = pg[_gene_index(pg, id)]
 
 """
     pg[indices::AbstractVector{<:Integer}]
     pg[ids::AbstractVector{<:AbstractString}]
 
-Return a new `ParalogGroup` restricted to the given genes (a "sub-group"): every
-relation matrix present on `pg` is sliced to just those genes, and
-`intervals`/`scaffold_ranges` are rebuilt to stay concordant with the new,
-contiguous linear indexing. `lca_labels` is carried over whole, so a label the
-sub-group no longer uses simply goes unreferenced.
+Given a set of genes, slice `pg` down to them. Returns a new `ParalogGroup` whose
+relation matrices, `intervals` and `scaffold_ranges` are all concordant with the
+new, contiguous linear indexing.
+
+`lca_labels` is carried over whole, so a label the sub-group no longer uses
+simply goes unreferenced.
 """
 function Base.getindex(pg::ParalogGroup, indices::AbstractVector{<:Integer})
     isempty(indices) && throw(ArgumentError("`indices` must be non-empty"))
-    n = _n_genes(pg)
-    all(i -> 1 <= i <= n, indices) ||
-        throw(ArgumentError("gene index out of bounds (1:$n)"))
-
-    order = sort!(unique(collect(Int, indices)))
+    order = sort!(unique(Int[_gene_index(pg, index) for index in indices]))
     order_set = Set(order)
     index_to_id = _index_to_id(pg)
 
-    new_intervals = Dict{String,StructArray{Reference.IntervalSimple}}()
-    new_ranges = Dict{String,UnitRange{Int}}()
-    new_id_to_index = Dict{String,Int}()
-    cursor = 1
-    for name in sort!(collect(keys(pg.scaffold_ranges)))
-        range = pg.scaffold_ranges[name]
-        kept = filter(in(order_set), range)
-        isempty(kept) && continue
+    intervals, scaffold_ranges, id_to_index = _layout_genes(
+        (name, pg.intervals[name][gene-first(range)+1], index_to_id[gene]) for
+        (name, range) in pg.scaffold_ranges for gene in range if gene in order_set
+    )
 
-        new_intervals[name] =
-            StructArray([pg.intervals[name][gene-first(range)+1] for gene in kept])
-        new_ranges[name] = cursor:(cursor+length(kept)-1)
-        for (offset, gene) in enumerate(kept)
-            new_id_to_index[index_to_id[gene]] = cursor + offset - 1
-        end
-        cursor += length(kept)
-    end
-
-    function relation(field)
-        matrix = getfield(pg, field)
-        return isnothing(matrix) ? nothing : matrix[order, order]
-    end
-
-    return ParalogGroup(
-        _RawFields(),
-        new_intervals,
-        new_ranges,
-        new_id_to_index,
-        pg.topology[order, order],
-        relation(:dN),
-        relation(:dS),
-        relation(:id_subject_query),
-        relation(:id_query_subject),
-        relation(:lca_depth),
-        relation(:lca),
-        pg.lca_labels,
+    return _rebuild(
+        pg,
+        function (field)
+            matrix = getfield(pg, field)
+            return isnothing(matrix) ? nothing : matrix[order, order]
+        end;
+        intervals = intervals,
+        scaffold_ranges = scaffold_ranges,
+        id_to_index = id_to_index,
+        topology = pg.topology[order, order],
     )
 end
 
 function Base.getindex(pg::ParalogGroup, ids::AbstractVector{<:AbstractString})
     isempty(ids) && throw(ArgumentError("`ids` must be non-empty"))
-    indices = map(ids) do id
-        haskey(pg.id_to_index, id) || throw(ArgumentError("Unknown gene ID: \"$id\""))
-        pg.id_to_index[id]
-    end
-    return pg[indices]
+    return pg[Int[_gene_index(pg, id) for id in ids]]
 end
 
 """
     lca_label(pg::ParalogGroup, a, b) -> Union{Nothing, String}
 
-Name of the last common ancestor recorded for the pair of genes `a` and `b`
-(linear indices or gene IDs), or `nothing` when `pg` has no `lca` relation or
-the pair has no ancestor recorded. The relation is symmetric, so argument order
-does not matter.
+Given two genes (linear indices or gene IDs), look up the last common ancestor
+recorded for the pair. Returns its name, or `nothing` when `pg` has no `lca`
+relation or the pair has none recorded. Argument order does not matter.
 """
 function lca_label(pg::ParalogGroup, a::Integer, b::Integer)
     isnothing(pg.lca) && return nothing
-    n = _n_genes(pg)
-    all(i -> 1 <= i <= n, (a, b)) || throw(ArgumentError("gene index out of bounds (1:$n)"))
-    code = pg.lca[minmax(a, b)...]
+    code = _tri(pg.lca, _gene_index(pg, a), _gene_index(pg, b))
     return iszero(code) ? nothing : pg.lca_labels[code]
 end
 
-function lca_label(pg::ParalogGroup, a::AbstractString, b::AbstractString)
-    for id in (a, b)
-        haskey(pg.id_to_index, id) || throw(ArgumentError("Unknown gene ID: \"$id\""))
-    end
-    return lca_label(pg, pg.id_to_index[a], pg.id_to_index[b])
-end
+lca_label(pg::ParalogGroup, a::AbstractString, b::AbstractString) =
+    lca_label(pg, _gene_index(pg, a), _gene_index(pg, b))
 
 #= Graph views =#
 
 """
     topology_graph(pg::ParalogGroup) -> SimpleGraph
 
-Unweighted `Graphs.SimpleGraph` view of `pg.topology`: vertex `v` is gene `v`
-(see `pg.id_to_index` for the name), and edge `u-v` marks a topology pair.
+Given a group, view its topology as an unweighted `Graphs.SimpleGraph`. Returns
+that graph, in which vertex `v` is gene `v` (see `pg.id_to_index` for the name)
+and edge `u-v` marks a topology pair.
 """
 topology_graph(pg::ParalogGroup) = SimpleGraph(pg.topology)
 
+"""
+Given a symmetric relation, view it as a weighted graph. Returns that graph, or
+`nothing` for an absent relation; `SimpleWeightedGraph` needs a fully symmetric
+adjacency matrix, so the stored upper triangle is mirrored first.
+"""
 _weighted_undirected_graph(::Nothing) = nothing
-# dN/dS store only their upper triangle; SimpleWeightedGraph requires a fully
-# symmetric adjacency matrix, so mirror it across the diagonal first.
 _weighted_undirected_graph(m::SparseMatrixCSC) = SimpleWeightedGraph(m + permutedims(m))
 
 """
     dN_graph(pg::ParalogGroup) -> Union{Nothing, SimpleWeightedGraph}
 
-Undirected `SimpleWeightedGraphs.SimpleWeightedGraph` view of `pg.dN`, or
-`nothing` if `dN` wasn't supplied.
+Given a group, view its `dN` relation as an undirected
+`SimpleWeightedGraphs.SimpleWeightedGraph`. Returns that graph, or `nothing`
+when `dN` wasn't supplied.
 
-A weighted graph represents "no edge" as weight 0, and the symmetrisation above
-prunes zeros besides, so a pair whose value is 0 — a dN of 0 between recent
-duplicates, say — has no edge here. Use `pg.topology` to ask which pairs exist.
+**NOTE:** a weighted graph represents "no edge" as weight 0, and symmetrising
+prunes zeros besides, so a pair whose dN is 0 has no edge here. Ask
+`pg.topology` which pairs exist.
 """
 dN_graph(pg::ParalogGroup) = _weighted_undirected_graph(pg.dN)
 
@@ -548,16 +605,21 @@ Same as [`dN_graph`](@ref), for `pg.dS`.
 """
 dS_graph(pg::ParalogGroup) = _weighted_undirected_graph(pg.dS)
 
+"""
+Given a directed relation, view it as a weighted digraph. Returns that graph, or
+`nothing` for an absent relation; the relation is already directed, so nothing
+is symmetrised.
+"""
 _weighted_directed_graph(::Nothing) = nothing
 _weighted_directed_graph(m::SparseMatrixCSC) = SimpleWeightedDiGraph(m)
 
 """
     id_subject_query_graph(pg::ParalogGroup) -> Union{Nothing, SimpleWeightedDiGraph}
 
-Directed `SimpleWeightedGraphs.SimpleWeightedDiGraph` view of
-`pg.id_subject_query`, or `nothing` if it wasn't supplied. Edge `i -> j` carries
-weight `M[i, j]`, following the stored `[query, subject]` axis convention (see
-the `ParalogGroup` docstring) — no symmetrisation, since the relation is directed.
+Given a group, view its `id_subject_query` relation as a
+`SimpleWeightedGraphs.SimpleWeightedDiGraph`. Returns that graph, or `nothing`
+when the relation wasn't supplied. Edge `i -> j` carries weight `M[i, j]`, with
+no symmetrisation, the relation being directed.
 """
 id_subject_query_graph(pg::ParalogGroup) = _weighted_directed_graph(pg.id_subject_query)
 
@@ -572,7 +634,8 @@ id_query_subject_graph(pg::ParalogGroup) = _weighted_directed_graph(pg.id_query_
 #= OrthoFinder duplication ingestion =#
 
 """
-Depth of every labelled node of the Newick tree in `newick`, the root at 1.
+Given a Newick tree, read the depth of every labelled node, the root at 1.
+Returns a `label => depth` map.
 
 A label's depth is its parenthesis nesting level plus one, so an internal label
 (`N3`) and a terminal one (a species name) are read the same way and no tree
@@ -611,11 +674,11 @@ _species_tree_path(duplications::AbstractString) = joinpath(
 )
 
 """
-Genes of one species in a `Genes 1`/`Genes 2` field: those carrying `prefix`,
-with it stripped and `transform` applied.
+Given a `Genes 1`/`Genes 2` field, pick out the genes of one species. Returns
+those carrying `prefix`, with it stripped and `transform` applied.
 
-The prefix cannot be found by splitting on the first `_`, since a species name
-may hold one itself (`pongo_abelii_XP_054409609.1`).
+**NOTE:** the prefix cannot be found by splitting on the first `_`, since a
+species name may hold one itself (`pongo_abelii_XP_054409609.1`).
 """
 function _species_genes(
     field::AbstractString,
@@ -631,43 +694,185 @@ function _species_genes(
     return genes
 end
 
-# Restrict `m`'s stored entries to the cells `keep` admits. Done over `findnz`
-# rather than by multiplying with a mask, which would prune the explicit zeros a
-# meaningful dN/dS of 0 relies on.
+"""
+Given a cell predicate, restrict `m`'s stored entries to the cells it admits.
+Returns the restricted matrix, or `nothing` for a relation `pg` never held.
+
+Done over `findnz` rather than by multiplying with a mask, which would prune the
+explicit zeros a meaningful dN/dS of 0 relies on.
+"""
 function _mask_relation(m::SparseMatrixCSC, keep::F, n_genes::Integer) where {F}
     rows, cols, vals = findnz(m)
     selected = findall(entry -> keep(rows[entry], cols[entry]), eachindex(rows))
-    return sparse(rows[selected], cols[selected], vals[selected], n_genes, n_genes, max)
+    return _relation(rows[selected], cols[selected], vals[selected], n_genes)
+end
+
+_mask_relation(::Nothing, keep, n_genes::Integer) = nothing
+
+"""
+Given a `Duplications.tsv` header, locate the columns this reader needs.
+Returns them as a `NamedTuple` of indices.
+"""
+function _duplication_columns(header::Vector{<:AbstractString}, path::AbstractString)
+    function column(name)
+        index = findfirst(==(name), header)
+        isnothing(index) && throw(
+            ArgumentError("\"$path\" has no \"$name\" column; is it a Duplications.tsv?"),
+        )
+        return index
+    end
+    return (
+        node = column("Species Tree Node"),
+        support = column("Support"),
+        first_genes = column("Genes 1"),
+        second_genes = column("Genes 2"),
+    )
 end
 
 """
-    add_duplications_of(pg::ParalogGroup, path, species; species_tree = nothing,
+Given the two gene sets of one duplication, record it against every pair of `pg`
+they span. Returns how many of those pairs were already recorded at a different
+depth, the shallower of the two — the one that actually separates the pair —
+being kept.
+"""
+function _record_duplication!(
+    annotations::Dict{Tuple{Int,Int},Tuple{String,Int}},
+    pg::ParalogGroup,
+    left::Vector{Int},
+    right::Vector{Int},
+    node::String,
+    depth::Int,
+)
+    n_conflicts = 0
+    for a in left, b in right
+        (a == b || !pg.topology[a, b]) && continue
+        pair = minmax(a, b)
+        recorded = get(annotations, pair, nothing)
+        if isnothing(recorded)
+            annotations[pair] = (node, depth)
+        elseif recorded[2] != depth
+            n_conflicts += 1
+            recorded[2] > depth && (annotations[pair] = (node, depth))
+        end
+    end
+    return n_conflicts
+end
+
+"""
+Given an open `Duplications.tsv`, collect the duplication each of `pg`'s pairs
+descends from. Returns `(annotations, n_conflicts)`, the annotations mapping an
+upper-triangle cell to its `(node, depth)`.
+
+Rows below `min_support`, or whose support cannot be read, are skipped, as are
+nodes absent from `depths`.
+"""
+function _read_duplications(
+    io::IO,
+    path::AbstractString,
+    pg::ParalogGroup,
+    prefix::AbstractString,
+    transform::F,
+    depths::Dict{String,Int},
+    min_support::Real,
+) where {F}
+    columns = _duplication_columns(split(readline(io), '\t'), path)
+    n_columns = maximum(columns)
+    annotations = Dict{Tuple{Int,Int},Tuple{String,Int}}()
+    n_conflicts = 0
+
+    indices(field) = [
+        pg.id_to_index[gene] for
+        gene in _species_genes(field, prefix, transform) if haskey(pg.id_to_index, gene)
+    ]
+
+    for line in eachline(io)
+        fields = split(line, '\t')
+        length(fields) >= n_columns || continue
+
+        support = tryparse(Float64, strip(fields[columns.support]))
+        (isnothing(support) || support < min_support) && continue
+
+        node = String(strip(fields[columns.node]))
+        depth = get(depths, node, 0)
+        depth == 0 && continue
+
+        left = indices(fields[columns.first_genes])
+        isempty(left) && continue
+        right = indices(fields[columns.second_genes])
+        isempty(right) && continue
+
+        n_conflicts += _record_duplication!(annotations, pg, left, right, node, depth)
+    end
+    return annotations, n_conflicts
+end
+
+"""
+Given the collected duplications, check their nodes lie on one lineage. Returns
+`nothing`, or throws when two nodes share a depth — which would break the
+comparability `lca_depth` rests on.
+"""
+function _check_one_lineage(annotations, tree_path::AbstractString)
+    depth_of_node = Dict{String,Int}()
+    for (node, depth) in values(annotations)
+        depth_of_node[node] = depth
+    end
+    allunique(values(depth_of_node)) || throw(
+        ArgumentError(
+            "Nodes $(join(sort!(collect(keys(depth_of_node))), ", ")) do not lie on one lineage of \"$tree_path\"",
+        ),
+    )
+    return nothing
+end
+
+"""
+Given the collected duplications, turn them into relation coordinates. Returns
+`(edge_i, edge_j, lca_codes, depths, labels)`, ordered by pair so that the
+interned label order does not follow `Dict` hash order.
+"""
+function _annotation_entries(annotations::Dict{Tuple{Int,Int},Tuple{String,Int}})
+    edge_i, edge_j = Int[], Int[]
+    lca_codes, depth_values = UInt32[], Float64[]
+    labels = String[]
+    codes = Dict{String,UInt32}()
+
+    for pair in sort!(collect(keys(annotations)))
+        node, depth = annotations[pair]
+        push!(edge_i, pair[1])
+        push!(edge_j, pair[2])
+        push!(depth_values, Float64(depth))
+        push!(lca_codes, _intern!(labels, codes, node))
+    end
+    return edge_i, edge_j, lca_codes, depth_values, labels
+end
+
+"""
+Given what [`add_duplications_of`](@ref) dropped, report it. Returns `nothing`,
+warning once for the pairs left unannotated and once for the pairs reported at
+more than one node.
+"""
+function _warn_duplication_losses(n_pairs::Int, n_genes::Int, n_conflicts::Int)
+    if n_pairs > 0
+        orphans =
+            n_genes > 0 ? ", leaving $(_plural(n_genes, "gene")) without a partner" : ""
+        @warn "add_duplications_of: dropped $(_plural(n_pairs, "pair")) with no duplication recorded$orphans"
+    end
+    n_conflicts > 0 &&
+        @warn "add_duplications_of: $(_plural(n_conflicts, "pair")) reported at more than one node; kept the shallowest"
+    return nothing
+end
+
+"""
+    add_duplications_of(pg, path, species; species_tree = nothing,
                         min_support = 0.0, transform = identity) -> ParalogGroup
 
-Annotate `pg`'s pairs with the duplication each descends from, read from an
-OrthoFinder `Gene_Duplication_Events/Duplications.tsv` at `path`, and return a
-**new** group — `ParalogGroup` is immutable.
+Given an OrthoFinder `Duplications.tsv` at `path`, annotate `pg`'s pairs with the
+duplication each descends from. Returns a **new** group; only `species`' own
+duplications count, which is what puts every depth on one lineage. Depths come
+from `species_tree`, by default the `SpeciesTree_rooted_node_labels.txt` beside
+`path`; `transform` maps a gene name, species prefix stripped, to `pg`'s own ID.
 
-Only `species`' own duplications are read: a row counts when `Genes 1` *and*
-`Genes 2` both carry a gene of `species`, which is exactly the condition for the
-row's node to be an ancestor of `species`, and so for the depths collected here
-to lie on one lineage. Every cross-pair of those genes that `pg` already holds
-takes the row's `Species Tree Node` as its `lca` and that node's depth as its
-`lca_depth`; a pair reported at two nodes keeps the shallower, which is the one
-that actually separates it. Rows below `min_support`, or whose support cannot be
-read, are skipped.
-
-`lca`/`lca_depth` are **overwritten**, not merged. A pair left without one is
-dropped, together with the relation values it carried and any gene thereby left
-without a partner, so the result can always be ranked by `:lca_depth`.
-
-Depths come from `SpeciesTree_rooted_node_labels.txt`, found next to `path`
-unless `species_tree` says otherwise, and are never inferred from the node
-*number*: OrthoFinder numbers nodes by traversal order, which follows depth only
-on a ladder-shaped tree.
-
-`transform` maps an OrthoFinder gene name — species prefix already stripped — to
-the ID `pg` knows it by. Names `pg` does not hold are ignored.
+**NOTE:** `lca`/`lca_depth` are overwritten, and a pair with no duplication
+recorded is dropped, so the result is always rankable by `:lca_depth`.
 """
 function add_duplications_of(
     pg::ParalogGroup,
@@ -684,133 +889,40 @@ function add_duplications_of(
     haskey(depths, species) ||
         throw(ArgumentError("\"$species\" is not a node of \"$tree_path\""))
 
-    prefix = species * "_"
-    # (lo, hi) => (node, depth), over `pg`'s own gene indices.
-    annotations = Dict{Tuple{Int,Int},Tuple{String,Int}}()
-    n_conflicts = 0
-
-    open(path) do io
-        header = split(readline(io), '\t')
-        function column(name)
-            index = findfirst(==(name), header)
-            isnothing(index) && throw(
-                ArgumentError(
-                    "\"$path\" has no \"$name\" column; is it a Duplications.tsv?",
-                ),
-            )
-            return index
-        end
-        node_column, support_column = column("Species Tree Node"), column("Support")
-        first_column, second_column = column("Genes 1"), column("Genes 2")
-        n_columns = max(node_column, support_column, first_column, second_column)
-
-        indices(field) = [
-            pg.id_to_index[gene] for gene in _species_genes(field, prefix, transform) if
-            haskey(pg.id_to_index, gene)
-        ]
-
-        for line in eachline(io)
-            fields = split(line, '\t')
-            length(fields) >= n_columns || continue
-
-            support = tryparse(Float64, strip(fields[support_column]))
-            (isnothing(support) || support < min_support) && continue
-
-            node = String(strip(fields[node_column]))
-            depth = get(depths, node, 0)
-            depth == 0 && continue
-
-            left = indices(fields[first_column])
-            isempty(left) && continue
-            right = indices(fields[second_column])
-            isempty(right) && continue
-
-            for a in left, b in right
-                (a == b || !pg.topology[a, b]) && continue
-                pair = minmax(a, b)
-                recorded = get(annotations, pair, nothing)
-                if isnothing(recorded)
-                    annotations[pair] = (node, depth)
-                elseif recorded[2] != depth
-                    n_conflicts += 1
-                    recorded[2] > depth && (annotations[pair] = (node, depth))
-                end
-            end
-        end
+    annotations, n_conflicts = open(path) do io
+        _read_duplications(io, path, pg, species * "_", transform, depths, min_support)
     end
-
     isempty(annotations) && throw(
         ArgumentError(
             "No pair of `pg` matched a duplication of \"$species\" in \"$path\"; check `species` and `transform`",
         ),
     )
-
-    # Every node kept is an ancestor of `species`, so one lineage: two nodes at
-    # one depth would break the comparability `lca_depth` rests on.
-    depth_of_node = Dict{String,Int}()
-    for (node, depth) in values(annotations)
-        depth_of_node[node] = depth
-    end
-    allunique(values(depth_of_node)) || throw(
-        ArgumentError(
-            "Nodes $(join(sort!(collect(keys(depth_of_node))), ", ")) do not lie on one lineage of \"$tree_path\"",
-        ),
-    )
+    _check_one_lineage(annotations, tree_path)
 
     n_genes = _n_genes(pg)
-    edge_i, edge_j = UInt32[], UInt32[]
-    lca_v, depth_v = UInt32[], Float64[]
-    labels = String[]
-    codes = Dict{String,UInt32}()
-    # Sorted, so the interned label order does not follow Dict hash order.
-    for pair in sort!(collect(keys(annotations)))
-        node, depth = annotations[pair]
-        push!(edge_i, pair[1])
-        push!(edge_j, pair[2])
-        push!(depth_v, Float64(depth))
-        push!(lca_v, get!(codes, node) do
-            push!(labels, node)
-            UInt32(length(labels))
-        end)
-    end
+    edge_i, edge_j, lca_codes, depth_values, labels = _annotation_entries(annotations)
+    kept_cells = Set(zip(edge_i, edge_j))
+    kept_genes = sort!(unique(vcat(edge_i, edge_j)))
+    _warn_duplication_losses(
+        nnz(pg.topology) ÷ 2 - length(edge_i),
+        n_genes - length(kept_genes),
+        n_conflicts,
+    )
 
-    kept = Set(zip(edge_i, edge_j))
-    kept_cell(row, col) = minmax(row, col) in kept
-    masked(matrix) =
-        isnothing(matrix) ? nothing : _mask_relation(matrix, kept_cell, n_genes)
-
-    n_dropped_pairs = nnz(pg.topology) ÷ 2 - length(edge_i)
-    kept_genes = sort!(unique(vcat(Int.(edge_i), Int.(edge_j))))
-    n_dropped_genes = n_genes - length(kept_genes)
-    if n_dropped_pairs > 0
-        orphans =
-            n_dropped_genes > 0 ? ", leaving $n_dropped_genes gene(s) without a partner" :
-            ""
-        @warn "add_duplications_of: dropped $n_dropped_pairs pair(s) with no duplication recorded$orphans"
-    end
-    n_conflicts > 0 &&
-        @warn "add_duplications_of: $n_conflicts pair(s) reported at more than one node; kept the shallowest"
-
-    annotated = ParalogGroup(
-        _RawFields(),
-        pg.intervals,
-        pg.scaffold_ranges,
-        pg.id_to_index,
-        sparse(
-            vcat(edge_i, edge_j),
-            vcat(edge_j, edge_i),
-            trues(2 * length(edge_i)),
-            n_genes,
-            n_genes,
-            |,
-        ),
-        masked(pg.dN),
-        masked(pg.dS),
-        masked(pg.id_subject_query),
-        masked(pg.id_query_subject),
-        sparse(edge_i, edge_j, depth_v, n_genes, n_genes, max),
-        sparse(edge_i, edge_j, lca_v, n_genes, n_genes, min),
-        labels,
+    lca_depth = _relation(edge_i, edge_j, depth_values, n_genes)
+    lca = _relation(edge_i, edge_j, lca_codes, n_genes, min)
+    annotated = _rebuild(
+        pg,
+        field ->
+            field === :lca_depth ? lca_depth :
+            field === :lca ? lca :
+            _mask_relation(
+                getfield(pg, field),
+                (row, col) -> minmax(Int(row), Int(col)) in kept_cells,
+                n_genes,
+            );
+        topology = _topology(edge_i, edge_j, n_genes),
+        lca_labels = labels,
     )
     return annotated[kept_genes]
 end
@@ -818,9 +930,9 @@ end
 #= Reciprocal best hits =#
 
 """
-Canonical name for a scoring alias (`"maximum"` → `"max"`, `"avg"` → `"mean"`,
-…), or `nothing` when the alias is unrecognised. Which names a given `rbh`
-method accepts is up to that method.
+Given a scoring alias, canonicalise it (`"maximum"` → `"max"`, `"avg"` →
+`"mean"`, …). Returns the canonical name, or `nothing` when unrecognised; which
+names a given `rbh` method accepts is up to that method.
 """
 function _canonical_scoring(scoring::AbstractString)
     key = lowercase(scoring)
@@ -831,9 +943,11 @@ function _canonical_scoring(scoring::AbstractString)
     return nothing
 end
 
-# For edge {a, b}, resolve which end was the original query/subject using
-# whichever id_* relation is present (their storage axis records it exactly);
-# falls back to the lower index as query when neither is present.
+"""
+Given an undirected edge, work out which end was the original query. Returns
+`(query, subject)`, read off whichever `id_*` relation is present — their
+storage axis records it exactly — and falling back to the lower index as query.
+"""
 function _edge_query_subject(pg::ParalogGroup, a::Integer, b::Integer)
     if !isnothing(pg.id_subject_query)
         return pg.id_subject_query[a, b] != 0 ? (a, b) : (b, a)
@@ -846,9 +960,9 @@ end
 """
     edge_identity(pg, query, subject, scoring)
 
-The %ID for edge `(query, subject)`, combining whichever of
-`id_subject_query`/`id_query_subject` are present via `scoring` (`"mean"`,
-`"min"` or `"max"`). Returns `nothing` when neither relation is present.
+Given an edge, combine whichever of `id_subject_query`/`id_query_subject` are
+present via `scoring` (`"mean"`, `"min"` or `"max"`). Returns the combined %ID,
+or `nothing` when neither relation is present.
 """
 function edge_identity(pg::ParalogGroup, query::Integer, subject::Integer, scoring::String)
     subject_query =
@@ -862,9 +976,11 @@ function edge_identity(pg::ParalogGroup, query::Integer, subject::Integer, scori
     return max(subject_query, query_subject)
 end
 
-# Group `graph`'s edges by connected component, returning `(components, edges)`
-# as parallel vectors. One pass over the edges, rather than one pass per
-# component.
+"""
+Given a graph, group its edges by connected component. Returns
+`(components, edges)` as parallel vectors, built in one pass over the edges
+rather than one pass per component.
+"""
 function _component_edges(graph::SimpleGraph)
     components = connected_components(graph)
     component_of = zeros(Int, nv(graph))
@@ -891,8 +1007,10 @@ _has_level(pg::ParalogGroup, level::Symbol) =
     (!isnothing(pg.id_subject_query) || !isnothing(pg.id_query_subject)) :
     !isnothing(getfield(pg, level))
 
-# `rbh`'s ranking levels: everything `pg` carries bar `:lca_depth`, which is
-# opt-in, or the caller's own list, which must name only relations `pg` has.
+"""
+Given no explicit `levels`, pick the ranking levels implicitly. Returns
+everything `pg` carries bar `:lca_depth`, which is opt-in.
+"""
 function _rank_levels(pg::ParalogGroup, levels::Nothing)
     available = filter(level -> _has_level(pg, level), [:dS, :dN, :identity])
     isempty(available) && throw(
@@ -903,6 +1021,10 @@ function _rank_levels(pg::ParalogGroup, levels::Nothing)
     return available
 end
 
+"""
+Given the caller's own `levels`, check them against `pg`. Returns them
+unchanged; a level `pg` lacks is an error, never a silently skipped rank.
+"""
 function _rank_levels(pg::ParalogGroup, levels)
     requested = collect(Symbol, levels)
     isempty(requested) && throw(ArgumentError("`levels` must name at least one relation"))
@@ -920,155 +1042,169 @@ function _rank_levels(pg::ParalogGroup, levels)
     return requested
 end
 
-# One level's contribution to the ascending rank key for edge {a, b}. Similarity
-# levels are negated so that, throughout, smaller means better.
+"""
+Given one ranking level, score edge `{a, b}` by it. Returns the score with
+similarity levels negated, so that smaller means better throughout.
+"""
 function _level_value(pg::ParalogGroup, level::Symbol, a::Integer, b::Integer, scoring)
-    lo, hi = minmax(a, b)
-    level === :dS && return pg.dS[lo, hi]
-    level === :dN && return pg.dN[lo, hi]
-    level === :lca_depth && return -pg.lca_depth[lo, hi]
+    level === :dS && return _tri(pg.dS, a, b)
+    level === :dN && return _tri(pg.dN, a, b)
+    level === :lca_depth && return -_tri(pg.lca_depth, a, b)
     return -edge_identity(pg, _edge_query_subject(pg, a, b)..., scoring)
 end
 
-# First few of `indices`, so a warning naming a large component stays readable.
+"""First few of `indices`, so a warning naming a large component stays readable."""
 _truncated(indices, limit = 4) =
     join(Iterators.take(indices, limit), ", ") * (length(indices) > limit ? ", …" : "")
 
 """
-    rbh(pg::ParalogGroup; scoring::String = "mean", levels = nothing) -> DataFrame
+Given a group about to be ranked by `:lca_depth`, check every edge has one
+recorded. Returns `nothing`; depths start at 1, so a 0 means "not recorded" and
+is an error rather than a silent default.
+"""
+function _check_depths(pg::ParalogGroup, graph::SimpleGraph)
+    index_to_id = _index_to_id(pg)
+    unranked = [
+        (index_to_id[src(edge)], index_to_id[dst(edge)]) for
+        edge in edges(graph) if iszero(_tri(pg.lca_depth, src(edge), dst(edge)))
+    ]
+    isempty(unranked) || throw(
+        ArgumentError(
+            "rbh: ranking by `lca_depth`, but $(_plural(length(unranked), "pair")) have none recorded, e.g. $(first(unranked))",
+        ),
+    )
+    return nothing
+end
 
-Reciprocal best hit per weakly-connected component of `pg.topology`. Within each
-component, edges are ranked by `levels` — the first entry primary, each
-subsequent entry breaking ties in the one before it — and the top-ranked edge of
-each multi-gene component is kept; singleton (edge-less) components are skipped.
-An edge tying on *every* level is resolved by the lowest gene indices, and
-warned about (naming the tied component's gene indices).
+"""
+Given one component's edges, pick the best-ranking one. Returns
+`(query, subject, tied)`, `tied` marking a tie on *every* level — which the
+lowest gene indices then settle.
+"""
+function _best_edge(pg::ParalogGroup, edge_list, ranking::Vector{Symbol}, scoring::String)
+    # Ascending throughout (see `_level_value`), with `(lo, hi)` as a final,
+    # deterministic tie-break: lowest indices win.
+    rank_key(a, b) =
+        ([_level_value(pg, level, a, b, scoring) for level in ranking], minmax(a, b))
+    ranked = sort([(rank_key(src(e), dst(e)), src(e), dst(e)) for e in edge_list])
 
-`levels` names the relations to rank by, most significant first:
+    best_key = ranked[1][1][1]
+    tied = count(entry -> entry[1][1] == best_key, ranked) > 1
+    _, a, b = ranked[1]
+    return (_edge_query_subject(pg, a, b)..., tied)
+end
 
-- `:dS`, `:dN`  — ascending: the smaller distance is the closer paralog.
-- `:identity`   — descending, combining `id_subject_query`/`id_query_subject`
-  via `scoring` (`"mean"` (default), `"min"`, or `"max"`).
-- `:lca_depth`  — descending: the deeper duplication is the more recent one.
+"""
+Given the pairs [`rbh`](@ref) chose, assemble its output table. Returns a
+`DataFrame` shaped like `ParalogGroup`'s constructor input, carrying whichever
+relations `pg` holds.
+"""
+function _pair_table(pg::ParalogGroup, chosen::Vector{Tuple{Int,Int}})
+    index_to_id = _index_to_id(pg)
+    columns = Pair{String,Vector}[
+        "query"=>String[index_to_id[query] for (query, _) in chosen],
+        "subject"=>String[index_to_id[subject] for (_, subject) in chosen],
+    ]
+    add(name, values) = push!(columns, name => values)
 
-`levels = nothing` (the default) uses whichever of `:dS`, `:dN`, `:identity`
-`pg` carries, in that order. `:lca_depth` is never included implicitly — ask for
-it, e.g. `levels = [:lca_depth, :dS]` to let the phylogeny outrank the molecular
-clock. A missing rank is never silently defaulted: naming a level `pg` lacks is
-an error, as is ranking by `:lca_depth` when any edge has no depth recorded.
+    isnothing(pg.dN) ||
+        add("dN", Float64[_tri(pg.dN, query, subject) for (query, subject) in chosen])
+    isnothing(pg.dS) ||
+        add("dS", Float64[_tri(pg.dS, query, subject) for (query, subject) in chosen])
+    isnothing(pg.id_subject_query) || add(
+        "id_subject_query",
+        Float64[pg.id_subject_query[query, subject] for (query, subject) in chosen],
+    )
+    isnothing(pg.id_query_subject) || add(
+        "id_query_subject",
+        Float64[pg.id_query_subject[subject, query] for (query, subject) in chosen],
+    )
+    isnothing(pg.lca_depth) || add(
+        "lca_depth",
+        Float64[_tri(pg.lca_depth, query, subject) for (query, subject) in chosen],
+    )
+    isnothing(pg.lca) || add(
+        "lca",
+        String[something(lca_label(pg, query, subject), "") for (query, subject) in chosen],
+    )
+    return DataFrame(columns...)
+end
 
-Returns a `DataFrame` shaped like `ParalogGroup`'s constructor input — `query`,
-`subject`, plus whichever of `dN`/`dS`/`id_subject_query`/`id_query_subject`/
-`lca_depth`/`lca` are present on `pg` — containing only the chosen pairs.
+"""
+    rbh(pg::ParalogGroup; scoring = "mean", levels = nothing) -> DataFrame
+
+Given a group, keep the best-ranking edge of each weakly-connected component of
+`pg.topology`. Returns those pairs as a `DataFrame` shaped like the constructor's
+input; singleton (edge-less) components are skipped.
+
+`levels` ranks edges, most significant first: `:dS`/`:dN` ascending, `:identity`
+(combined via `scoring`) and `:lca_depth` descending. It defaults to whichever of
+`:dS`, `:dN`, `:identity` `pg` carries — `:lca_depth` is never implicit, and a
+level `pg` lacks is an error rather than a skipped rank. A tie on *every* level
+goes to the lowest gene indices, and warns.
 """
 function rbh(pg::ParalogGroup; scoring::String = "mean", levels = nothing)
     scoring = something(_canonical_scoring(scoring), "")
     scoring in ("mean", "min", "max") ||
         throw(ArgumentError("scoring must be \"mean\", \"min\", or \"max\""))
-
     ranking = _rank_levels(pg, levels)
 
-    index_to_id = _index_to_id(pg)
     graph = topology_graph(pg)
+    :lca_depth in ranking && _check_depths(pg, graph)
 
-    # Depths start at 1, so a 0 (stored or not) means "not recorded".
-    if :lca_depth in ranking
-        unranked = [
-            (index_to_id[src(e)], index_to_id[dst(e)]) for
-            e in edges(graph) if iszero(pg.lca_depth[minmax(src(e), dst(e))...])
-        ]
-        isempty(unranked) || throw(
-            ArgumentError(
-                "rbh: ranking by `lca_depth`, but $(length(unranked)) pair(s) have none recorded, e.g. $(first(unranked))",
-            ),
-        )
-    end
-
-    # Ascending throughout (see `_level_value`), with `(lo, hi)` as a final,
-    # deterministic tie-break: lowest indices win.
-    rank_key(a, b) =
-        ([_level_value(pg, level, a, b, scoring) for level in ranking], minmax(a, b))
-
-    components, component_edges = _component_edges(graph)
-
-    query, subject = String[], String[]
-    dN_out, dS_out, sq_out, qs_out = Float64[], Float64[], Float64[], Float64[]
-    depth_out = Float64[]
-    lca_out = String[]
+    chosen = Tuple{Int,Int}[]
     tied_components = Vector{Int}[]
-
-    for (component, edge_list) in zip(components, component_edges)
+    for (component, edge_list) in zip(_component_edges(graph)...)
         isempty(edge_list) && continue   # singleton gene, no partner to hit
-
-        ranked = sort([(rank_key(src(e), dst(e)), src(e), dst(e)) for e in edge_list])
-        # Only a tie on every level is arbitrary; a lower level resolving the
-        # top one is the ranking working as asked.
-        best_key = ranked[1][1][1]
-        count(r -> r[1][1] == best_key, ranked) > 1 &&
-            push!(tied_components, sort(component))
-
-        _, a, b = ranked[1]
-        gene, paralog = _edge_query_subject(pg, a, b)
-        push!(query, index_to_id[gene])
-        push!(subject, index_to_id[paralog])
-        isnothing(pg.dN) || push!(dN_out, pg.dN[minmax(gene, paralog)...])
-        isnothing(pg.dS) || push!(dS_out, pg.dS[minmax(gene, paralog)...])
-        isnothing(pg.id_subject_query) || push!(sq_out, pg.id_subject_query[gene, paralog])
-        isnothing(pg.id_query_subject) || push!(qs_out, pg.id_query_subject[paralog, gene])
-        isnothing(pg.lca_depth) || push!(depth_out, pg.lca_depth[minmax(gene, paralog)...])
-        isnothing(pg.lca) || push!(lca_out, something(lca_label(pg, gene, paralog), ""))
+        query, subject, tied = _best_edge(pg, edge_list, ranking, scoring)
+        push!(chosen, (query, subject))
+        tied && push!(tied_components, sort(component))
     end
 
     if !isempty(tied_components)
         groups = join(("[$(_truncated(c))]" for c in first(tied_components, 3)), ", ")
-        @warn "rbh: tied best-hit rank in $(length(tied_components)) group(s): $groups$(length(tied_components) > 3 ? ", …" : "")"
+        @warn "rbh: tied best-hit rank in $(_plural(length(tied_components), "group")): $groups$(length(tied_components) > 3 ? ", …" : "")"
     end
+    return _pair_table(pg, chosen)
+end
 
-    columns = Pair{String,Vector}["query"=>query, "subject"=>subject]
-    isnothing(pg.dN) || push!(columns, "dN" => dN_out)
-    isnothing(pg.dS) || push!(columns, "dS" => dS_out)
-    isnothing(pg.id_subject_query) || push!(columns, "id_subject_query" => sq_out)
-    isnothing(pg.id_query_subject) || push!(columns, "id_query_subject" => qs_out)
-    isnothing(pg.lca_depth) || push!(columns, "lca_depth" => depth_out)
-    isnothing(pg.lca) || push!(columns, "lca" => lca_out)
-    return DataFrame(columns...)
+#= Reciprocal best hits over a flat pair table =#
+
+"""
+Given a flat paralog table, validate it: two ID columns followed by
+`n_columns - 2` numeric ones. Returns `nothing`.
+"""
+function _check_pair_columns(paralog_df::DataFrame, n_columns::Int)
+    ncol(paralog_df) >= n_columns || throw(
+        ArgumentError(
+            "`paralog_df` needs at least $n_columns columns, got $(ncol(paralog_df))",
+        ),
+    )
+    for column = 1:2
+        _require_eltype(paralog_df, column, AbstractString, "gene IDs (strings)")
+    end
+    for column = 3:n_columns
+        _require_eltype(paralog_df, column, Real, "scores (numbers)")
+    end
+    return nothing
 end
 
 """
-Row and column best hits of a sparse score matrix held as
-`(row, column) => score`, over `n_genes` genes. Returns
-`(best_in_row, best_in_column)`, each a `Vector{Int}` of gene indices, `0` where
-a gene has no scored partner. `better(a, b)` decides whether `a` beats `b`
-(`>` for a similarity, `<` for a distance); ties go to the lowest index, so the
-result does not depend on iteration order.
+Given a flat paralog table, collect its gene IDs. Returns `(ids, id_to_index)`,
+the IDs in first-appearance order and the reverse lookup to their positions.
 """
-function _best_hits(scores::Dict{Tuple{Int,Int},Float64}, n_genes::Int, better::F) where {F}
-    best_in_row = zeros(Int, n_genes)
-    best_in_column = zeros(Int, n_genes)
-    row_best = Vector{Float64}(undef, n_genes)
-    column_best = Vector{Float64}(undef, n_genes)
-
-    for ((row, column), score) in scores
-        if best_in_row[row] == 0 ||
-           better(score, row_best[row]) ||
-           (score == row_best[row] && column < best_in_row[row])
-            best_in_row[row] = column
-            row_best[row] = score
-        end
-        if best_in_column[column] == 0 ||
-           better(score, column_best[column]) ||
-           (score == column_best[column] && row < best_in_column[column])
-            best_in_column[column] = row
-            column_best[column] = score
-        end
-    end
-    return best_in_row, best_in_column
+function _index_pair_ids(paralog_df::DataFrame)
+    ids = unique(vcat(string.(paralog_df[:, 1]), string.(paralog_df[:, 2])))
+    return ids, Dict(id => index for (index, id) in enumerate(ids))
 end
 
-# Score matrices for a flat paralog table: `original` holds the two directional
-# values as given, `ranked` the values best hits are chosen by (identical to
-# `original` under "double_max" and "ds"). Later rows overwrite earlier ones for
-# a repeated pair, and both are keyed by the gene indices of `id_to_index`.
+"""
+Given a flat paralog table, score its pairs. Returns `(original, ranked)`, both
+`(gene, partner) => value` dictionaries: `original` holds the two directional
+values as given, `ranked` the values best hits are chosen by.
+
+A later row overwrites an earlier one for a repeated pair.
+"""
 function _pair_matrices(
     paralog_df::DataFrame,
     id_to_index::Dict{<:Any,Int},
@@ -1095,8 +1231,43 @@ function _pair_matrices(
     return original, ranked
 end
 
-# Genes that are each other's best hit and not already paired, as
-# `(gene, best_partner)` pairs in ascending gene order.
+"""
+Given a sparse score matrix held as `(row, column) => score`, find each gene's
+best partner. Returns `(best_in_row, best_in_column)`, gene indices with `0`
+where a gene has no scored partner.
+
+`better(a, b)` decides whether `a` beats `b` (`>` for a similarity, `<` for a
+distance); ties go to the lowest index, so the result is iteration-order
+independent.
+"""
+function _best_hits(scores::Dict{Tuple{Int,Int},Float64}, n_genes::Int, better::F) where {F}
+    best_in_row = zeros(Int, n_genes)
+    best_in_column = zeros(Int, n_genes)
+    row_best = Vector{Float64}(undef, n_genes)
+    column_best = Vector{Float64}(undef, n_genes)
+
+    for ((row, column), score) in scores
+        if best_in_row[row] == 0 ||
+           better(score, row_best[row]) ||
+           (score == row_best[row] && column < best_in_row[row])
+            best_in_row[row] = column
+            row_best[row] = score
+        end
+        if best_in_column[column] == 0 ||
+           better(score, column_best[column]) ||
+           (score == column_best[column] && row < best_in_column[column])
+            best_in_column[column] = row
+            column_best[column] = score
+        end
+    end
+    return best_in_row, best_in_column
+end
+
+"""
+Given the ranked scores, find the genes that are each other's best hit. Returns
+those `(gene, best_partner)` pairs in ascending gene order, each gene appearing
+at most once.
+"""
 function _reciprocal_pairs(
     ranked::Dict{Tuple{Int,Int},Float64},
     n_genes::Int,
@@ -1118,33 +1289,40 @@ function _reciprocal_pairs(
 end
 
 """
+Given a flat pair table's score dictionaries, resolve its reciprocal best hits
+back to names and scores. Returns `(gene_ids, paralog_ids, forwards, backwards)`
+as parallel vectors, the scores being the two directions as originally given.
+"""
+function _reciprocal_scores(
+    original::Dict{Tuple{Int,Int},Float64},
+    ranked::Dict{Tuple{Int,Int},Float64},
+    ids::Vector{String},
+    better::F,
+) where {F}
+    gene_ids, paralog_ids = String[], String[]
+    forwards, backwards = Float64[], Float64[]
+
+    for (gene, partner) in _reciprocal_pairs(ranked, length(ids), better)
+        push!(gene_ids, ids[partner])
+        push!(paralog_ids, ids[gene])
+        push!(forwards, get(original, (gene, partner), 0.0))
+        push!(backwards, get(original, (partner, gene), 0.0))
+    end
+    return gene_ids, paralog_ids, forwards, backwards
+end
+
+"""
     rbh(paralog_df::DataFrame; scoring = "max") -> DataFrame
 
-Identify reciprocal best hits (RBH) between paralogs listed one pair per row.
+Given paralogs one pair per row — two ID columns, then percent identity
+gene → paralog and paralog → gene — keep the pairs that are each other's best
+hit. Returns a `DataFrame` of `GeneID`, `ParalogID`, `perc_1`, `perc_2`,
+`max_perc` and `mean_perc`. `scoring` picks what pairs are ranked by: `"max"`
+(the default), `"mean"`, `"double_max"` (each direction on its own), or `"ds"`,
+which reads column 3 as a dS and defers to [`rbh_ds`](@ref).
 
-`paralog_df` needs at least three columns (four unless `scoring = "ds"`):
-
-1. `GeneID` (`String`)
-2. `ParalogID` (`String`)
-3. percent identity gene → paralog, or the pair's dS when `scoring = "ds"`
-4. percent identity paralog → gene (ignored when `scoring = "ds"`)
-
-`scoring` picks the value pairs are ranked by:
-
-- `"max"`/`"maximum"` (default): the larger of the two directions
-- `"mean"`/`"avg"`/`"average"`: their mean
-- `"double_max"`: each direction on its own
-- `"ds"`: column 3 read as a dS value and ranked **ascending** (see
-  [`rbh_ds`](@ref))
-
-A pair is kept when each gene is the other's best hit and neither has already
-been paired. Returns a `DataFrame` of `GeneID`, `ParalogID`, `perc_1`, `perc_2`
-(the two original scores), `max_perc` and `mean_perc`; `scoring = "ds"` returns
-[`rbh_ds`](@ref)'s columns instead. An empty input gives an empty, correctly
-shaped result.
-
-**NOTE:** only scored pairs are ranked. A gene absent from a pair has no best
-hit there, rather than being treated as scoring zero against it.
+**NOTE:** only scored pairs are ranked. A gene absent from a pair has no best hit
+there, rather than scoring zero against it.
 """
 function rbh(paralog_df::DataFrame; scoring::String = "max")
     canonical = _canonical_scoring(scoring)
@@ -1158,92 +1336,42 @@ function rbh(paralog_df::DataFrame; scoring::String = "max")
     _check_pair_columns(paralog_df, 4)
     ids, id_to_index = _index_pair_ids(paralog_df)
     original, ranked = _pair_matrices(paralog_df, id_to_index, canonical)
-
-    gene_ids, paralog_ids = String[], String[]
-    forwards, reverses, maxima, means = Float64[], Float64[], Float64[], Float64[]
-    for (gene, partner) in _reciprocal_pairs(ranked, length(ids), >)
-        forward = get(original, (gene, partner), 0.0)
-        backward = get(original, (partner, gene), 0.0)
-        push!(gene_ids, ids[partner])
-        push!(paralog_ids, ids[gene])
-        push!(forwards, forward)
-        push!(reverses, backward)
-        push!(maxima, max(forward, backward))
-        push!(means, (forward + backward) / 2)
-    end
+    gene_ids, paralog_ids, forwards, backwards =
+        _reciprocal_scores(original, ranked, ids, >)
 
     return DataFrame(
         "GeneID" => gene_ids,
         "ParalogID" => paralog_ids,
         "perc_1" => forwards,
-        "perc_2" => reverses,
-        "max_perc" => maxima,
-        "mean_perc" => means,
+        "perc_2" => backwards,
+        "max_perc" => max.(forwards, backwards),
+        "mean_perc" => (forwards .+ backwards) ./ 2,
     )
 end
 
 """
     rbh_ds(paralog_df::DataFrame) -> DataFrame
 
-Reciprocal best hits ranked by dS — the lowest value wins, dS being a distance
-rather than a similarity. Column 3 of `paralog_df` holds the pair's dS and is
-taken to apply in both directions; see [`rbh`](@ref) for the pairing rule.
+Given paralogs listed one pair per row, with column 3 holding the pair's dS,
+keep the pairs that are each other's best hit. Returns a `DataFrame` of
+`GeneID`, `ParalogID`, `ds` and `min_ds`.
 
-Returns a `DataFrame` of `GeneID`, `ParalogID`, `ds` and `min_ds`.
+dS is a distance, so the **lowest** value wins; see [`rbh`](@ref) for the
+pairing rule.
 """
 function rbh_ds(paralog_df::DataFrame)
     _check_pair_columns(paralog_df, 3)
     ids, id_to_index = _index_pair_ids(paralog_df)
     original, ranked = _pair_matrices(paralog_df, id_to_index, "ds")
-
-    gene_ids, paralog_ids = String[], String[]
-    ds_values, minima = Float64[], Float64[]
-    for (gene, partner) in _reciprocal_pairs(ranked, length(ids), <)
-        forward = get(original, (gene, partner), 0.0)
-        backward = get(original, (partner, gene), 0.0)
-        push!(gene_ids, ids[partner])
-        push!(paralog_ids, ids[gene])
-        push!(ds_values, forward)
-        push!(minima, min(forward, backward))
-    end
+    gene_ids, paralog_ids, forwards, backwards =
+        _reciprocal_scores(original, ranked, ids, <)
 
     return DataFrame(
         "GeneID" => gene_ids,
         "ParalogID" => paralog_ids,
-        "ds" => ds_values,
-        "min_ds" => minima,
+        "ds" => forwards,
+        "min_ds" => min.(forwards, backwards),
     )
-end
-
-# Validate a flat paralog table: two ID columns followed by `n_columns - 2`
-# numeric ones.
-function _check_pair_columns(paralog_df::DataFrame, n_columns::Int)
-    ncol(paralog_df) >= n_columns || throw(
-        ArgumentError(
-            "`paralog_df` needs at least $n_columns columns, got $(ncol(paralog_df))",
-        ),
-    )
-    for column = 1:2
-        eltype(paralog_df[:, column]) <: AbstractString || throw(
-            ArgumentError(
-                "Column $column (\"$(names(paralog_df)[column])\") must contain gene IDs (strings), got element type $(eltype(paralog_df[:, column]))",
-            ),
-        )
-    end
-    for column = 3:n_columns
-        eltype(paralog_df[:, column]) <: Real || throw(
-            ArgumentError(
-                "Column $column (\"$(names(paralog_df)[column])\") must contain scores (numbers), got element type $(eltype(paralog_df[:, column]))",
-            ),
-        )
-    end
-    return nothing
-end
-
-# Gene IDs in first-appearance order, and the reverse lookup to their indices.
-function _index_pair_ids(paralog_df::DataFrame)
-    ids = unique(vcat(string.(paralog_df[:, 1]), string.(paralog_df[:, 2])))
-    return ids, Dict(id => index for (index, id) in enumerate(ids))
 end
 
 export ParalogGroup,
