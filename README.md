@@ -35,6 +35,11 @@ Pkg.add([
 | `Modeling` | Statistical models (placeholder). |
 | `Plotting` | Figures (placeholder). |
 
+## Reference documents
+
+- [`docs/paralog_group.md`](docs/paralog_group.md) — `ParalogGroup`'s input columns, relation-matrix layouts, and `lca_depth` numbering.
+- [`docs/weighting.md`](docs/weighting.md) — how read depth becomes weight through the methylation metagene pipeline.
+
 ## Author
 Tom Wolfe<br>
 e-mail: thomas_wolfe@student.uml.edu<br>

@@ -62,14 +62,15 @@ struct Variable{T<:Number}
     end
 end
 
-# Recursively assemble the variable trie for an `Experiment`.
-#
-# `entries` pairs each sample's ordered variable-column values with its loaded
-# data. `depth` is the 1-based variable column currently being grouped and
-# `nvars` the total number of variable columns. Samples are grouped by their
-# value at `depth` (first-seen order preserved); at the final column each group
-# is a single validated sample and becomes a leaf `Variable` holding data,
-# otherwise the group is recursed into to build that node's covariates.
+"""
+Given `entries` — each sample's ordered variable-column values paired with its
+loaded data — assemble one level of an `Experiment`'s variable trie. Returns
+that level's `ImmutableDict` of [`Variable`](@ref)s.
+
+Samples are grouped by their value at variable column `depth` (of `nvars`), in
+first-seen order. At the last column a group is one validated sample and becomes
+a leaf holding data; otherwise it recurses into that node's covariates.
+"""
 function _build_variables(
     ::Type{T},
     entries::Vector{Tuple{Vector{String},D}},
@@ -99,10 +100,11 @@ function _build_variables(
     return variables
 end
 
-# Load a single sample's data file, choosing the representation from the file
-# extension: anything ending in `.bed` becomes `BedData`, everything else is
-# read as a table and matched against `genome` as `TabularData{T}` (its numeric
-# columns coerced to `T`).
+"""
+Given one sample's data file, load it against `genome`. Returns a
+[`BedData`](@ref) for a `.bed` path and a `TabularData{T}` for anything else,
+whose numeric columns are coerced to `T`.
+"""
 function _load_sample(::Type{T}, genome::Genome, path::AbstractString) where {T<:Number}
     endswith(lowercase(path), ".bed") && return load_bed(genome, String(path))
 
@@ -178,44 +180,45 @@ Experiment(genome::Genome, sample_sheet::DataFrame) =
 #= Methods =#
 
 """
-Match a data frame's rows against `genome` by ID, returning a `TabularData`.
-
-The first column must hold sample IDs (e.g. gene or transcript accessions) and
-every other column must be numeric; `nothing` is returned (with a warning) when
-that does not hold. Rows whose ID matches no feature keep a `nothing` sample
-slot. The whole table is resolved in a single O(features) genome walk, which
-stops early once every row has matched.
+Given a data frame, check it holds sample IDs in column 1 and numbers in every
+other. Returns whether it does, warning about each offending part.
 """
-function load_table(genome::Genome, data_frame::DataFrame)
+function _valid_table(data_frame::DataFrame)
     sample_col_correct = eltype(data_frame[!, 1]) <: AbstractString
     data_cols_correct = all(eltype(data_frame[!, i]) <: Number for i = 2:ncol(data_frame))
     sample_col_correct || @warn "Sample column incorrect format"
     data_cols_correct || @warn "Data columns incorrect format"
-    (sample_col_correct && data_cols_correct) || return nothing
+    return sample_col_correct && data_cols_correct
+end
 
-    n_rows = nrow(data_frame)
+"""
+Given sample IDs, match each against `genome` by feature metadata ID. Returns a
+vector parallel to `ids` holding `(scaffold name, interval)` where matched and
+`nothing` where not.
 
-    # Output vector, parallel to the table rows. A slot stays `nothing` if its
-    # sample ID never matches any feature's metadata ID. A match stores the
-    # scaffold name and the full interval (start/end coords + 64-bit metadata
-    # code), so the feature type can be filtered out of these later without
-    # re-reading the table.
-    samples =
-        Vector{Union{Nothing,Tuple{String,IntervalValue{UInt32,UInt64}}}}(nothing, n_rows)
+The whole set is resolved in one O(features) genome walk that stops early once
+every ID has matched; a lookup per ID would be O(ids × features). The full
+interval is kept so that feature type can be filtered on later without
+re-reading the table.
+"""
+function _match_samples(genome::Genome, ids)
+    samples = Vector{Union{Nothing,Tuple{String,IntervalValue{UInt32,UInt64}}}}(
+        nothing,
+        length(ids),
+    )
 
-    # Samples still awaiting a match: sample_id => original row index. Popping a
-    # match makes the whole search O(features) with an early exit.
+    # Samples still awaiting a match: sample_id => original row index.
     remaining = Dict{String,Int}()
-    sizehint!(remaining, n_rows)
-    for (row, id) in enumerate(data_frame[!, 1])
+    sizehint!(remaining, length(ids))
+    for (row, id) in enumerate(ids)
         remaining[String(id)] = row
     end
 
-    for (scaffold_name, scaffold) in genome.scaffolds
+    for scaffold_name in keys(genome.scaffolds)
         isempty(remaining) && break
 
-        for interval in scaffold.features
-            id = Reference.get_metadata_id(genome, Reference.parse_index(interval.value))
+        for interval in genome.scaffolds[scaffold_name].features
+            id = Reference.feature_id(genome, interval)
             isnothing(id) && continue
 
             row = get(remaining, id, nothing)
@@ -226,11 +229,20 @@ function load_table(genome::Genome, data_frame::DataFrame)
             end
         end
     end
+    return samples
+end
 
+"""
+Given a data frame whose first column holds sample IDs, match its rows against
+`genome`. Returns a [`TabularData`](@ref), or `nothing` (with a warning) when
+the column types are wrong; a row matching no feature keeps a `nothing` slot.
+"""
+function load_table(genome::Genome, data_frame::DataFrame)
+    _valid_table(data_frame) || return nothing
     return TabularData(
         genome,
         Vector{AbstractString}(names(data_frame)[2:end]),
-        samples,
+        _match_samples(genome, data_frame[!, 1]),
         Matrix(data_frame[!, 2:end]),
     )
 end
@@ -250,14 +262,20 @@ function sample_id(
     sample::Union{Nothing,Tuple{String,IntervalValue{UInt32,UInt64}}},
 )
     isnothing(sample) && return nothing
-    return Reference.get_metadata_id(genome, Reference.parse_index(sample[2].value))
+    return Reference.feature_id(genome, sample[2])
 end
 
-# Rows of `t` whose sample ID satisfies `matches`, in table order.
+"""
+Given a predicate on a sample ID, find the rows of `t` satisfying it. Returns
+their indices in table order.
+"""
 _matching_rows(t::TabularData, matches::F) where {F} =
     findall(sample -> matches(sample_id(t.genome, sample)), t.samples)
 
-# `t` restricted to `rows`, sharing nothing mutable with the original.
+"""
+Given a set of rows, restrict `t` to them. Returns a new [`TabularData`](@ref)
+sharing nothing mutable with the original.
+"""
 _subset(t::TabularData, rows::AbstractVector{Int}) =
     TabularData(t.genome, copy(t.variables), t.samples[rows], t.table[rows, :])
 
@@ -341,17 +359,15 @@ function bed_record_strand(record::BED.Record)
 end
 
 """
-Load a BED file (optionally gzipped) into a [`BedData`](@ref) associated with
-`genome`. BED's 0-based half-open coordinates are converted to the 1-based
-closed intervals used by gene features.
+Given a BED file (optionally gzipped), load it into a [`BedData`](@ref) against
+`genome`. Returns that data; BED's 0-based half-open coordinates are converted
+to the 1-based closed intervals used by gene features.
 """
 function load_bed(genome::Genome, file_path::String)
     scaffolds = Dict{String,IntervalTreeM64}()
 
-    open(file_path) do fh
-        reader =
-            endswith(file_path, ".gz") ? BED.Reader(GzipDecompressorStream(fh)) :
-            BED.Reader(fh)
+    open(file_path) do handle
+        reader = BED.Reader(Reference.gzip_stream(handle, file_path))
 
         record = BED.Record()
         try
@@ -407,36 +423,27 @@ function intersect(tree_a::IntervalTreeM64, tree_b::IntervalTreeM64)::IntervalTr
 end
 
 """
-Intersect the `feature`-type features of `scaffold` with the matching scaffold
-of `bed_data`. Returns `nothing` when the scaffold is absent from `bed_data` or
+Given a scaffold, intersect its features with the matching scaffold of
+`bed_data`, restricted to the `feature`-type ones when one is named. Returns the
+intersection, or `nothing` when the scaffold is absent from `bed_data` or
 `feature` is not a known SO term.
 """
 function intersect(
     scaffold::Scaffold,
     bed_data::BedData,
-    feature::Union{AbstractString,Symbol},
-)
+    feature::Union{AbstractString,Symbol}...,
+)::Union{Nothing,IntervalTreeM64}
     tree = get(bed_data.scaffolds, scaffold.name, nothing)
     isnothing(tree) && return nothing
-    feature_intervals = get_feature(scaffold, feature)
-    isnothing(feature_intervals) && return nothing
-    return intersect(feature_intervals, tree)
+    features = isempty(feature) ? scaffold.features : get_feature(scaffold, only(feature))
+    isnothing(features) && return nothing
+    return intersect(features, tree)
 end
 
 """
-Intersect every feature of `scaffold` with the matching scaffold of `bed_data`.
-Returns `nothing` when the scaffold is absent from `bed_data`.
-"""
-function intersect(scaffold::Scaffold, bed_data::BedData)::Union{Nothing,IntervalTreeM64}
-    tree = get(bed_data.scaffolds, scaffold.name, nothing)
-    isnothing(tree) && return nothing
-    return intersect(scaffold.features, tree)
-end
-
-"""
-Intersect `genome` with `bed_data` scaffold by scaffold, restricted to
-`feature`-type features when one is given. Scaffolds with no intersection are
-omitted from the result.
+Given a genome, intersect it with `bed_data` scaffold by scaffold, restricted to
+`feature`-type features when one is named. Returns a `Dict` keyed by scaffold
+name; scaffolds with no intersection are omitted.
 """
 function intersect(genome::Genome, bed_data::BedData, args...)::Dict{String,IntervalTreeM64}
     scaffolds = Dict{String,IntervalTreeM64}()
@@ -448,22 +455,13 @@ function intersect(genome::Genome, bed_data::BedData, args...)::Dict{String,Inte
 end
 
 """
-Left-join two interval trees, preserving every interval of `treeL` and pairing
-each with a (possibly `nothing`) interval from `treeR`.
+Given two interval trees, left-join them on `on`: `:metadata` (the default, the
+64-bit `value`), `:start`, `:end`, or `:interval` (both bounds). Returns a lazy
+iterator of `(left, right)` tuples, `left` always from `treeL` in the tree's
+natural order and `right` a match from `treeR` or `nothing`.
 
-The returned value is a lazy iterator of `(left, right)` tuples where `left` is
-always an interval from `treeL` and `right` is either a matching interval from
-`treeR` or `nothing`. Left intervals are visited in the tree's natural (sorted)
-order; a left interval with several right matches yields one tuple per match,
-while a left interval with no match yields a single `(left, nothing)` tuple.
-Right intervals that never match a left interval are dropped.
-
-How intervals are matched is controlled by `on`:
-
-- `:metadata` (default) : match on the 64-bit metadata `value`.
-- `:start`              : match on the start position (`first`).
-- `:end`                : match on the end position (`last`).
-- `:interval`           : match only when both `first` and `last` are equal.
+A left interval with several matches yields one tuple per match; one with none
+yields a single `(left, nothing)`. Right intervals matching nothing are dropped.
 """
 function leftjoin(treeL::IntervalTreeM64, treeR::IntervalTreeM64, on::Symbol = :metadata)
     on === :metadata && return _leftjoin(treeL, treeR, iv -> iv.value, UInt64)
@@ -476,14 +474,19 @@ function leftjoin(treeL::IntervalTreeM64, treeR::IntervalTreeM64, on::Symbol = :
     )
 end
 
-# Left-join `treeL` against `treeR` on `keyfn`, whose return type is `KT`.
+"""
+Given a key function of return type `KT`, left-join `treeL` against `treeR` on
+it. Returns the lazy `(left, right)` iterator [`leftjoin`](@ref) documents.
+"""
 function _leftjoin(
     treeL::IntervalTreeM64,
     treeR::IntervalTreeM64,
     keyfn::F,
     ::Type{KT},
 ) where {F,KT}
-    IV = eltype(treeL)   # IntervalValue{UInt32, UInt64}
+    # `eltype` of an `IntervalTree` is `Any`, which would box every indexed
+    # interval; `IntervalTreeM64` fixes the value type, so name it directly.
+    IV = IntervalValue{UInt32,UInt64}
 
     # Index the right tree by join key: key => right intervals sharing that key.
     right_index = Dict{KT,Vector{IV}}()

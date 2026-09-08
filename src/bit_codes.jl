@@ -6,8 +6,8 @@ const Strand = GFF3.GenomicFeatures.Strand
 
 """
 Canonical 2-bit strand encoding, shared by every packed metadata code in this
-package (gene features in `Reference`, BED intervals in `Data`, and methylation
-calls in `Methylation`).
+package. Two bits is the narrowest strand field any layout allocates; a wider
+one — `Reference` and `Data` keep 8 bits — leaves its upper bits zero.
 
 | Code   | Strand           |
 |--------|------------------|
@@ -16,12 +16,8 @@ calls in `Methylation`).
 | `0x02` | both (`.`)       |
 | `0x03` | unknown / NA     |
 
-Two bits is the narrowest strand field any layout allocates; wider fields —
-`Reference` and `Data` keep an 8-bit slot — leave their upper bits zero.
-
 **NOTE:** `0x00` means *forward*, not *unknown*: a zeroed code decodes to `+`.
-Always write a strand explicitly, using [`STRAND_NA`](@ref) when there isn't
-one.
+Always write a strand explicitly, [`STRAND_NA`](@ref) when there isn't one.
 """
 const STRAND_FWD = UInt8(0)
 const STRAND_REV = UInt8(1)

@@ -1148,4 +1148,21 @@ end
 
         @test_throws ArgumentError read_methylation(mktempdir())
     end
+
+    @testset "write helpers" begin
+        M = BioinfoTools2.Methylation
+
+        @testset "_unique_stem! - two names sanitizing alike" begin
+            used = Set{String}()
+            stems = [M._unique_stem!(used, "chr_1") for _ = 1:3]
+            @test stems == ["chr_1", "chr_1_1", "chr_1_2"]
+            @test used == Set(stems)
+        end
+
+        @testset "_per_file - fixed value or function of the path" begin
+            @test M._per_file(CTX_CHG, "any.cov") == CTX_CHG
+            @test M._per_file(M.infer_strand, "sample_OB.cov") == STRAND_REV
+            @test M._per_file(path -> length(path), "abcd") == 4
+        end
+    end
 end

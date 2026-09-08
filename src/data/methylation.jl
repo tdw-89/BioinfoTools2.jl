@@ -66,30 +66,21 @@ const CONTEXT_LABELS = (:CpG, :CHG, :CHH, :unknown)
 @inline two_bit_code(value::Integer) = UInt8(value) & 0x03
 
 """
-A single genomic cytosine's aggregated methylation calls, packed into 8 bytes.
-
-- `pos`: 1-based genomic coordinate. Positions are partitioned by scaffold (see
-  [`MethylationData`](@ref)), so 32 bits is ample for any single sequence.
-- `payload`: a bit-packed methylation *level* and read depth, plus metadata:
+A single genomic cytosine's aggregated methylation calls, packed into 8 bytes: a
+1-based `pos` (partitioned by scaffold, so 32 bits is ample) plus a `payload`
+laid out as
 
 ```
 |-Rsvd-|--St-|--Cx-|--percent--|------------depth------------|
 | 31-28|27-26|25-24|   23-16   |             15-0            |
 ```
 
-- Bits  0-15 : total read depth (0-65535, saturating — see [`MAX_COUNT`](@ref))
-- Bits 16-23 : methylation percentage, linearly mapped from `[0, 100]` onto
-  `[0, 255]` (see [`encode_percent`](@ref))
-- Bits 24-25 : cytosine context (see [`CTX_CPG`](@ref))
-- Bits 26-27 : strand, as the package-wide 2-bit strand codes (see `BitCodes`)
-- Bits 28-31 : reserved for future quality/SNP flags
+the depth saturating at [`MAX_COUNT`](@ref), the percent linearly mapped from
+`[0, 100]` ([`encode_percent`](@ref)), and the context and strand carrying the
+package-wide codes ([`CTX_CPG`](@ref), `BitCodes`).
 
-The methylated and unmethylated counts are *reconstructed* rather than stored
-(see [`get_meth`](@ref)): the reconstruction is exact up to a depth of 255 and
-off by at most a read or two beyond that, while the depth stays exact and the
-level stays within half a quantization step (0.196 percentage points).
-
-Read IDs from the source alignment are deliberately discarded.
+**NOTE:** the methylated and unmethylated counts are *reconstructed*, not stored
+— see [`get_meth`](@ref). Source read IDs are discarded.
 """
 struct AggregatedCall
     pos::UInt32
@@ -497,17 +488,12 @@ end
 """
     parse_bismark_line(line)
 
-Parse one Bismark methylation-extractor record into
-`(scaffold, position, context, is_methylated)`, with the scaffold as a
-`SubString` so nothing is allocated per record.
+Given one tab-separated methylation-extractor record —
+`<read id> <state> <chromosome> <position> <call letter>` — split it. Returns
+`(scaffold, position, context, is_methylated)`, the scaffold a `SubString` so
+that nothing is allocated per record.
 
-Expected layout (tab separated):
-
-```
-<read id>	<methylation state>	<chromosome>	<position>	<call letter>
-```
-
-Returns `nothing` for the version header, blank lines, and any line without the
+Returns `nothing` for the version header, blank lines and any line without the
 five expected fields; those are skipped rather than aborting a load.
 """
 @inline function parse_bismark_line(line::AbstractString)
@@ -539,15 +525,15 @@ end
 """
     site_key(position, context, strand, is_methylated)
 
-Sort/group key for one raw methylation-extractor call:
+Given one raw methylation-extractor call, pack it into a sort/group key:
 
 ```
 |--- pos (bits 63-32) ---|--- unused (31-5) ---|-cx (4-3)-|-st (2-1)-|-meth (0)-|
 ```
 
-Sorting these orders records by position, and every record for one site forms a
-contiguous run sharing `key >>> 1`, which [`aggregate_keys!`](@ref) collapses in
-a single scan with no hashing.
+Sorted, these order by position and put every record for one site in a
+contiguous run sharing `key >>> 1`, which [`aggregate_keys!`](@ref) collapses
+in one scan with no hashing.
 """
 @inline site_key(position::UInt32, context::UInt8, strand::UInt8, is_methylated::Bool) =
     (UInt64(position) << 32) | (UInt64(context) << 3) | (UInt64(strand) << 1) |
@@ -637,23 +623,14 @@ end
 """
     load_bismark(path; strand = infer_strand(path))
 
-Load a Bismark methylation-extractor file (optionally gzipped) into a
-[`MethylationData`](@ref) of per-site counts.
+Given a Bismark methylation-extractor file (optionally gzipped), one *read's*
+call per line, aggregate it. Returns a [`MethylationData`](@ref) holding one
+8-byte [`AggregatedCall`](@ref) per (position, context, strand); read IDs are
+discarded, and the header, blank lines and malformed lines are skipped.
 
-Each input line is one *read's* call at one cytosine:
-
-```
-<read id>	<methylation state>	<chromosome>	<position>	<call letter>
-```
-
-Read IDs are discarded and calls at the same site are summed, so the result is
-one 8-byte [`AggregatedCall`](@ref) per (position, context, strand). The call
-letter supplies the context and the methylation state (`Z`/`z` = CpG,
-`X`/`x` = CHG, `H`/`h` = CHH, `U`/`u` = unknown; uppercase means methylated),
-while `strand` comes from the file name — see [`infer_strand`](@ref). Pass
-`strand` explicitly for files whose names don't follow the convention.
-
-The version header, blank lines, and any malformed line are skipped.
+The call letter supplies both context and state (`Z`/`z` = CpG, `X`/`x` = CHG,
+`H`/`h` = CHH, `U`/`u` = unknown; uppercase means methylated), while `strand`
+comes from the file name — see [`infer_strand`](@ref).
 """
 load_bismark(path::AbstractString; strand::Integer = infer_strand(path)) =
     open_maybe_gzip(io -> load_bismark(io; strand = strand), path)
@@ -676,6 +653,13 @@ function open_maybe_gzip(f, path::AbstractString)
 end
 
 """
+Given a per-file setting that is either a fixed value or a function of the path,
+resolve it for `path`. Returns the value.
+"""
+@inline _per_file(setting, path::AbstractString) =
+    setting isa Function ? setting(path) : setting
+
+"""
     load_bismark(paths; strand = infer_strand)
 
 Load several Bismark files (for example the `OT` and `OB` halves of one sample)
@@ -689,8 +673,7 @@ to a code (the default infers it from each file's name).
 function load_bismark(paths::AbstractVector{<:AbstractString}; strand = infer_strand)
     isempty(paths) && return MethylationData()
     return merge_calls(
-        load_bismark(path; strand = strand isa Function ? strand(path) : strand) for
-        path in paths
+        load_bismark(path; strand = _per_file(strand, path)) for path in paths
     )
 end
 
@@ -735,22 +718,15 @@ end
 """
     parse_cov_record(buffer, line_start, line_stop)
 
-Parse one Bismark coverage record out of `buffer[line_start:line_stop]` (a line
-with its newline already stripped) into
-`(scaffold_stop, position, meth_count, unmeth_count)`. The scaffold name is
-`buffer[line_start:scaffold_stop]`, left as a byte range so
-[`parse_cov_chunk`](@ref) can match it without allocating.
+Given one newline-stripped coverage record in `buffer[line_start:line_stop]` —
+`<chromosome> <start> <end> <meth %> <count meth> <count unmeth>`, tab
+separated — split it. Returns `(scaffold_stop, position, meth_count,
+unmeth_count)`, the name left as the byte range `buffer[line_start:scaffold_stop]`
+so [`parse_cov_chunk`](@ref) can match it without allocating.
 
-Expected layout (tab separated):
-
-```
-<chromosome>	<start>	<end>	<methylation %>	<count meth>	<count unmeth>
-```
-
-`start` is 1-based and equals `end` for a single cytosine, so it is the
-position. The percentage is derivable from the counts and is skipped, as is any
-column past the sixth. Returns `nothing` for blank lines and anything without
-the six expected fields; those are skipped rather than aborting a load.
+`start` is 1-based and equals `end` for a single cytosine, so it is the position;
+the percentage is derivable from the counts and is skipped. Returns `nothing` for
+a blank line or one without six fields, which are skipped, not fatal.
 """
 @inline function parse_cov_record(buffer::Vector{UInt8}, line_start::Int, line_stop::Int)
     line_start > line_stop && return nothing
@@ -944,6 +920,12 @@ function chunk_lines!(channel::Channel{CovChunk}, io::IO, pool::ChunkPool)
     n_chunks = 0
     straddling = UInt8[]
 
+    function emit!(bytes, start_index, stop_index)
+        n_chunks += 1
+        put!(channel, CovChunk(n_chunks, bytes, start_index, stop_index))
+        return nothing
+    end
+
     while true
         buffer = take_chunk!(pool)
         n_bytes = readbytes!(io, buffer, chunk_bytes)
@@ -964,8 +946,7 @@ function chunk_lines!(channel::Channel{CovChunk}, io::IO, pool::ChunkPool)
             # This read completes the line left over from the previous one.
             first_newline = findnext(==(NEWLINE), buffer, 1)::Int
             append!(straddling, view(buffer, 1:first_newline))
-            n_chunks += 1
-            put!(channel, CovChunk(n_chunks, straddling, 1, length(straddling)))
+            emit!(straddling, 1, length(straddling))
             straddling = UInt8[]
             body_start = first_newline + 1
         end
@@ -974,19 +955,14 @@ function chunk_lines!(channel::Channel{CovChunk}, io::IO, pool::ChunkPool)
         append!(straddling, view(buffer, (last_newline+1):n_bytes))
 
         if body_start <= last_newline
-            n_chunks += 1
-            put!(channel, CovChunk(n_chunks, buffer, body_start, last_newline))
+            emit!(buffer, body_start, last_newline)
         else
             recycle_chunk!(pool, buffer)
         end
     end
 
     # Last line, if it had no trailing newline.
-    if !isempty(straddling)
-        n_chunks += 1
-        put!(channel, CovChunk(n_chunks, straddling, 1, length(straddling)))
-    end
-
+    isempty(straddling) || emit!(straddling, 1, length(straddling))
     return n_chunks
 end
 
@@ -1121,16 +1097,14 @@ end
 """
     parse_cov_parallel(io, n_workers)
 
-Read `io` and parse it into per-scaffold [`CovBuffer`](@ref)s.
+Given a coverage stream, parse it into per-scaffold [`CovBuffer`](@ref)s.
+Returns them keyed by scaffold name, concatenated in chunk order — which makes
+the load independent of scheduling and leaves an already-sorted `.cov` sorted
+for [`collapse_cov!`](@ref).
 
 One task reads (decompression, where there is any, is serial) while `n_workers`
 tasks parse chunks off a bounded channel, each into its own scaffold buffers so
-the hot loop shares nothing. Results concatenate in chunk order, which makes the
-load independent of scheduling and leaves an already-sorted `.cov` sorted for
-[`collapse_cov!`](@ref).
-
-Read buffers come from a [`ChunkPool`](@ref) sized to the most that can be alive
-at once: one in the reader's hand, `n_workers` queued, `n_workers` being parsed.
+the hot loop shares nothing.
 """
 function parse_cov_parallel(io::IO, n_workers::Int)
     n_workers = max(1, n_workers)
@@ -1138,23 +1112,7 @@ function parse_cov_parallel(io::IO, n_workers::Int)
     pool = ChunkPool(COV_CHUNK_BYTES, 2 * n_workers + 2)
 
     results = Tuple{Int,Dict{String,CovBuffer}}[]
-    results_lock = ReentrantLock()
-
-    workers = map(1:n_workers) do _
-        Threads.@spawn begin
-            try
-                for chunk in channel
-                    parsed = parse_cov_chunk(chunk)
-                    recycle_chunk!(pool, chunk.bytes)
-                    Base.@lock results_lock push!(results, (chunk.index, parsed))
-                end
-            catch err
-                # Unblocks a reader waiting on a full channel.
-                close(channel, err isa Exception ? err : ErrorException(string(err)))
-                rethrow()
-            end
-        end
-    end
+    workers = _spawn_cov_workers(channel, pool, results, n_workers)
 
     try
         chunk_lines!(channel, io, pool)
@@ -1164,9 +1122,44 @@ function parse_cov_parallel(io::IO, n_workers::Int)
     foreach(wait, workers)
 
     sort!(results; by = first)
+    return _merge_cov_results(results)
+end
 
-    # Total each scaffold up front, so the buffer the rest are folded into is
-    # grown once.
+"""
+Given a chunk channel, start the tasks that drain it. Returns them, each parsing
+into its own scaffold buffers and appending `(chunk index, buffers)` to
+`results` under a lock; a failure closes `channel`, unblocking a reader waiting
+on a full one.
+"""
+function _spawn_cov_workers(
+    channel::Channel{CovChunk},
+    pool::ChunkPool,
+    results::Vector{Tuple{Int,Dict{String,CovBuffer}}},
+    n_workers::Int,
+)
+    results_lock = ReentrantLock()
+    return map(1:n_workers) do _
+        Threads.@spawn begin
+            try
+                for chunk in channel
+                    parsed = parse_cov_chunk(chunk)
+                    recycle_chunk!(pool, chunk.bytes)
+                    Base.@lock results_lock push!(results, (chunk.index, parsed))
+                end
+            catch err
+                close(channel, err isa Exception ? err : ErrorException(string(err)))
+                rethrow()
+            end
+        end
+    end
+end
+
+"""
+Given the per-chunk buffers in chunk order, concatenate them per scaffold.
+Returns one [`CovBuffer`](@ref) per scaffold, each grown once by totalling the
+scaffold up front rather than re-paying the doubling ramp.
+"""
+function _merge_cov_results(results::Vector{Tuple{Int,Dict{String,CovBuffer}}})
     totals = Dict{String,Int}()
     for (_, parsed) in results, (scaffold, buffer) in parsed
         totals[scaffold] = get(totals, scaffold, 0) + length(buffer.positions)
@@ -1223,40 +1216,15 @@ load_bismark_cov(io::IO; context::Integer = CTX_CPG, strand::Integer = STRAND_NA
 """
     load_bismark_cov(path; context = CTX_CPG, strand = infer_strand(path))
 
-Load a Bismark coverage file (`.cov`, optionally gzipped) into a
-[`MethylationData`](@ref) of per-site counts.
+Given a Bismark coverage file (`.cov`, optionally gzipped) — the *aggregated*
+output of `bismark2bedGraph`/`coverage2cytosine`, one 1-based
+`<chr> <start> <end> <meth %> <count meth> <count unmeth>` line per cytosine —
+load it. Returns a [`MethylationData`](@ref) of one [`AggregatedCall`](@ref) per
+site, repeated positions summed and each scaffold sorted; a malformed line is
+skipped, not fatal. Parsing is threaded — see [`load_bismark_cov(::IO)`](@ref).
 
-This is Bismark's *aggregated* output — what `bismark2bedGraph`/
-`coverage2cytosine` write, as opposed to the per-read methylation-extractor
-records [`load_bismark`](@ref) reads. Each line is one cytosine:
-
-```
-<chromosome>	<start>	<end>	<methylation %>	<count methylated>	<count unmethylated>
-```
-
-Coordinates are already 1-based and `start == end` for a single cytosine, so
-`start` is taken as the position and `end` ignored. The percentage column is
-ignored as well, the counts being the more precise source, and those go straight
-into an [`AggregatedCall`](@ref) whose depth saturates at [`MAX_COUNT`](@ref).
-Repeated lines for the same position (concatenated files) are summed, and each
-scaffold's calls are sorted by position.
-
-A `.cov` file records **neither the context nor the strand**, so both are
-supplied by the caller:
-
-- `context` defaults to [`CTX_CPG`](@ref), Bismark's default coverage output
-  being CpG-only. Pass the right code for a single-context `--CX` run, or
-  [`CTX_UNKNOWN`](@ref) for a mixed-context one — a mixed file cannot be split
-  by context after the fact.
-- `strand` defaults to whatever [`infer_strand`](@ref) makes of the file name,
-  which is [`STRAND_NA`](@ref) for the usual strand-pooled whole-sample file.
-  Pass a code explicitly for coverage generated from one strand's extractor
-  output.
-
-Blank lines and any line without the six expected fields are skipped, as are
-lines whose numeric fields are not plain runs of digits (a sign or padding
-spaces count as malformed). Parsing is threaded — see
-[`load_bismark_cov(::IO)`](@ref).
+**NOTE:** a `.cov` records neither context nor strand, so both come from the
+caller, and a mixed-context `--CX` file cannot be split by context afterwards.
 """
 load_bismark_cov(
     path::AbstractString;
@@ -1275,18 +1243,15 @@ const MAX_CONCURRENT_COV_FILES = 4
     load_bismark_cov(paths; context = CTX_CPG, strand = infer_strand,
                      max_concurrent_files = MAX_CONCURRENT_COV_FILES)
 
-Load several Bismark coverage files and merge them into a single
+Given several Bismark coverage files, load and merge them. Returns one
 [`MethylationData`](@ref), summing the counts of entries that share a position,
-context and strand.
+context and strand; `context` and `strand` may each be a fixed code or a
+function of the path.
 
-`context` and `strand` may each be a fixed code applied to every file, or a
-function mapping a path to a code (`strand` defaults to inferring it from each
-file's name).
-
-Up to `max_concurrent_files` files are read at once, gated by a semaphore, and
-the available threads are split between them; that overlaps the part of a load a
-single file cannot parallelize, chiefly gzip decompression. Merging follows
-`paths` order, so the result does not depend on which file finishes first.
+Up to `max_concurrent_files` files are read at once with the threads split
+between them, overlapping the part of a load one file cannot parallelize —
+chiefly gzip decompression. Merging follows `paths` order, so the result does
+not depend on which file finishes first.
 """
 function load_bismark_cov(
     paths::AbstractVector{<:AbstractString};
@@ -1301,8 +1266,8 @@ function load_bismark_cov(
     gate = Base.Semaphore(n_concurrent)
 
     tasks = map(paths) do path
-        file_context = two_bit_code(context isa Function ? context(path) : context)
-        file_strand = two_bit_code(strand isa Function ? strand(path) : strand)
+        file_context = two_bit_code(_per_file(context, path))
+        file_strand = two_bit_code(_per_file(strand, path))
         Threads.@spawn Base.acquire(gate) do
             open_maybe_gzip(path) do io
                 load_cov_stream(io, file_context, file_strand, workers_per_file)
@@ -1335,7 +1300,24 @@ function merge_calls(datasets)
     return MethylationData(scaffolds)
 end
 
-# Copy `calls[from_index:end]` onto the output columns of `merge_scaffold`.
+"""
+Given one call, append it to the output columns of [`merge_scaffold`](@ref).
+Returns `nothing`.
+"""
+@inline function _push_call!(
+    positions::Vector{UInt32},
+    payloads::Vector{UInt32},
+    call::AggregatedCall,
+)
+    push!(positions, call.pos)
+    push!(payloads, call.payload)
+    return nothing
+end
+
+"""
+Given a merge that has run one side dry, copy `calls[from_index:end]` onto the
+output columns of [`merge_scaffold`](@ref). Returns `nothing`.
+"""
 @inline function _append_tail!(
     positions::Vector{UInt32},
     payloads::Vector{UInt32},
@@ -1367,12 +1349,10 @@ function merge_scaffold(
         left_key, right_key = sort_key(left_call), sort_key(right_call)
 
         if left_key < right_key
-            push!(positions, left_call.pos)
-            push!(payloads, left_call.payload)
+            _push_call!(positions, payloads, left_call)
             left_index += 1
         elseif right_key < left_key
-            push!(positions, right_call.pos)
-            push!(payloads, right_call.payload)
+            _push_call!(positions, payloads, right_call)
             right_index += 1
         else
             push!(positions, left_call.pos)
@@ -1443,6 +1423,22 @@ const MANIFEST_NAME = "scaffolds.tsv"
 sanitize_name(name::AbstractString) = replace(String(name), r"[^A-Za-z0-9._-]" => "_")
 
 """
+Given a file-name stem, make it unique against the ones already `used`. Returns
+the stem, suffixed with `_1`, `_2`, … when two scaffold names sanitize alike,
+and records it as used.
+"""
+function _unique_stem!(used::Set{String}, stem::AbstractString)
+    candidate = String(stem)
+    suffix = 1
+    while candidate in used
+        candidate = "$(stem)_$(suffix)"
+        suffix += 1
+    end
+    push!(used, candidate)
+    return candidate
+end
+
+"""
     write_methylation(dir, data; compress = :zstd)
 
 Write a whole [`MethylationData`](@ref) to `dir`, one Arrow file per scaffold
@@ -1463,17 +1459,7 @@ function write_methylation(
     used = Set{String}()
 
     for scaffold in sort!(collect(keys(data.scaffolds)))
-        stem = sanitize_name(scaffold)
-        # Two different scaffold names can sanitize to the same stem.
-        candidate = stem
-        suffix = 1
-        while candidate in used
-            candidate = "$(stem)_$(suffix)"
-            suffix += 1
-        end
-        push!(used, candidate)
-
-        filename = "$(candidate).arrow"
+        filename = "$(_unique_stem!(used, sanitize_name(scaffold))).arrow"
         write_methylation_arrow(
             joinpath(dir, filename),
             data.scaffolds[scaffold];

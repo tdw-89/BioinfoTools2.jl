@@ -769,7 +769,7 @@ end
     @testset "a gene left without a partner goes too" begin
         # Only g1-g2 is recorded, so g3 and g4 lose their only pairs.
         local result
-        result = @test_logs (:warn, r"dropped 2 pair\(s\).*2 gene") add_duplications_of(
+        result = @test_logs (:warn, r"dropped 2 pairs.*2 genes") add_duplications_of(
             pg,
             duplications_file(rows[1:1]),
             "human",
@@ -1261,5 +1261,106 @@ end
         result = rbh(pg)
         pg2 = PG(genome, result)
         @test size(pg2.topology, 1) == 2
+    end
+end
+
+# ============================================================================
+# Tests for the constructor's internal stages
+# ============================================================================
+const P = BioinfoTools2.Homologs.Paralogs
+
+@testset "ParalogGroup construction helpers" begin
+
+    @testset "_plural" begin
+        @test P._plural(0, "pair") == "0 pairs"
+        @test P._plural(1, "pair") == "1 pair"
+        @test P._plural(2, "gene") == "2 genes"
+    end
+
+    @testset "_intern! - 1-based codes, first name wins" begin
+        labels = String[]
+        codes = Dict{String,UInt32}()
+        assigned = [P._intern!(labels, codes, name) for name in ("N1", "N2", "N1", "N3")]
+        @test assigned == UInt32[1, 2, 1, 3]
+        @test labels == ["N1", "N2", "N3"]
+        # A 0 is unreachable, which is what lets an unstored cell mean "unknown".
+        @test !any(iszero, assigned)
+    end
+
+    @testset "_upper_triangle" begin
+        lower, upper = P._upper_triangle([3, 1, 2], [1, 4, 2])
+        @test lower == [1, 1, 2]
+        @test upper == [3, 4, 2]
+    end
+
+    @testset "_pair_edges - unindexed ends drop the row" begin
+        id_to_index = Dict("a" => 1, "b" => 2)
+        queries, subjects, rows =
+            P._pair_edges(["a", "a", "ghost"], ["b", "ghost", "b"], id_to_index)
+        @test queries == [1]
+        @test subjects == [2]
+        @test rows == [1]
+    end
+
+    @testset "_layout_genes - scaffolds end to end, genes by position" begin
+        interval(start_pos, end_pos) =
+            BioinfoTools2.Reference.IntervalSimple(UInt32(start_pos), UInt32(end_pos), 0x00)
+        # Deliberately out of order, and with "chr2" named before "chr1".
+        intervals, ranges, id_to_index = P._layout_genes([
+            ("chr2", interval(10, 20), "g4"),
+            ("chr1", interval(300, 400), "g2"),
+            ("chr1", interval(100, 200), "g1"),
+            ("chr1", interval(500, 600), "g3"),
+        ])
+
+        # Scaffolds are laid out in sorted name order, genes within one by start.
+        @test ranges == Dict("chr1" => 1:3, "chr2" => 4:4)
+        @test id_to_index == Dict("g1" => 1, "g2" => 2, "g3" => 3, "g4" => 4)
+        @test intervals["chr1"].start_pos == UInt32[100, 300, 500]
+        @test intervals["chr2"].start_pos == UInt32[10]
+        @test sort(collect(keys(intervals))) == ["chr1", "chr2"]
+    end
+
+    @testset "_layout_genes - empty input" begin
+        intervals, ranges, id_to_index =
+            P._layout_genes(Tuple{String,BioinfoTools2.Reference.IntervalSimple,String}[])
+        @test isempty(intervals)
+        @test isempty(ranges)
+        @test isempty(id_to_index)
+    end
+
+    @testset "_relation and _topology keep explicit zeros / symmetry" begin
+        # A meaningful 0 (a dS of 0 between recent duplicates) must survive.
+        relation = P._relation([1, 2], [2, 3], [0.0, 0.5], 3)
+        @test nnz(relation) == 2
+        @test relation[1, 2] == 0.0
+        @test relation[2, 3] == 0.5
+
+        topology = P._topology([1, 2], [2, 3], 3)
+        @test topology == permutedims(topology)
+        @test nnz(topology) == 4
+        @test topology[1, 2] && topology[2, 1]
+        @test !topology[1, 3]
+    end
+
+    @testset "_tri reads the same cell either way round" begin
+        relation = P._relation([1], [3], [0.25], 3)
+        @test P._tri(relation, 1, 3) == 0.25
+        @test P._tri(relation, 3, 1) == 0.25
+    end
+
+    @testset "_require_eltype names the column" begin
+        df = DataFrame(GeneID = [1, 2], Score = ["x", "y"])
+        @test P._require_eltype(df, 1, Integer, "numbers") === nothing
+        err = try
+            P._require_eltype(df, 2, Real, "scores (numbers)", "Relation column")
+            nothing
+        catch caught
+            caught
+        end
+        @test err isa ArgumentError
+        @test occursin("Relation column 2", err.msg)
+        @test occursin("\"Score\"", err.msg)
+        @test occursin("String", err.msg)
     end
 end
