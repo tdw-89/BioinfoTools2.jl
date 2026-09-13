@@ -1,6 +1,6 @@
 name = "BioinfoTools2"
 uuid = "961a5d6f-8097-4ecf-bcda-6ee52fd0e99f"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Tom Wolfe <thomas_wolfe@student.uml.edu>"]
 
 [deps]
