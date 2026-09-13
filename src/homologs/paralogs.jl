@@ -1131,6 +1131,25 @@ function _pair_table(pg::ParalogGroup, chosen::Vector{Tuple{Int,Int}})
 end
 
 """
+    pair_table(pg::ParalogGroup) -> DataFrame
+
+Given a group, list every pair its topology holds. Returns a `DataFrame` shaped
+like the constructor's input — `query`, `subject`, then whichever relations `pg`
+carries — one row per pair, in ascending gene-index order. [`rbh`](@ref) returns
+the same shape, restricted to each component's best pair.
+
+**NOTE:** a gene with no partner has no row, and a pair with no value recorded
+for a relation reads as 0 there, `lca` as `""`.
+"""
+function pair_table(pg::ParalogGroup)
+    all_pairs = Tuple{Int,Int}[
+        _edge_query_subject(pg, Int(src(edge)), Int(dst(edge))) for
+        edge in edges(topology_graph(pg))
+    ]
+    return _pair_table(pg, all_pairs)
+end
+
+"""
     rbh(pg::ParalogGroup; scoring = "mean", levels = nothing) -> DataFrame
 
 Given a group, keep the best-ranking edge of each weakly-connected component of
@@ -1382,6 +1401,7 @@ export ParalogGroup,
     id_query_subject_graph,
     id_subject_query_graph,
     lca_label,
+    pair_table,
     rbh,
     rbh_ds,
     topology_graph
