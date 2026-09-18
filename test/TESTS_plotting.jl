@@ -50,6 +50,11 @@ const Makie = BioinfoTools2.Plotting.CairoMakie
         mark_positions!(trend_axis, [1, 3], ["first", "second"])
         @test length(trend_axis.scene.plots) == 4    # plus the rules and their labels
         @test_throws DimensionMismatch mark_positions!(trend_axis, [1, 2], ["only one"])
+        @test_throws ArgumentError mark_positions!(trend_axis, [1], ["x"]; side = :top)
+        left_axis =
+            trend_plot!(figure[8, 1], 1:4, [1.0, 3.0, 2.0, 4.0], [2.0, 2.0, 3.0, 3.0])
+        mark_positions!(left_axis, [2.5], ["everything left"]; side = :left)
+        @test length(left_axis.scene.plots) == 4
 
         # Headless render: the whole figure draws without error.
         @test Makie.colorbuffer(figure) isa AbstractMatrix
