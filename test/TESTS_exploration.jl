@@ -1022,6 +1022,22 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             @test sort(collect(zip(bins, values))) == [(1, 0.25), (2, 0.5)]
         end
 
+        @testset "values_by_rank and moving_average" begin
+            ranks, ranked = values_by_rank(
+                Dict("a" => 3.0, "b" => 1.0, "c" => 2.0, "ghost" => 9.0),
+                Dict("a" => 30, "b" => 10, "c" => 20),
+            )
+            @test ranks == [10, 20, 30]
+            @test ranked == [1.0, 2.0, 3.0]
+
+            # One value either side, the window shrinking at the ends; the NaN
+            # is skipped rather than poisoning its neighbours.
+            @test moving_average([1.0, 2.0, NaN, 4.0], 1) == [1.5, 1.5, 3.0, 4.0]
+            @test moving_average([5.0, 7.0], 0) == [5.0, 7.0]
+            @test all(isnan, moving_average([NaN, NaN], 3))
+            @test_throws ArgumentError moving_average([1.0], -1)
+        end
+
         @testset "zscore_finite and mean_finite - NaN means unmeasured" begin
             panel = [1.0 NaN; 3.0 5.0]
             standardised = zscore_finite(panel)

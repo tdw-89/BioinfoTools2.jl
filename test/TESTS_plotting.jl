@@ -44,6 +44,13 @@ const Makie = BioinfoTools2.Plotting.CairoMakie
         @test length(bare_lines.scene.plots) == 1
         @test length(heat_axis.scene.plots) == 2
 
+        trend_axis =
+            trend_plot!(figure[7, 1], 1:4, [1.0, 3.0, 2.0, 4.0], [2.0, 2.0, 3.0, 3.0])
+        @test length(trend_axis.scene.plots) == 2    # the points and the trend
+        mark_positions!(trend_axis, [1, 3], ["first", "second"])
+        @test length(trend_axis.scene.plots) == 4    # plus the rules and their labels
+        @test_throws DimensionMismatch mark_positions!(trend_axis, [1, 2], ["only one"])
+
         # Headless render: the whole figure draws without error.
         @test Makie.colorbuffer(figure) isa AbstractMatrix
     end

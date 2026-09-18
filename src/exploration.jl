@@ -1103,6 +1103,40 @@ function values_by_quantile(
     return bins, binned_values
 end
 
+"""
+Given a `gene ID => value` `Dict` and a `gene ID => rank` map, pair each value
+with its gene's rank. Returns `(ranks, values)` sorted by rank, ready for
+[`moving_average`](@ref); unranked genes are dropped.
+"""
+function values_by_rank(
+    gene_values::AbstractDict{String,<:Real},
+    gene_rank::AbstractDict{String,<:Integer},
+)
+    ranks, ranked_values = values_by_quantile(gene_values, gene_rank)
+    order = sortperm(ranks)
+    return ranks[order], ranked_values[order]
+end
+
+"""
+Given ordered `values`, smooth each with a centred moving average over the
+`half_width` values either side of it, the window shrinking at either end.
+Returns a vector of the same length; non-finite values are skipped, and a window
+holding none gives `NaN`.
+"""
+function moving_average(values::AbstractVector{<:Real}, half_width::Integer)
+    half_width >= 0 ||
+        throw(ArgumentError("`half_width` must be non-negative (got $half_width)"))
+    finite = isfinite.(values)
+    sums = cumsum([0.0; ifelse.(finite, Float64.(values), 0.0)])
+    counts = cumsum([0; finite])
+    n_values = length(values)
+    return map(1:n_values) do index
+        low, high = max(1, index - half_width), min(n_values, index + half_width)
+        n_finite = counts[high+1] - counts[low]
+        n_finite == 0 ? NaN : (sums[high+1] - sums[low]) / n_finite
+    end
+end
+
 #= Panel statistics =#
 
 """
@@ -1159,6 +1193,8 @@ export coverage,
     clipped_features,
     tss_window,
     values_by_quantile,
+    values_by_rank,
+    moving_average,
     zscore_finite,
     mean_finite
 
