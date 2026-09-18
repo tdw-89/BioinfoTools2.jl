@@ -1165,4 +1165,78 @@ end
             @test M._per_file(path -> length(path), "abcd") == 4
         end
     end
+
+    @testset "merge_calls - single_rounding packs each site once" begin
+        # Two datasets deep enough at one site for re-rounding to matter, plus
+        # a site only one of them holds.
+        left = MethylationData(
+            Dict(
+                "c" => aggregated_calls(
+                    UInt32[5, 9],
+                    [pack_payload(700, 300), pack_payload(1, 1)],
+                ),
+            ),
+        )
+        right = MethylationData(
+            Dict("c" => aggregated_calls(UInt32[5], [pack_payload(333, 667)])),
+        )
+        once = merge_calls([left, right]; single_rounding = true)["c"]
+        expected = pack_payload(
+            Int(get_meth(left["c"][1])) + Int(get_meth(right["c"][1])),
+            Int(get_unmeth(left["c"][1])) + Int(get_unmeth(right["c"][1])),
+        )
+        @test collect(once.pos) == UInt32[5, 9]
+        @test once.payload[1] == expected
+        @test once.payload[2] == pack_payload(1, 1)
+        # One dataset is returned untouched either way.
+        @test merge_calls([left]; single_rounding = true)["c"] === left["c"]
+        # The default fold is exact for shallow sites, so both agree there.
+        shallow = [load_bismark(MICRO_BISMARK), load_bismark(MICRO_BISMARK)]
+        @test merge_calls(shallow; single_rounding = true)["15"] ==
+              merge_calls(shallow)["15"]
+    end
+
+    @testset "load_bismark_cov - Arrow cache" begin
+        cache = mktempdir()
+        plain = load_bismark_cov(MICRO_COV)
+        cold = load_bismark_cov(MICRO_COV; cache)
+        warm = load_bismark_cov(MICRO_COV; cache)
+        same(a, b) =
+            keys(a) == keys(b) && all(
+                collect(a[k].pos) == collect(b[k].pos) &&
+                collect(a[k].payload) == collect(b[k].payload) for k in keys(a)
+            )
+        @test same(plain, cold) && same(plain, warm)
+        # The warm load is the cached copy, memory-mapped rather than parsed.
+        @test !(first(values(warm.scaffolds)).pos isa Vector)
+        # Context and strand are baked into the payloads, so each gets its own copy.
+        load_bismark_cov(MICRO_COV; cache, context = CTX_CHG)
+        @test length(readdir(cache)) == 2
+        # A source newer than its copy is re-parsed.
+        source = cp(MICRO_COV, joinpath(mktempdir(), "sample.cov"))
+        load_bismark_cov(source; cache)
+        manifest = joinpath(
+            Methylation._cache_dir(cache, source, CTX_CPG, STRAND_NA),
+            "scaffolds.tsv",
+        )
+        built = mtime(manifest)
+        sleep(1.1)   # past any filesystem's timestamp resolution
+        touch(source)
+        @test same(plain, load_bismark_cov(source; cache))
+        @test mtime(manifest) > built
+        # The multi-file loader goes through the same cache, in `paths` order.
+        @test same(
+            load_bismark_cov([MICRO_COV, MICRO_COV]),
+            load_bismark_cov([MICRO_COV, MICRO_COV]; cache),
+        )
+    end
+
+    @testset "read_methylation - materialize" begin
+        dir =
+            write_methylation(mktempdir(), load_bismark_cov(MICRO_COV); compress = nothing)
+        copied = first(values(read_methylation(dir; materialize = true).scaffolds))
+        mapped = first(values(read_methylation(dir).scaffolds))
+        @test copied.pos isa Vector{UInt32} && copied.payload isa Vector{UInt32}
+        @test copied == mapped
+    end
 end

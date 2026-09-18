@@ -473,6 +473,20 @@ struct FeatureFrequency
 end
 
 """
+Given `scaffold_features(name, tree)`, which builds a `feature ID => value` `Dict`
+of `V` for one scaffold's `feature`-type features, run it for every scaffold of
+`genome` on its own task. Returns the merged `Dict`, folded in scaffold order so
+the result does not depend on scheduling.
+"""
+function _by_scaffold(scaffold_features::F, genome::Genome, feature, ::Type{V}) where {F,V}
+    tasks = [
+        Threads.@spawn(scaffold_features(name, tree)) for
+        (name, tree) in get_feature(genome, feature)
+    ]
+    return foldl(merge!, fetch.(tasks); init = Dict{String,V}())
+end
+
+"""
     feature_frequency(genome, feature, frequency, n; flank = 500)
 
 Given a per-base `frequency` dictionary (as [`calculate_frequency`](@ref)
@@ -491,34 +505,35 @@ function feature_frequency(
     n::Integer;
     flank::Integer = 500,
 )
-    features = Dict{String,SparseVector{UInt32,Int}}()
+    features =
+        _by_scaffold(genome, feature, SparseVector{UInt32,Int}) do scaffold_name, tree
+            counts = get(frequency, scaffold_name, nothing)
+            # Nonzero (base, count) pairs for this scaffold, ascending by position.
+            base_indices, base_counts =
+                isnothing(counts) ? (Int[], UInt32[]) : findnz(counts)
+            scaffold_features = Dict{String,SparseVector{UInt32,Int}}()
 
-    for (scaffold_name, tree) in get_feature(genome, feature)
-        counts = get(frequency, scaffold_name, nothing)
-        # Nonzero (base, count) pairs for this scaffold, ascending by position.
-        base_indices, base_counts = isnothing(counts) ? (Int[], UInt32[]) : findnz(counts)
+            for interval in tree
+                region = _feature_region(genome, interval, flank; clip = true)
+                isnothing(region) && continue
+                feature_id, negative, region_start, region_end = region
 
-        for interval in tree
-            region = _feature_region(genome, interval, flank; clip = true)
-            isnothing(region) && continue
-            feature_id, negative, region_start, region_end = region
-
-            # Slice of nonzero bases falling inside the padded region.
-            entries =
-                searchsortedfirst(base_indices, region_start):searchsortedlast(
-                    base_indices,
-                    region_end,
+                # Slice of nonzero bases falling inside the padded region.
+                entries =
+                    searchsortedfirst(base_indices, region_start):searchsortedlast(
+                        base_indices,
+                        region_end,
+                    )
+                scaffold_features[feature_id] = sparsevec(
+                    Int[
+                        _region_index(base_indices[e], region_start, region_end, negative) for e in entries
+                    ],
+                    UInt32[base_counts[e] for e in entries],
+                    region_end - region_start + 1,
                 )
-            features[feature_id] = sparsevec(
-                Int[
-                    _region_index(base_indices[e], region_start, region_end, negative)
-                    for e in entries
-                ],
-                UInt32[base_counts[e] for e in entries],
-                region_end - region_start + 1,
-            )
+            end
+            scaffold_features
         end
-    end
 
     return FeatureFrequency(n, features)
 end
@@ -553,18 +568,54 @@ that observation; prefer `log1p` over `log` unless that is what you want.
 end
 
 """
-One feature's per-base methylation, oriented in the direction of transcription
-(index 1 is the 5' end of the flanked region).
+One feature's measured bases over a flanked region `region_length` bases long,
+oriented in the direction of transcription (base 1 is the 5' end): parallel
+`bases` (ascending), depth-weighted `levels` in `[0, 1]` and total-depth
+`weights`. `fl[base]` reads one base as `(level, weight)`.
 
-- `levels`: depth-weighted methylation fraction in `[0, 1]` at each base.
-- `weights`: total read depth at each base. **A nonzero weight is what marks a
-  base as measured**, since a base measured at 0% methylation and a base with no
-  cytosine are both structural zeros in `levels`.
+**NOTE:** only measured bases are stored — that is what tells a base measured at
+0% from one with no cytosine — so an unmeasured base reads as `(0, 0)`.
 """
 struct FeatureLevels
-    levels::SparseVector{Float32,Int}
-    weights::SparseVector{UInt32,Int}
+    region_length::Int
+    bases::Vector{Int32}
+    levels::Vector{Float32}
+    weights::Vector{UInt32}
 end
+
+"""
+Given a region's per-base `levels` and `weights` as `SparseVector`s, keep the
+bases with a nonzero weight. Returns their [`FeatureLevels`](@ref).
+"""
+function FeatureLevels(levels::SparseVector, weights::SparseVector)
+    bases, depths = findnz(weights)
+    measured = findall(!iszero, depths)
+    return FeatureLevels(
+        length(weights),
+        Int32.(bases[measured]),
+        Float32[levels[base] for base in bases[measured]],
+        UInt32.(depths[measured]),
+    )
+end
+
+Base.length(feature_levels::FeatureLevels) = feature_levels.region_length
+
+function Base.getindex(feature_levels::FeatureLevels, base::Integer)
+    entry = searchsortedfirst(feature_levels.bases, base)
+    (entry <= length(feature_levels.bases) && feature_levels.bases[entry] == base) ||
+        return (level = 0.0f0, weight = UInt32(0))
+    return (level = feature_levels.levels[entry], weight = feature_levels.weights[entry])
+end
+
+"""
+Given a range of region bases, locate the measured ones inside it. Returns the
+range of entries of `feature_levels.bases` that fall there.
+"""
+_entries_within(feature_levels::FeatureLevels, bases::AbstractUnitRange) =
+    searchsortedfirst(feature_levels.bases, first(bases)):searchsortedlast(
+        feature_levels.bases,
+        last(bases),
+    )
 
 """
 Per-feature, per-base methylation levels, together with the filters they were
@@ -583,9 +634,9 @@ struct MethylationFrequency
 end
 
 """
-Given the calls over one region, pool them per base. Returns
-`(indices, levels, weights)` in region coordinates, several calls on one base —
-the two strands of a CpG, say — combining in proportion to their depths.
+Given the calls over one region, pool them per base. Returns the region's
+[`FeatureLevels`](@ref), several calls on one base — the two strands of a CpG,
+say — combining in proportion to their depths.
 
 Calls shallower than `min_depth`, or outside `context` when one is given, are
 dropped.
@@ -598,9 +649,9 @@ function _region_levels(
     min_depth::UInt32,
     context::Union{Nothing,UInt8},
 )
-    indices = Int[]
-    level_values = Float32[]
-    weight_values = UInt32[]
+    indices = sizehint!(Int32[], length(region_calls))
+    level_values = sizehint!(Float32[], length(region_calls))
+    weight_values = sizehint!(UInt32[], length(region_calls))
 
     # Calls are position-sorted, so the (rare) several calls sharing a base form
     # one contiguous run.
@@ -631,7 +682,14 @@ function _region_levels(
         push!(level_values, Float32(weighted_fraction / depth_total))
         push!(weight_values, UInt32(min(depth_total, Int(typemax(UInt32)))))
     end
-    return indices, level_values, weight_values
+    # Calls run in genomic order, so a negative-strand region was filled 3' first.
+    negative && foreach(reverse!, (indices, level_values, weight_values))
+    return FeatureLevels(
+        region_end - region_start + 1,
+        indices,
+        level_values,
+        weight_values,
+    )
 end
 
 """
@@ -657,18 +715,16 @@ function feature_frequency(
 )
     min_depth_bits = UInt32(min_depth)
     context_bits = isnothing(context) ? nothing : UInt8(context)
-    features = Dict{String,FeatureLevels}()
-
-    for (scaffold_name, tree) in get_feature(genome, feature)
-        haskey(data, scaffold_name) || continue
+    features = _by_scaffold(genome, feature, FeatureLevels) do scaffold_name, tree
+        scaffold_levels = Dict{String,FeatureLevels}()
+        haskey(data, scaffold_name) || return scaffold_levels
         calls = data[scaffold_name]
 
         for interval in tree
             region = _feature_region(genome, interval, flank; clip = false)
             isnothing(region) && continue
             feature_id, negative, region_start, region_end = region
-
-            indices, levels, weights = _region_levels(
+            scaffold_levels[feature_id] = _region_levels(
                 find_calls_in_range(calls, max(1, region_start), region_end),
                 region_start,
                 region_end,
@@ -676,12 +732,8 @@ function feature_frequency(
                 min_depth_bits,
                 context_bits,
             )
-            region_length = region_end - region_start + 1
-            features[feature_id] = FeatureLevels(
-                sparsevec(indices, levels, region_length),
-                sparsevec(indices, weights, region_length),
-            )
         end
+        scaffold_levels
     end
 
     return MethylationFrequency(min_depth_bits, context_bits, features)
@@ -790,42 +842,27 @@ function gene_profile(
     flank::Integer = 500,
     body_bins::Integer = 100,
     weight_by_depth::Bool = true,
-    weight_transform = identity,
-)
-    region_length = length(feature_levels.levels)
+    # Typed so the method specializes on it: an argument only passed on is
+    # otherwise dispatched dynamically, boxing every weight.
+    weight_transform::T = identity,
+) where {T}
+    region_length = length(feature_levels)
     region_length < 2 * flank + 2 && return nothing
 
     n_slots = 2 * flank + body_bins
     profile_levels = zeros(Float64, n_slots)
     profile_weights = zeros(Float64, n_slots)
     weighted_sums = zeros(Float64, n_slots)
-
     body_length = region_length - 2 * flank
-    weight_bases, base_weights = findnz(feature_levels.weights)
-    level_bases, base_levels = findnz(feature_levels.levels)
 
-    # `levels` and `weights` share a sparsity pattern in practice but need not,
-    # so both stored-entry lists — each ascending — are walked in step rather
-    # than indexing `levels` per base, which would binary search it every time.
-    level_entry = 1
-    n_level_entries = length(level_bases)
-
-    for (entry, base) in enumerate(weight_bases)
-        depth = base_weights[entry]
-        depth == 0 && continue
+    for (base, level, depth) in
+        zip(feature_levels.bases, feature_levels.levels, feature_levels.weights)
         weight = weight_by_depth ? weight_of(depth, weight_transform) : 1.0
         weight == 0 && continue
 
-        while level_entry <= n_level_entries && level_bases[level_entry] < base
-            level_entry += 1
-        end
-        level =
-            level_entry <= n_level_entries && level_bases[level_entry] == base ?
-            Float64(base_levels[level_entry]) : 0.0
-
-        slot = _flank_slot(base, flank, body_length, body_bins)
-        slot == 0 && (slot = flank + cld((base - flank) * body_bins, body_length))
-        weighted_sums[slot] += level * weight
+        slot = _flank_slot(Int(base), flank, body_length, body_bins)
+        slot == 0 && (slot = flank + cld((Int(base) - flank) * body_bins, body_length))
+        weighted_sums[slot] += Float64(level) * weight
         profile_weights[slot] += weight
     end
 
@@ -876,8 +913,8 @@ function _group_profiles(
     flank::Integer = 500,
     body_bins::Integer = 100,
     weight_by_depth::Bool = true,
-    weight_transform = identity,
-) where {F}
+    weight_transform::T = identity,
+) where {F,T}
     weighted_sums = zeros(Float64, n_groups, 2 * flank + body_bins)
     weight_totals = zeros(Float64, n_groups, 2 * flank + body_bins)
 
@@ -1067,14 +1104,13 @@ function tss_window(
     summaries = Dict{String,Float64}()
     for (gene_id, feature_levels) in frequency.features
         gene_id in exclude && continue
-        length(feature_levels.levels) - 2 * flank < window ÷ 2 && continue
+        length(feature_levels) - 2 * flank < window ÷ 2 && continue
 
         weighted_total = 0.0
         weight_total = 0.0
-        for position in positions
-            weight = Float64(feature_levels.weights[position])
-            weight == 0 && continue
-            weighted_total += feature_levels.levels[position] * weight
+        for entry in _entries_within(feature_levels, positions)
+            weight = Float64(feature_levels.weights[entry])
+            weighted_total += feature_levels.levels[entry] * weight
             weight_total += weight
         end
         weight_total == 0 || (summaries[gene_id] = weighted_total / weight_total)

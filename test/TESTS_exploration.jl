@@ -657,31 +657,38 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             @test haskey(frequency.features, gene_id)
 
             levels = frequency.features[gene_id]
-            @test length(levels.levels) == gene_length + 2 * flank
+            @test length(levels) == gene_length + 2 * flank
             # Index 1 is the 5' end for either strand.
-            @test levels.levels[1] ≈ 1.0
-            @test levels.weights[1] == 10
-            @test levels.levels[flank+2] ≈ 0.5 atol = 1 / 255
-            @test levels.weights[flank+2] == 10
+            @test levels[1].level ≈ 1.0
+            @test levels[1].weight == 10
+            @test levels[flank+2].level ≈ 0.5 atol = 1 / 255
+            @test levels[flank+2].weight == 10
+            # Stored ascending whatever the strand, and only where measured.
+            @test issorted(levels.bases) && length(levels.bases) == 2
+            @test levels[flank+3] == (level = 0.0f0, weight = UInt32(0))
+            @test FeatureLevels(
+                sparsevec([2, 4], Float32[0.5, 0.0], 5),
+                sparsevec([2, 4], UInt32[3, 0], 5),
+            ).bases == Int32[2]
 
             @testset "depth and context filters" begin
                 shallow = meth_data([inside], UInt32[pack_payload(2, 0)])
-                @test nnz(
-                    feature_frequency(sp.genome, :gene, shallow; flank).features[gene_id].weights,
+                @test length(
+                    feature_frequency(sp.genome, :gene, shallow; flank).features[gene_id].bases,
                 ) == 0
                 # ...unless the threshold is lowered to admit it.
-                @test nnz(
-                    feature_frequency(sp.genome, :gene, shallow; flank, min_depth = 2).features[gene_id].weights,
+                @test length(
+                    feature_frequency(sp.genome, :gene, shallow; flank, min_depth = 2).features[gene_id].bases,
                 ) == 1
 
                 non_cpg = meth_data([inside], UInt32[pack_payload(10, 0, CTX_CHH)])
-                @test nnz(
-                    feature_frequency(sp.genome, :gene, non_cpg; flank).features[gene_id].weights,
+                @test length(
+                    feature_frequency(sp.genome, :gene, non_cpg; flank).features[gene_id].bases,
                 ) == 0
                 # `context = nothing` keeps every context.
                 kept =
                     feature_frequency(sp.genome, :gene, non_cpg; flank, context = nothing)
-                @test nnz(kept.features[gene_id].weights) == 1
+                @test length(kept.features[gene_id].bases) == 1
                 @test kept.context === nothing
             end
 
@@ -697,8 +704,8 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
                 )
                 combined = feature_frequency(sp.genome, :gene, shared; flank)
                 slot = combined.features[gene_id]
-                @test slot.weights[flank+2] == 40
-                @test slot.levels[flank+2] ≈ 0.75 atol = 1 / 255
+                @test slot[flank+2].weight == 40
+                @test slot[flank+2].level ≈ 0.75 atol = 1 / 255
             end
 
             @testset "region is not clipped at the scaffold start" begin
@@ -710,7 +717,7 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
                     Reference.get_metadata_id(sp.genome, Reference.parse_index(edge.value))
                 edge_length = Int(edge.last) - Int(edge.first) + 1
                 clipped = feature_frequency(sp.genome, :gene, data; flank)
-                @test length(clipped.features[edge_id].levels) == edge_length + 2 * flank
+                @test length(clipped.features[edge_id]) == edge_length + 2 * flank
             end
 
             @testset "scaffold absent from the data contributes nothing" begin
