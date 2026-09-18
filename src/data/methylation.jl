@@ -325,9 +325,11 @@ end
 @inline BitCodes.get_strand(call::AggregatedCall) = get_strand(call.payload)
 
 """Ordering key keeping call arrays in (position, context, strand) order."""
-@inline sort_key(call::AggregatedCall) =
-    (UInt64(call.pos) << 32) | (UInt64(get_context(call)) << 2) |
-    UInt64(get_strand_code(call))
+@inline sort_key(pos::UInt32, payload::UInt32) =
+    (UInt64(pos) << 32) | (UInt64(get_context(payload)) << 2) |
+    UInt64(get_strand_code(payload))
+
+@inline sort_key(call::AggregatedCall) = sort_key(call.pos, call.payload)
 
 #= StructArray construction and search =#
 
@@ -559,10 +561,13 @@ Sort one scaffold's [`site_key`](@ref)s in place and collapse each
 """
 function aggregate_keys!(keys::Vector{UInt64})
     sort!(keys)
-
-    positions = UInt32[]
-    payloads = UInt32[]
     n_keys = length(keys)
+    # One pass over the sorted keys counts the sites, so the outputs grow once.
+    n_unique =
+        n_keys == 0 ? 0 :
+        1 + count(index -> keys[index] >>> 1 != keys[index-1] >>> 1, 2:n_keys)
+    positions = sizehint!(UInt32[], n_unique)
+    payloads = sizehint!(UInt32[], n_unique)
 
     index = 1
     while index <= n_keys
@@ -1202,6 +1207,33 @@ function load_cov_stream(io::IO, context::UInt8, strand::UInt8, n_workers::Int)
 end
 
 """
+Given a `.cov` file and a `cache` directory, name the file's Arrow copy there —
+one per file, context and strand, since both are baked into the payloads.
+"""
+_cache_dir(cache::AbstractString, path::AbstractString, context::UInt8, strand::UInt8) =
+    joinpath(cache, "$(sanitize_name(basename(path)))_context$(context)_strand$(strand)")
+
+"""
+Given a `.cov` file, load it on `n_workers` tasks — through its Arrow copy under
+`cache` when one is given. Returns its [`MethylationData`](@ref), read back from
+the copy when that is newer than the file, and otherwise parsed and (re)cached
+uncompressed, so that later loads memory-map it.
+"""
+function _load_cov_file(path, context::UInt8, strand::UInt8, n_workers::Int, cache)
+    parse() = open_maybe_gzip(io -> load_cov_stream(io, context, strand, n_workers), path)
+    isnothing(cache) && return parse()
+
+    dir = _cache_dir(cache, path, context, strand)
+    manifest = joinpath(dir, MANIFEST_NAME)
+    isfile(manifest) && mtime(manifest) >= mtime(path) && return read_methylation(dir)
+    data = parse()
+    # Removed, not overwritten: a stale copy may still be memory-mapped.
+    rm(dir; recursive = true, force = true)
+    write_methylation(dir, data; compress = nothing)
+    return data
+end
+
+"""
     load_bismark_cov(io; context = CTX_CPG, strand = STRAND_NA)
 
 Read Bismark coverage records from `io` and pack them into per-site calls.
@@ -1221,7 +1253,8 @@ output of `bismark2bedGraph`/`coverage2cytosine`, one 1-based
 `<chr> <start> <end> <meth %> <count meth> <count unmeth>` line per cytosine —
 load it. Returns a [`MethylationData`](@ref) of one [`AggregatedCall`](@ref) per
 site, repeated positions summed and each scaffold sorted; a malformed line is
-skipped, not fatal. Parsing is threaded — see [`load_bismark_cov(::IO)`](@ref).
+skipped, not fatal. Parsing is threaded — see [`load_bismark_cov(::IO)`](@ref);
+with a `cache` directory, the file is parsed once and memory-mapped thereafter.
 
 **NOTE:** a `.cov` records neither context nor strand, so both come from the
 caller, and a mixed-context `--CX` file cannot be split by context afterwards.
@@ -1230,7 +1263,14 @@ load_bismark_cov(
     path::AbstractString;
     context::Integer = CTX_CPG,
     strand::Integer = infer_strand(path),
-) = open_maybe_gzip(io -> load_bismark_cov(io; context = context, strand = strand), path)
+    cache::Union{Nothing,AbstractString} = nothing,
+) = _load_cov_file(
+    path,
+    two_bit_code(context),
+    two_bit_code(strand),
+    Threads.nthreads(),
+    cache,
+)
 
 """
 Default ceiling on how many `.cov` files [`load_bismark_cov`](@ref) reads at
@@ -1241,7 +1281,7 @@ const MAX_CONCURRENT_COV_FILES = 4
 
 """
     load_bismark_cov(paths; context = CTX_CPG, strand = infer_strand,
-                     max_concurrent_files = MAX_CONCURRENT_COV_FILES)
+                     max_concurrent_files = MAX_CONCURRENT_COV_FILES, cache = nothing)
 
 Given several Bismark coverage files, load and merge them. Returns one
 [`MethylationData`](@ref), summing the counts of entries that share a position,
@@ -1251,13 +1291,14 @@ function of the path.
 Up to `max_concurrent_files` files are read at once with the threads split
 between them, overlapping the part of a load one file cannot parallelize —
 chiefly gzip decompression. Merging follows `paths` order, so the result does
-not depend on which file finishes first.
+not depend on which file finishes first — nor on whether a file came from `cache`.
 """
 function load_bismark_cov(
     paths::AbstractVector{<:AbstractString};
     context = CTX_CPG,
     strand = infer_strand,
     max_concurrent_files::Integer = MAX_CONCURRENT_COV_FILES,
+    cache::Union{Nothing,AbstractString} = nothing,
 )
     isempty(paths) && return MethylationData()
 
@@ -1269,9 +1310,7 @@ function load_bismark_cov(
         file_context = two_bit_code(_per_file(context, path))
         file_strand = two_bit_code(_per_file(strand, path))
         Threads.@spawn Base.acquire(gate) do
-            open_maybe_gzip(path) do io
-                load_cov_stream(io, file_context, file_strand, workers_per_file)
-            end
+            _load_cov_file(path, file_context, file_strand, workers_per_file, cache)
         end
     end
 
@@ -1281,37 +1320,106 @@ end
 #= Merging =#
 
 """
-    merge_calls(datasets)
+    merge_calls(datasets; single_rounding = false)
 
 Merge several [`MethylationData`](@ref) into one, combining entries that share a
 position, context and strand: their depths add (saturating at
 [`MAX_COUNT`](@ref)) and their levels are pooled in proportion to those depths.
+Datasets fold in order, each fold merging its scaffolds on parallel tasks.
 
-Merging goes through the reconstructed counts (see [`get_meth`](@ref)), so it is
-exact for the depths those are exact at, and is not perfectly associative once a
-site is deep enough for the level's quantization to bite.
+**NOTE:** merging goes through the reconstructed counts (see [`get_meth`](@ref)),
+so a pairwise fold re-rounds a deep site once per dataset. `single_rounding =
+true` sums every dataset's counts first and packs once — closer to the counts,
+but not bit-identical to the fold.
 """
-function merge_calls(datasets)
+function merge_calls(datasets; single_rounding::Bool = false)
+    single_rounding && return _merge_once(datasets)
     scaffolds = Dict{String,StructArray{AggregatedCall}}()
-    for data in datasets, (scaffold, calls) in data.scaffolds
-        existing = get(scaffolds, scaffold, nothing)
-        scaffolds[scaffold] = existing === nothing ? calls : merge_scaffold(existing, calls)
-    end
+    foreach(data -> _fold_into!(scaffolds, data), datasets)
     return MethylationData(scaffolds)
 end
 
 """
-Given one call, append it to the output columns of [`merge_scaffold`](@ref).
-Returns `nothing`.
+Given the scaffolds merged so far, fold `data` into them: a new scaffold is
+taken as-is, a shared one merged by [`merge_scaffold`](@ref) on its own task.
+Returns `scaffolds`.
 """
-@inline function _push_call!(
-    positions::Vector{UInt32},
-    payloads::Vector{UInt32},
-    call::AggregatedCall,
+function _fold_into!(
+    scaffolds::Dict{String,StructArray{AggregatedCall}},
+    data::MethylationData,
 )
-    push!(positions, call.pos)
-    push!(payloads, call.payload)
-    return nothing
+    shared = [name for name in keys(data.scaffolds) if haskey(scaffolds, name)]
+    merged = _spawn_per_scaffold(shared) do name
+        merge_scaffold(scaffolds[name], data.scaffolds[name])
+    end
+    for (name, calls) in data.scaffolds
+        haskey(scaffolds, name) || (scaffolds[name] = calls)
+    end
+    return merge!(scaffolds, merged)
+end
+
+"""
+Given scaffold `names`, compute `per_scaffold(name)` for each on its own task.
+Returns a `name => result` `Dict` of call arrays.
+"""
+function _spawn_per_scaffold(per_scaffold::F, names) where {F}
+    results = Vector{StructArray{AggregatedCall}}(undef, length(names))
+    @sync for (index, name) in enumerate(names)
+        Threads.@spawn results[index] = per_scaffold(name)
+    end
+    return Dict{String,StructArray{AggregatedCall}}(zip(names, results))
+end
+
+"""
+Given several datasets, sum each site's reconstructed counts across all of them
+and pack it once (see [`merge_calls`](@ref)). Returns the merged
+[`MethylationData`](@ref).
+"""
+function _merge_once(datasets)
+    grouped = Dict{String,Vector{StructArray{AggregatedCall}}}()
+    for data in datasets, (name, calls) in data.scaffolds
+        push!(get!(grouped, name, StructArray{AggregatedCall}[]), calls)
+    end
+    return MethylationData(
+        _spawn_per_scaffold(name -> _sum_calls(grouped[name]), collect(keys(grouped))),
+    )
+end
+
+"""
+Given one scaffold's call arrays, sum every (position, context, strand) site's
+reconstructed counts across them. Returns the site-sorted calls, each packed once.
+"""
+function _sum_calls(call_arrays::Vector{<:StructArray{AggregatedCall}})
+    length(call_arrays) == 1 && return only(call_arrays)
+    positions = reduce(vcat, [collect(calls.pos) for calls in call_arrays])
+    payloads = reduce(vcat, [collect(calls.payload) for calls in call_arrays])
+    site_keys = sort_key.(positions, payloads)
+    order = sortperm(site_keys)
+
+    site_positions, site_payloads = UInt32[], UInt32[]
+    index = 1
+    while index <= length(order)
+        site = site_keys[order[index]]
+        meth_total, unmeth_total = 0, 0
+        while index <= length(order) && site_keys[order[index]] == site
+            payload = payloads[order[index]]
+            meth_total += Int(get_meth(payload))
+            unmeth_total += Int(get_unmeth(payload))
+            index += 1
+        end
+        push!(site_positions, UInt32(site >>> 32))
+        last_payload = payloads[order[index-1]]
+        push!(
+            site_payloads,
+            pack_payload(
+                meth_total,
+                unmeth_total,
+                get_context(last_payload),
+                get_strand_code(last_payload),
+            ),
+        )
+    end
+    return aggregated_calls(site_positions, site_payloads)
 end
 
 """
@@ -1345,24 +1453,29 @@ function merge_scaffold(
 
     left_index, right_index = 1, 1
     while left_index <= n_left && right_index <= n_right
-        left_call, right_call = left[left_index], right[right_index]
-        left_key, right_key = sort_key(left_call), sort_key(right_call)
+        # Read the columns directly: no `AggregatedCall` is built per comparison.
+        left_pos, left_payload = left.pos[left_index], left.payload[left_index]
+        right_pos, right_payload = right.pos[right_index], right.payload[right_index]
+        left_key, right_key =
+            sort_key(left_pos, left_payload), sort_key(right_pos, right_payload)
 
         if left_key < right_key
-            _push_call!(positions, payloads, left_call)
+            push!(positions, left_pos)
+            push!(payloads, left_payload)
             left_index += 1
         elseif right_key < left_key
-            _push_call!(positions, payloads, right_call)
+            push!(positions, right_pos)
+            push!(payloads, right_payload)
             right_index += 1
         else
-            push!(positions, left_call.pos)
+            push!(positions, left_pos)
             push!(
                 payloads,
                 pack_payload(
-                    Int(get_meth(left_call)) + Int(get_meth(right_call)),
-                    Int(get_unmeth(left_call)) + Int(get_unmeth(right_call)),
-                    get_context(left_call),
-                    get_strand_code(left_call),
+                    Int(get_meth(left_payload)) + Int(get_meth(right_payload)),
+                    Int(get_unmeth(left_payload)) + Int(get_unmeth(right_payload)),
+                    get_context(left_payload),
+                    get_strand_code(left_payload),
                 ),
             )
             left_index += 1
@@ -1404,8 +1517,10 @@ Read an Arrow file written by [`write_methylation_arrow`](@ref) back into a
 `StructArray{AggregatedCall}` wrapping the Arrow columns directly rather than
 copying them. An uncompressed file is memory-mapped and costs no resident memory
 until its pages are touched; a compressed one is decompressed into memory.
+`materialize = true` copies the columns into plain `Vector`s instead, which index
+faster under heavy point querying.
 """
-function read_methylation_arrow(filepath::AbstractString)
+function read_methylation_arrow(filepath::AbstractString; materialize::Bool = false)
     table = Arrow.Table(filepath)
     columns = propertynames(table)
     (:pos in columns && :payload in columns) || throw(
@@ -1413,7 +1528,10 @@ function read_methylation_arrow(filepath::AbstractString)
             "\"$filepath\" is not a methylation Arrow file (expected `pos` and `payload` columns, got $(collect(columns))).",
         ),
     )
-    return StructArray{AggregatedCall}((pos = table.pos, payload = table.payload))
+    columns =
+        materialize ? (collect(table.pos), collect(table.payload)) :
+        (table.pos, table.payload)
+    return StructArray{AggregatedCall}((pos = columns[1], payload = columns[2]))
 end
 
 """Name of the scaffold manifest written alongside a dataset's Arrow files."""
@@ -1481,10 +1599,10 @@ end
     read_methylation(dir)
 
 Read a [`MethylationData`](@ref) written by [`write_methylation`](@ref) back
-from `dir`, memory-mapping each scaffold's Arrow file (see
-[`read_methylation_arrow`](@ref) for the caveat about compressed files).
+from `dir`, memory-mapping each scaffold's Arrow file unless `materialize` (see
+[`read_methylation_arrow`](@ref), also for the caveat about compressed files).
 """
-function read_methylation(dir::AbstractString)
+function read_methylation(dir::AbstractString; materialize::Bool = false)
     manifest_path = joinpath(dir, MANIFEST_NAME)
     isfile(manifest_path) ||
         throw(ArgumentError("No methylation manifest found at \"$manifest_path\"."))
@@ -1493,8 +1611,10 @@ function read_methylation(dir::AbstractString)
     for line in eachline(manifest_path)
         tab = findfirst('\t', line)
         tab === nothing && continue
-        scaffolds[String(SubString(line, 1, tab - 1))] =
-            read_methylation_arrow(joinpath(dir, String(SubString(line, tab + 1))))
+        scaffolds[String(SubString(line, 1, tab - 1))] = read_methylation_arrow(
+            joinpath(dir, String(SubString(line, tab + 1)));
+            materialize,
+        )
     end
 
     return MethylationData(scaffolds)

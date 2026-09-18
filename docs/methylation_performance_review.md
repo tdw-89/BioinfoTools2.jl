@@ -7,6 +7,35 @@ analysis notebooks use them (`zebrafish_and_stickleback`:
 `primates`: `methylation_vs_ds.qmd`). Scope is strictly *optimization* — nothing
 below changes what any analysis computes unless explicitly flagged.
 
+## Status (implemented)
+
+Measured on real zebrafish data (3 × `.cov.gz`, 8 threads), outputs hashed
+against the pre-change code:
+
+| Step | Before | After |
+|---|---|---|
+| `feature_frequency` (methylation) | 1.02 s | 0.16 s |
+| `quantile_profiles` (methylation) | 3.55 s | 0.33 s |
+| `tss_window` (methylation) | 0.37 s | 0.02 s |
+| `merge_calls`, 3 datasets | 0.60 s | 0.14 s |
+| `load_bismark_cov`, 3 files, cached | 3.36 s | 0.95 s |
+
+All 52 813 probes are bit-identical except `mean_gene_profile`, which moves by
+≤ 1.1e-16: its per-gene sum now runs in a different `Dict` order.
+
+- **Done:** §1 shared-index `FeatureLevels`; §2 as `load_bismark_cov(...; cache)`;
+  §4 per-scaffold merge, plus the k-way merge as opt-in `single_rounding`
+  (sort-based); §5 threaded `feature_frequency` (both methods), presized
+  `_region_levels`; §6 presized `aggregate_keys!`, column-indexed
+  `merge_scaffold`; §7 `materialize` (17 % faster `feature_frequency` on
+  materialized columns); §9 notebook items.
+- **Found beyond the review:** `gene_profile` did not specialize on
+  `weight_transform`, boxing every weight — most of the `quantile_profiles` gain.
+- **Not done:** `SortingAlgorithms.RadixSort` — Base already radix-sorts `UInt64`
+  (20 M keys in 0.17 s); porting `load_bismark` to the chunk machinery — deferred
+  by this review itself until extractor files are used at scale; §3 and §8 carry
+  no code changes.
+
 ## Benchmark setup
 
 Apple M3 (8 cores, 4P+4E), **16 GB** unified memory, Julia 1.13, real inputs:

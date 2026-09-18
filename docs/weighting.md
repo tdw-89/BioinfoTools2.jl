@@ -40,8 +40,6 @@ the same object under `identity`, `sqrt` and `log` without rebuilding it.
 `gene_profile(::FeatureLevels)`
 
 ```julia
-depth = base_weights[entry]
-depth == 0 && continue
 weight = weight_by_depth ? weight_of(depth, weight_transform) : 1.0
 weight == 0 && continue
 ...
