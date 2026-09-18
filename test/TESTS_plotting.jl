@@ -35,6 +35,15 @@ const Makie = BioinfoTools2.Plotting.CairoMakie
         @test heat_axis.xticks[] == metagene_xticks(2, 3)
         @test heat_axis.yticks[] == 1:3
         @test violin_axis.xticks[] == 1:2
+        # Without boundaries an axis holds only its data plot.
+        bare_axis, _ =
+            metagene_heatmap!(figure[5, 1], rand(2, 7); flank = 2, mark_boundaries = false)
+        bare_lines =
+            metagene_lines!(figure[6, 1], rand(7); flank = 2, mark_boundaries = false)
+        @test length(bare_axis.scene.plots) == 1
+        @test length(bare_lines.scene.plots) == 1
+        @test length(heat_axis.scene.plots) == 2
+
         # Headless render: the whole figure draws without error.
         @test Makie.colorbuffer(figure) isa AbstractMatrix
     end
