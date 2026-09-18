@@ -1127,34 +1127,63 @@ function moving_average(values::AbstractVector{<:Real}, half_width::Integer)
     half_width >= 0 ||
         throw(ArgumentError("`half_width` must be non-negative (got $half_width)"))
     finite = isfinite.(values)
-    sums = cumsum([0.0; ifelse.(finite, Float64.(values), 0.0)])
+    # Summing offsets from one of the values keeps the running sums small, so a
+    # constant stretch averages to exactly its value instead of rounding noise.
+    shift = any(finite) ? Float64(values[findfirst(finite)]) : 0.0
+    sums = cumsum([0.0; ifelse.(finite, Float64.(values) .- shift, 0.0)])
     counts = cumsum([0; finite])
     n_values = length(values)
     return map(1:n_values) do index
         low, high = max(1, index - half_width), min(n_values, index + half_width)
         n_finite = counts[high+1] - counts[low]
-        n_finite == 0 ? NaN : (sums[high+1] - sums[low]) / n_finite
+        n_finite == 0 ? NaN : shift + (sums[high+1] - sums[low]) / n_finite
     end
 end
 
 #= Panel statistics =#
 
 """
-Given a matrix whose non-finite cells mark unmeasured positions, standardise it
-against the mean and standard deviation of its own finite cells. Returns a
-matrix of the same shape, non-finite cells staying `NaN`.
-
-**NOTE:** a matrix with no spread at all comes back as zeros (and one with no
-finite cell as all-`NaN`), so colour encodes shape, never absolute magnitude.
+Given values whose non-finite entries mark unmeasured ones, summarise the finite
+ones. Returns their `(mean, std)`, `NaN` where there are too few to define it.
 """
-function zscore_finite(matrix::AbstractArray{<:Real})
-    measured = filter(isfinite, vec(matrix))
-    isempty(measured) && return fill(NaN, size(matrix))
-    center = mean(measured)
-    spread = std(measured)
-    (spread == 0 || !isfinite(spread)) &&
-        return map(value -> isfinite(value) ? 0.0 : NaN, matrix)
-    return map(value -> isfinite(value) ? (value - center) / spread : NaN, matrix)
+function finite_moments(values)
+    measured = [value for value in values if isfinite(value)]
+    isempty(measured) && return NaN, NaN
+    return mean(measured), std(measured)
+end
+
+"""
+Given values and the `center` and `spread` to measure them against, standardise
+them. Returns `(value - center) / spread` for each finite value and `NaN` for the
+rest; with no spread at all, every finite value is `0`.
+"""
+function standardize(values, center::Real, spread::Real)
+    flat = spread == 0 || !isfinite(spread)
+    return map(values) do value
+        !isfinite(value) ? NaN : flat ? 0.0 : (value - center) / spread
+    end
+end
+
+"""
+Given an array (e.g. a metagene matrix) whose non-finite cells mark unmeasured
+positions, standardise it against the mean and standard deviation of its own
+finite cells. Returns an array of the same shape (see [`standardize`](@ref)).
+
+**NOTE:** colour or height then encodes deviation from the array's own mean,
+never absolute magnitude.
+"""
+zscore_finite(values::AbstractArray{<:Real}) =
+    standardize(values, finite_moments(values)...)
+
+"""
+Given a `gene ID => value` `Dict`, standardise its values across every gene in
+it. Returns a `Dict` with the same keys (see [`standardize`](@ref)).
+"""
+function zscore_finite(gene_values::AbstractDict{String,<:Real})
+    center, spread = finite_moments(values(gene_values))
+    return Dict(
+        zip(keys(gene_values), standardize(collect(values(gene_values)), center, spread)),
+    )
 end
 
 """
@@ -1196,6 +1225,8 @@ export coverage,
     values_by_rank,
     moving_average,
     zscore_finite,
+    finite_moments,
+    standardize,
     mean_finite
 
 end
