@@ -178,7 +178,8 @@ end
 """
 Given `values` along `positions` and a smoothed `trend` over the same positions
 (e.g. `Exploration.moving_average`), draw the values as faint points and the
-trend as a line over them. Returns the new `Axis`, placed at `position`.
+trend as a line over them, labelled `trend_label` for a legend. Returns the new
+`Axis`, placed at `position`.
 """
 function trend_plot!(
     position,
@@ -188,10 +189,43 @@ function trend_plot!(
     title::AbstractString = "",
     xlabel::AbstractString = "",
     ylabel::AbstractString = "",
+    trend_label = nothing,
 )
     axis = Axis(position; title = title, xlabel = xlabel, ylabel = ylabel)
     scatter!(axis, positions, values; color = (:steelblue, 0.15), markersize = 3)
-    lines!(axis, positions, trend; color = :black, linewidth = 2)
+    overlay_trend!(
+        axis,
+        positions,
+        trend;
+        color = :black,
+        linestyle = :solid,
+        label = trend_label,
+    )
+    return axis
+end
+
+"""
+Given a further trend over `positions` (e.g. a fitted curve), draw it on `axis`
+as a line, dashed by default; give it a `label` and call `axislegend(axis)` to
+tell the trends apart. Returns `axis`.
+"""
+function overlay_trend!(
+    axis,
+    positions::AbstractVector{<:Real},
+    trend::AbstractVector{<:Real};
+    color = :firebrick,
+    linestyle = :dash,
+    label = nothing,
+)
+    lines!(
+        axis,
+        positions,
+        trend;
+        color = color,
+        linestyle = linestyle,
+        linewidth = 2,
+        label = label,
+    )
     return axis
 end
 
@@ -238,6 +272,7 @@ export metagene_xticks,
     metagene_heatmap!,
     violin_box!,
     trend_plot!,
+    overlay_trend!,
     mark_positions!
 
 end

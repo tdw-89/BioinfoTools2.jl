@@ -10,4 +10,5 @@ using Test
     include("TESTS_methylation.jl")
     include("TESTS_exploration.jl")
     include("TESTS_plotting.jl")
+    include("TESTS_modeling.jl")
 end

@@ -51,6 +51,16 @@ const Makie = BioinfoTools2.Plotting.CairoMakie
         @test length(trend_axis.scene.plots) == 4    # plus the rules and their labels
         @test_throws DimensionMismatch mark_positions!(trend_axis, [1, 2], ["only one"])
         @test_throws ArgumentError mark_positions!(trend_axis, [1], ["x"]; side = :top)
+        fit_axis = trend_plot!(
+            figure[9, 1],
+            1:4,
+            [1.0, 3.0, 2.0, 4.0],
+            [2.0, 2.0, 3.0, 3.0];
+            trend_label = "moving average",
+        )
+        overlay_trend!(fit_axis, 1:4, [1.5, 2.0, 2.5, 3.0]; label = "logistic fit")
+        @test length(fit_axis.scene.plots) == 3
+        @test Makie.axislegend(fit_axis) isa Makie.Legend
         left_axis =
             trend_plot!(figure[8, 1], 1:4, [1.0, 3.0, 2.0, 4.0], [2.0, 2.0, 3.0, 3.0])
         mark_positions!(left_axis, [2.5], ["everything left"]; side = :left)

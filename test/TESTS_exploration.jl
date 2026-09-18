@@ -1034,6 +1034,8 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             # is skipped rather than poisoning its neighbours.
             @test moving_average([1.0, 2.0, NaN, 4.0], 1) == [1.5, 1.5, 3.0, 4.0]
             @test moving_average([5.0, 7.0], 0) == [5.0, 7.0]
+            # A constant averages to exactly itself, not to cumulative rounding noise.
+            @test moving_average(fill(-0.004997, 5000), 250) == fill(-0.004997, 5000)
             @test all(isnan, moving_average([NaN, NaN], 3))
             @test_throws ArgumentError moving_average([1.0], -1)
         end
@@ -1045,6 +1047,16 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             @test standardised[[1, 2, 4]] ≈ ([1.0, 3.0, 5.0] .- 3.0) ./ 2.0
             @test isequal(zscore_finite([2.0 2.0; NaN 2.0]), [0.0 0.0; NaN 0.0])
             @test all(isnan, zscore_finite(fill(NaN, 2, 2)))
+
+            @test finite_moments([1.0, NaN, 3.0]) == (2.0, sqrt(2.0))
+            @test all(isnan, finite_moments([NaN]))
+            @test isequal(standardize([4.0, NaN], 2.0, 2.0), [1.0, NaN])
+
+            # A per-gene Dict is standardised across all of its genes.
+            gene_z = zscore_finite(Dict("a" => 1.0, "b" => 3.0, "c" => NaN))
+            @test gene_z["a"] ≈ -1 / sqrt(2)
+            @test gene_z["b"] ≈ 1 / sqrt(2)
+            @test isnan(gene_z["c"])
 
             averaged = mean_finite([[1.0 NaN], [3.0 NaN], [NaN NaN]])
             @test averaged[1] == 2.0
