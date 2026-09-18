@@ -197,7 +197,7 @@ end
 
 """
 Given x `positions` and their `labels`, mark each on `axis` with a dashed rule,
-labelled from the top down its right-hand side. Returns `axis`.
+labelled from the top down its `side` (`:right` or `:left`). Returns `axis`.
 
 **NOTE:** the labels are anchored to the y limits at the time of the call, so
 draw the data first.
@@ -206,10 +206,12 @@ function mark_positions!(
     axis,
     positions::AbstractVector{<:Real},
     labels::AbstractVector{<:AbstractString};
+    side::Symbol = :right,
     color = :gray,
 )
     length(positions) == length(labels) ||
         throw(DimensionMismatch("`labels` must run parallel to `positions`"))
+    side in (:right, :left) || throw(ArgumentError("`side` must be :right or :left"))
     vlines!(axis, positions; color = color, linestyle = :dash)
     reset_limits!(axis)
     limits = axis.finallimits[]
@@ -220,8 +222,9 @@ function mark_positions!(
         fill(top, length(positions));
         text = labels,
         rotation = pi / 2,
-        align = (:right, :top),
-        offset = (2, -4),
+        # Rotated a quarter turn, a label's top faces left and its bottom right.
+        align = (:right, side === :right ? :top : :bottom),
+        offset = (side === :right ? 2 : -2, -4),
         fontsize = 11,
         color = color,
     )
