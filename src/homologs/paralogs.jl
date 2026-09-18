@@ -634,40 +634,105 @@ id_query_subject_graph(pg::ParalogGroup) = _weighted_directed_graph(pg.id_query_
 #= OrthoFinder duplication ingestion =#
 
 """
-Given a Newick tree, read the depth of every labelled node, the root at 1.
-Returns a `label => depth` map.
-
-A label's depth is its parenthesis nesting level plus one, so an internal label
-(`N3`) and a terminal one (a species name) are read the same way and no tree
-needs building. Branch lengths are skipped.
+Given a Newick tree, split it into its structure and its labels. Returns the
+`'('`/`')'` characters and label `String`s in order; branch lengths and
+separators are dropped.
 """
-function _newick_depths(newick::AbstractString)
-    depths = Dict{String,Int}()
-    level = 0
+function _newick_tokens(newick::AbstractString)
+    tokens = Union{Char,String}[]
     label_start = 0
-    label_level = 0
     reading_length = false
 
     for (index, char) in pairs(newick)
         if char in ('(', ')', ',', ';', ':')
             if label_start > 0
                 label = strip(newick[label_start:prevind(newick, index)])
-                isempty(label) || (depths[String(label)] = label_level + 1)
+                isempty(label) || push!(tokens, String(label))
                 label_start = 0
             end
             reading_length = char == ':'
-            char == '(' && (level += 1)
-            char == ')' && (level -= 1)
+            char in ('(', ')') && push!(tokens, char)
         elseif !reading_length && label_start == 0 && !isspace(char)
             label_start = index
-            label_level = level
+        end
+    end
+    return tokens
+end
+
+"""
+Given a Newick tree, read the depth of every labelled node, the root at 1.
+Returns a `label => depth` map; a label's depth is its parenthesis nesting level
+plus one, so internal and terminal labels are read alike.
+"""
+function _newick_depths(newick::AbstractString)
+    depths = Dict{String,Int}()
+    level = 0
+    for token in _newick_tokens(newick)
+        if token == '('
+            level += 1
+        elseif token == ')'
+            level -= 1
+        else
+            depths[token] = level + 1
         end
     end
     return depths
 end
 
-"""Species tree OrthoFinder writes alongside a `Duplications.tsv`."""
-_species_tree_path(duplications::AbstractString) = joinpath(
+"""
+Given a Newick tree, collect the leaves under every labelled node. Returns a
+`label => leaves` map, in which a leaf maps to itself alone.
+"""
+function _newick_leaves(newick::AbstractString)
+    leaves = Dict{String,Vector{String}}()
+    open_clades = [String[]]       # leaves of each unclosed clade, innermost last
+    closed = String[]              # the clade just closed, awaiting its label
+    previous = nothing
+
+    for token in _newick_tokens(newick)
+        if token == '('
+            push!(open_clades, String[])
+        elseif token == ')'
+            closed = pop!(open_clades)
+            append!(last(open_clades), closed)
+        elseif previous == ')'
+            leaves[token] = closed
+        else
+            leaves[token] = [token]
+            push!(last(open_clades), token)
+        end
+        previous = token
+    end
+    return leaves
+end
+
+"""
+    lineage_splits(newick, species) -> Vector{Pair{String,Vector{String}}}
+
+Given a Newick species tree, walk from its root down to `species`. Returns every
+node on that lineage paired with the species that split from the lineage there,
+root first — so entry `d` is the node at `lca_depth` `d`, and the last entry is
+`species` itself, splitting from nothing.
+"""
+function lineage_splits(newick::AbstractString, species::AbstractString)
+    leaves = _newick_leaves(newick)
+    haskey(leaves, species) ||
+        throw(ArgumentError("\"$species\" is not a node of the species tree"))
+    depths = _newick_depths(newick)
+
+    lineage = sort!(
+        [node for (node, under) in leaves if species in under];
+        by = node -> depths[node],
+    )
+    return [
+        node =>
+            (node == species ? String[] : setdiff(leaves[node], leaves[lineage[step+1]]))
+        for (step, node) in enumerate(lineage)
+    ]
+end
+
+"""Given a `Duplications.tsv` path, locate the species tree OrthoFinder writes beside it."""
+species_tree_path(duplications::AbstractString) = joinpath(
     dirname(dirname(duplications)),
     "Species_Tree",
     "SpeciesTree_rooted_node_labels.txt",
@@ -882,7 +947,7 @@ function add_duplications_of(
     min_support::Real = 0.0,
     transform = identity,
 )
-    tree_path = something(species_tree, _species_tree_path(path))
+    tree_path = something(species_tree, species_tree_path(path))
     isfile(tree_path) ||
         throw(ArgumentError("No species tree at \"$tree_path\"; pass `species_tree`"))
     depths = _newick_depths(read(tree_path, String))
@@ -1401,9 +1466,11 @@ export ParalogGroup,
     id_query_subject_graph,
     id_subject_query_graph,
     lca_label,
+    lineage_splits,
     pair_table,
     rbh,
     rbh_ds,
+    species_tree_path,
     topology_graph
 
 end

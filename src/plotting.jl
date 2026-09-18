@@ -175,11 +175,66 @@ function violin_box!(
     return axis
 end
 
+"""
+Given `values` along `positions` and a smoothed `trend` over the same positions
+(e.g. `Exploration.moving_average`), draw the values as faint points and the
+trend as a line over them. Returns the new `Axis`, placed at `position`.
+"""
+function trend_plot!(
+    position,
+    positions::AbstractVector{<:Real},
+    values::AbstractVector{<:Real},
+    trend::AbstractVector{<:Real};
+    title::AbstractString = "",
+    xlabel::AbstractString = "",
+    ylabel::AbstractString = "",
+)
+    axis = Axis(position; title = title, xlabel = xlabel, ylabel = ylabel)
+    scatter!(axis, positions, values; color = (:steelblue, 0.15), markersize = 3)
+    lines!(axis, positions, trend; color = :black, linewidth = 2)
+    return axis
+end
+
+"""
+Given x `positions` and their `labels`, mark each on `axis` with a dashed rule,
+labelled from the top down its right-hand side. Returns `axis`.
+
+**NOTE:** the labels are anchored to the y limits at the time of the call, so
+draw the data first.
+"""
+function mark_positions!(
+    axis,
+    positions::AbstractVector{<:Real},
+    labels::AbstractVector{<:AbstractString};
+    color = :gray,
+)
+    length(positions) == length(labels) ||
+        throw(DimensionMismatch("`labels` must run parallel to `positions`"))
+    vlines!(axis, positions; color = color, linestyle = :dash)
+    reset_limits!(axis)
+    limits = axis.finallimits[]
+    top = limits.origin[2] + limits.widths[2]
+    text!(
+        axis,
+        positions,
+        fill(top, length(positions));
+        text = labels,
+        rotation = pi / 2,
+        align = (:right, :top),
+        offset = (2, -4),
+        fontsize = 11,
+        color = color,
+    )
+    return axis
+end
+
 export metagene_xticks,
     metagene_boundaries,
     stretch_body_columns,
     metagene_lines!,
     metagene_heatmap!,
-    violin_box!
+    violin_box!,
+    trend_plot!,
+    mark_positions!
 
 end

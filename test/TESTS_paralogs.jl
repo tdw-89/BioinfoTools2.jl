@@ -1364,3 +1364,31 @@ const P = BioinfoTools2.Homologs.Paralogs
         @test occursin("String", err.msg)
     end
 end
+
+# ============================================================================
+# Tests for species-tree lineages
+# ============================================================================
+@testset "lineage_splits" begin
+    # A non-ladder tree, so a split can take off a whole clade at once.
+    tree = "(mouse:0.08,(macaque:0.02,(human:0.01,(bonobo:0.004,chimp:0.004)N3:0.003)N2:0.005)N1:0.08)N0;"
+
+    @test lineage_splits(tree, "human") == [
+        "N0" => ["mouse"],
+        "N1" => ["macaque"],
+        "N2" => ["bonobo", "chimp"],
+        "human" => String[],
+    ]
+    # Entry d is the node at lca_depth d, as add_duplications_of numbers them.
+    depths = BioinfoTools2.Homologs.Paralogs._newick_depths(tree)
+    chimp_lineage = first.(lineage_splits(tree, "chimp"))
+    @test [depths[node] for node in chimp_lineage] == 1:length(chimp_lineage)
+    @test last(lineage_splits(tree, "chimp")[end-1]) == ["bonobo"]
+    @test_throws ArgumentError lineage_splits(tree, "gorilla")
+
+    leaves = BioinfoTools2.Homologs.Paralogs._newick_leaves(tree)
+    @test sort(leaves["N2"]) == ["bonobo", "chimp", "human"]
+    @test leaves["mouse"] == ["mouse"]
+
+    @test species_tree_path("/results/Gene_Duplication_Events/Duplications.tsv") ==
+          "/results/Species_Tree/SpeciesTree_rooted_node_labels.txt"
+end
