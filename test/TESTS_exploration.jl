@@ -929,4 +929,127 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             @test bins == [1, 1, 3, 4, 4]
         end
     end
+
+    # =========================================================================
+    @testset "grouped profiles and TSS windows" begin
+        flank, body_bins = 2, 3
+        gene_a = sparsevec([1, 8], UInt32[4, 8], 8)
+        gene_b = sparsevec([1, 8], UInt32[8, 4], 8)
+        gene_c = sparsevec([2, 3], UInt32[2, 2], 8)
+        ff = FeatureFrequency(2, Dict("a" => gene_a, "b" => gene_b, "c" => gene_c))
+        profile(counts) = gene_profile(counts, ff.n; flank, body_bins)
+
+        @testset "quantile_profiles - one mean_gene_profile per quantile" begin
+            bins = Dict("a" => 1, "b" => 2, "c" => 2)
+            matrix = quantile_profiles(ff, bins; flank, body_bins)
+            @test size(matrix) == (2, 2 * flank + body_bins)
+            @test matrix[1, :] ≈ profile(gene_a)
+            @test matrix[2, :] ≈ (profile(gene_b) .+ profile(gene_c)) ./ 2
+            # Grouping everything at once reproduces mean_gene_profile exactly.
+            everything =
+                quantile_profiles(ff, Dict("a" => 1, "b" => 1, "c" => 1); flank, body_bins)
+            @test vec(everything) == mean_gene_profile(ff; flank, body_bins)
+
+            # Excluded and unranked genes drop out; an empty quantile stays zero.
+            sparse_bins = quantile_profiles(
+                ff,
+                Dict("a" => 1, "b" => 1);
+                exclude = Set(["a"]),
+                n_quantiles = 3,
+                flank,
+                body_bins,
+            )
+            @test sparse_bins[1, :] ≈ profile(gene_b)
+            @test all(iszero, sparse_bins[2:3, :])
+            @test_throws ArgumentError quantile_profiles(
+                ff,
+                Dict("a" => 4);
+                n_quantiles = 3,
+            )
+        end
+
+        @testset "quantile_profiles - methylation averages only measured genes" begin
+            measured = FeatureLevels(
+                sparsevec([1], Float32[1.0], 7),
+                sparsevec([1], UInt32[10], 7),
+            )
+            elsewhere = FeatureLevels(
+                sparsevec([7], Float32[0.5], 7),
+                sparsevec([7], UInt32[10], 7),
+            )
+            frequency = MethylationFrequency(
+                Exploration.DEFAULT_MIN_DEPTH,
+                CTX_CPG,
+                Dict("x" => measured, "y" => elsewhere),
+            )
+            matrix =
+                quantile_profiles(frequency, Dict("x" => 1, "y" => 1); flank, body_bins)
+            @test matrix[1, 1] ≈ 1.0     # not 0.5: "y" was not measured there
+            @test matrix[1, 7] ≈ 0.5
+            @test all(isnan, matrix[1, 2:6])
+        end
+
+        @testset "tss_window - window centred on the TSS" begin
+            # flank 2, window 2: region indices 2:3, the last flank base and the
+            # first body base. "c" covers both twice over 2 measurements → 1.0.
+            window = tss_window(ff; flank, window = 2)
+            @test window["c"] ≈ 1.0
+            @test window["a"] == 0.0
+            @test !haskey(tss_window(ff; exclude = Set(["c"]), flank, window = 2), "c")
+            @test_throws ArgumentError tss_window(ff; flank, window = 3)
+            @test_throws ArgumentError tss_window(ff; flank, window = 6)
+
+            levels = FeatureLevels(
+                sparsevec([2, 3], Float32[1.0, 0.0], 7),
+                sparsevec([2, 3], UInt32[30, 10], 7),
+            )
+            unmeasured = FeatureLevels(spzeros(Float32, 7), spzeros(UInt32, 7))
+            methylation = MethylationFrequency(
+                Exploration.DEFAULT_MIN_DEPTH,
+                CTX_CPG,
+                Dict("levels" => levels, "unmeasured" => unmeasured),
+            )
+            fractions = tss_window(methylation; flank, window = 2)
+            @test fractions["levels"] ≈ 30 / 40     # depth-weighted, on [0, 1]
+            @test !haskey(fractions, "unmeasured")
+        end
+
+        @testset "values_by_quantile - unranked genes dropped" begin
+            bins, values = values_by_quantile(
+                Dict("a" => 0.5, "b" => 0.25, "ghost" => 9.0),
+                Dict("a" => 2, "b" => 1),
+            )
+            @test sort(collect(zip(bins, values))) == [(1, 0.25), (2, 0.5)]
+        end
+
+        @testset "zscore_finite and mean_finite - NaN means unmeasured" begin
+            panel = [1.0 NaN; 3.0 5.0]
+            standardised = zscore_finite(panel)
+            @test isnan(standardised[1, 2])
+            @test standardised[[1, 2, 4]] ≈ ([1.0, 3.0, 5.0] .- 3.0) ./ 2.0
+            @test isequal(zscore_finite([2.0 2.0; NaN 2.0]), [0.0 0.0; NaN 0.0])
+            @test all(isnan, zscore_finite(fill(NaN, 2, 2)))
+
+            averaged = mean_finite([[1.0 NaN], [3.0 NaN], [NaN NaN]])
+            @test averaged[1] == 2.0
+            @test isnan(averaged[2])
+            @test_throws DimensionMismatch mean_finite([zeros(1, 2), zeros(2, 1)])
+            @test_throws ArgumentError mean_finite(Matrix{Float64}[])
+        end
+
+        @testset "clipped_features - flank runs off the scaffold start" begin
+            species = Species("C. elegans")
+            add_features!(EX_GFF_SINGLE, species.genome)
+            genes = collect(first(values(get_feature(species.genome, :gene))))
+            flank_width = 1000
+            clipped = clipped_features(species.genome, :gene, flank_width)
+            expected = Set(
+                Reference.feature_id(species.genome, gene) for
+                gene in genes if Int(gene.first) <= flank_width
+            )
+            @test !isempty(clipped)
+            @test clipped == expected
+            @test isempty(clipped_features(species.genome, :gene, 0))
+        end
+    end
 end

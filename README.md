@@ -33,7 +33,7 @@ Pkg.add([
 | `Homologs.Orthologs` | Between-genome orthology (placeholder). |
 | `Exploration` | Coverage, density estimates, quantile binning and metagene profiles over the above. |
 | `Modeling` | Statistical models (placeholder). |
-| `Plotting` | Figures (placeholder). |
+| `Plotting` | Metagene line profiles and heatmaps, and per-quantile violin plots (CairoMakie). |
 
 ## Reference documents
 

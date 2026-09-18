@@ -838,6 +838,80 @@ function gene_profile(
 end
 
 """
+Given per-gene coverage counts and `group_of`, which maps a gene ID to a 1-based
+group (`0` skipping the gene), average each group's [`gene_profile`](@ref)s.
+Returns an `n_groups × (2 * flank + body_bins)` matrix, all-zero in a row no
+gene reached.
+"""
+function _group_profiles(
+    frequency::FeatureFrequency,
+    group_of::F,
+    n_groups::Integer;
+    flank::Integer = 500,
+    body_bins::Integer = 100,
+) where {F}
+    sums = zeros(Float64, n_groups, 2 * flank + body_bins)
+    n_genes = zeros(Int, n_groups)
+    for (gene_id, counts) in frequency.features
+        group = group_of(gene_id)
+        group == 0 && continue
+        profile = gene_profile(counts, frequency.n; flank, body_bins)
+        isnothing(profile) && continue
+        view(sums, group, :) .+= profile
+        n_genes[group] += 1
+    end
+    return sums ./ max.(n_genes, 1)
+end
+
+"""
+Given per-gene methylation levels and `group_of`, which maps a gene ID to a
+1-based group (`0` skipping the gene), average each group's
+[`gene_profile`](@ref)s by weight. Returns an `n_groups × (2 * flank + body_bins)`
+matrix, `NaN` wherever no gene of the group was measured.
+"""
+function _group_profiles(
+    frequency::MethylationFrequency,
+    group_of::F,
+    n_groups::Integer;
+    flank::Integer = 500,
+    body_bins::Integer = 100,
+    weight_by_depth::Bool = true,
+    weight_transform = identity,
+) where {F}
+    weighted_sums = zeros(Float64, n_groups, 2 * flank + body_bins)
+    weight_totals = zeros(Float64, n_groups, 2 * flank + body_bins)
+
+    for (gene_id, feature_levels) in frequency.features
+        group = group_of(gene_id)
+        group == 0 && continue
+        profile = gene_profile(
+            feature_levels;
+            flank,
+            body_bins,
+            weight_by_depth,
+            weight_transform,
+        )
+        isnothing(profile) && continue
+
+        for slot in eachindex(profile.levels)
+            # `gene_profile` already applied `weight_transform` to each base, so
+            # this sum is used as-is: transforming it again would give
+            # `f(Σ f(depth))`, which is not a weight on any observation.
+            profile.weights[slot] == 0 && continue
+            weight = weight_by_depth ? profile.weights[slot] : 1.0
+            weighted_sums[group, slot] += profile.levels[slot] * weight
+            weight_totals[group, slot] += weight
+        end
+    end
+
+    return map(
+        (total, weight) -> weight == 0 ? NaN : total / weight,
+        weighted_sums,
+        weight_totals,
+    )
+end
+
+"""
     mean_gene_profile(feature_frequency; exclude = Set{String}(), flank = 500,
                       body_bins = 100)
 
@@ -846,23 +920,20 @@ metagene profile. Returns a vector of length `2 * flank + body_bins`, all-zero
 when no gene qualifies; genes listed in `exclude`, or whose stored vector is too
 short for a body, are skipped.
 """
-function mean_gene_profile(
+mean_gene_profile(
     feature_frequency::FeatureFrequency;
     exclude = Set{String}(),
     flank::Integer = 500,
     body_bins::Integer = 100,
+) = vec(
+    _group_profiles(
+        feature_frequency,
+        gene_id -> gene_id in exclude ? 0 : 1,
+        1;
+        flank,
+        body_bins,
+    ),
 )
-    accumulator = zeros(Float64, 2 * flank + body_bins)
-    n_genes = 0
-    for (gene_id, counts) in feature_frequency.features
-        gene_id in exclude && continue
-        profile = gene_profile(counts, feature_frequency.n; flank, body_bins)
-        isnothing(profile) && continue
-        accumulator .+= profile
-        n_genes += 1
-    end
-    return accumulator ./ max(n_genes, 1)
-end
 
 """
     mean_gene_profile(methylation_frequency; exclude = Set{String}(), flank = 500,
@@ -878,43 +949,199 @@ metagene profile. Returns a vector of length `2 * flank + body_bins`; genes in
 reads as mean level among measured cytosines, not level times cytosine density;
 a position no gene measured comes back as `NaN`.
 """
-function mean_gene_profile(
+mean_gene_profile(
     methylation_frequency::MethylationFrequency;
     exclude = Set{String}(),
     flank::Integer = 500,
     body_bins::Integer = 100,
     weight_by_depth::Bool = true,
     weight_transform = identity,
+) = vec(
+    _group_profiles(
+        methylation_frequency,
+        gene_id -> gene_id in exclude ? 0 : 1,
+        1;
+        flank,
+        body_bins,
+        weight_by_depth,
+        weight_transform,
+    ),
 )
-    weighted_sums = zeros(Float64, 2 * flank + body_bins)
-    weight_totals = zeros(Float64, 2 * flank + body_bins)
 
-    for (gene_id, feature_levels) in methylation_frequency.features
+"""
+    quantile_profiles(frequency, feature_quantile; exclude = Set{String}(),
+                      n_quantiles = maximum(values(feature_quantile)), kwargs...)
+
+Given per-gene frequencies and a `gene ID => quantile` map (1 = lowest), average
+each quantile's genes into one metagene profile, exactly as
+[`mean_gene_profile`](@ref) averages all of them. Returns an
+`n_quantiles × (2 * flank + body_bins)` matrix; `kwargs` are that function's.
+
+A gene missing from `feature_quantile`, or listed in `exclude` (see
+[`clipped_features`](@ref)), is skipped.
+"""
+function quantile_profiles(
+    frequency::Union{FeatureFrequency,MethylationFrequency},
+    feature_quantile::AbstractDict{String,<:Integer};
+    exclude = Set{String}(),
+    n_quantiles::Integer = maximum(values(feature_quantile); init = 0),
+    kwargs...,
+)
+    all(bin -> 1 <= bin <= n_quantiles, values(feature_quantile)) || throw(
+        ArgumentError("every quantile in `feature_quantile` must lie in 1:$n_quantiles"),
+    )
+    group_of(gene_id) = gene_id in exclude ? 0 : Int(get(feature_quantile, gene_id, 0))
+    return _group_profiles(frequency, group_of, n_quantiles; kwargs...)
+end
+
+"""
+Given a flank and the `feature`-type features of `genome`, find those whose
+padded region `[first - flank, last + flank]` runs off the start of their
+scaffold. Returns their IDs as a `Set{String}`, ready to pass as `exclude`.
+
+**NOTE:** scaffold lengths are not recorded, so a flank running off the far end
+of a scaffold is not detected.
+"""
+function clipped_features(
+    genome::Genome,
+    feature::Union{AbstractString,Symbol},
+    flank::Integer,
+)
+    clipped = Set{String}()
+    for tree in values(get_feature(genome, feature)), interval in tree
+        Int(interval.first) <= flank || continue
+        found = Reference.feature_id(genome, interval)
+        isnothing(found) || push!(clipped, found)
+    end
+    return clipped
+end
+
+#= TSS windows =#
+
+"""
+Given a flank and an even `window`, locate the window centred on a region's 5'
+end — half in the upstream flank, half in the body. Returns its region indices,
+throwing when half the window would not fit inside `flank`.
+"""
+function _tss_window(flank::Integer, window::Integer)
+    iseven(window) || throw(ArgumentError("`window` must be even (got $window)"))
+    half_window = window ÷ 2
+    half_window <= flank ||
+        throw(ArgumentError("window ÷ 2 ($half_window) must not exceed flank ($flank)"))
+    return (flank-half_window+1):(flank+half_window)
+end
+
+"""
+    tss_window(frequency; exclude = Set{String}(), flank = 500, window = 500)
+
+Given per-gene frequencies, summarise each gene over a `window`-bp window centred
+on its TSS, half upstream and half into the body. Returns a `gene ID => value` `Dict` in `[0, 1]`:
+the mean per-base frequency for a [`FeatureFrequency`](@ref), the depth-weighted
+methylation fraction for a [`MethylationFrequency`](@ref).
+
+Genes in `exclude`, and genes whose body is shorter than half the window, are
+left out; so is a methylation gene with no measured base in the window.
+"""
+function tss_window(
+    frequency::FeatureFrequency;
+    exclude = Set{String}(),
+    flank::Integer = 500,
+    window::Integer = 500,
+)
+    positions = _tss_window(flank, window)
+    summaries = Dict{String,Float64}()
+    for (gene_id, counts) in frequency.features
+        (gene_id in exclude || length(counts) - 2 * flank < window ÷ 2) && continue
+        summaries[gene_id] = sum(view(counts, positions)) / (window * frequency.n)
+    end
+    return summaries
+end
+
+function tss_window(
+    frequency::MethylationFrequency;
+    exclude = Set{String}(),
+    flank::Integer = 500,
+    window::Integer = 500,
+)
+    positions = _tss_window(flank, window)
+    summaries = Dict{String,Float64}()
+    for (gene_id, feature_levels) in frequency.features
         gene_id in exclude && continue
-        profile = gene_profile(
-            feature_levels;
-            flank,
-            body_bins,
-            weight_by_depth,
-            weight_transform,
-        )
-        isnothing(profile) && continue
+        length(feature_levels.levels) - 2 * flank < window ÷ 2 && continue
 
-        for slot in eachindex(weighted_sums)
-            # `gene_profile` already applied `weight_transform` to each base, so
-            # this sum is used as-is: transforming it again would give
-            # `f(Σ f(depth))`, which is not a weight on any observation.
-            profile.weights[slot] == 0 && continue
-            weight = weight_by_depth ? profile.weights[slot] : 1.0
-            weighted_sums[slot] += profile.levels[slot] * weight
-            weight_totals[slot] += weight
+        weighted_total = 0.0
+        weight_total = 0.0
+        for position in positions
+            weight = Float64(feature_levels.weights[position])
+            weight == 0 && continue
+            weighted_total += feature_levels.levels[position] * weight
+            weight_total += weight
+        end
+        weight_total == 0 || (summaries[gene_id] = weighted_total / weight_total)
+    end
+    return summaries
+end
+
+"""
+Given a `gene ID => value` `Dict` and a `gene ID => quantile` map, pair each
+value with its gene's quantile. Returns `(bins, values)` as parallel vectors,
+ready for a boxplot or [`Plotting.violin_box!`](@ref); unranked genes are
+dropped.
+"""
+function values_by_quantile(
+    gene_values::AbstractDict{String,<:Real},
+    feature_quantile::AbstractDict{String,<:Integer},
+)
+    bins = Int[]
+    binned_values = Float64[]
+    for (gene_id, value) in gene_values
+        bin = get(feature_quantile, gene_id, 0)
+        bin == 0 && continue
+        push!(bins, bin)
+        push!(binned_values, value)
+    end
+    return bins, binned_values
+end
+
+#= Panel statistics =#
+
+"""
+Given a matrix whose non-finite cells mark unmeasured positions, standardise it
+against the mean and standard deviation of its own finite cells. Returns a
+matrix of the same shape, non-finite cells staying `NaN`.
+
+**NOTE:** a matrix with no spread at all comes back as zeros (and one with no
+finite cell as all-`NaN`), so colour encodes shape, never absolute magnitude.
+"""
+function zscore_finite(matrix::AbstractArray{<:Real})
+    measured = filter(isfinite, vec(matrix))
+    isempty(measured) && return fill(NaN, size(matrix))
+    center = mean(measured)
+    spread = std(measured)
+    (spread == 0 || !isfinite(spread)) &&
+        return map(value -> isfinite(value) ? 0.0 : NaN, matrix)
+    return map(value -> isfinite(value) ? (value - center) / spread : NaN, matrix)
+end
+
+"""
+Given several same-shaped matrices, average them cell by cell over the finite
+cells only. Returns a matrix of that shape, `NaN` where no input was finite, so
+an unmeasured cell neither counts as a zero nor erases the others.
+"""
+function mean_finite(matrices)
+    isempty(matrices) && throw(ArgumentError("`matrices` must be non-empty"))
+    sums = zeros(Float64, size(first(matrices)))
+    counts = zeros(Int, size(sums))
+    for matrix in matrices
+        size(matrix) == size(sums) ||
+            throw(DimensionMismatch("every matrix must be $(size(sums))"))
+        for index in eachindex(sums, matrix)
+            isfinite(matrix[index]) || continue
+            sums[index] += matrix[index]
+            counts[index] += 1
         end
     end
-
-    return [
-        weight_totals[slot] == 0 ? NaN : weighted_sums[slot] / weight_totals[slot] for
-        slot in eachindex(weighted_sums)
-    ]
+    return map((total, count) -> count == 0 ? NaN : total / count, sums, counts)
 end
 
 export coverage,
@@ -927,6 +1154,12 @@ export coverage,
     MethylationFrequency,
     DEFAULT_MIN_DEPTH,
     gene_profile,
-    mean_gene_profile
+    mean_gene_profile,
+    quantile_profiles,
+    clipped_features,
+    tss_window,
+    values_by_quantile,
+    zscore_finite,
+    mean_finite
 
 end
