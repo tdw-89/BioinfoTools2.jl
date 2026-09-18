@@ -58,8 +58,9 @@ end
 
 """
 Given a metagene profile and its `flank`, draw it as a line with the TSS and TES
-dashed in. Returns the new `Axis`, placed at `position` (e.g. `figure[1, 1]`);
-the body width is read off the profile's length.
+dashed in (unless `mark_boundaries = false`). Returns the new `Axis`, placed at
+`position` (e.g. `figure[1, 1]`); the body width is read off the profile's
+length.
 """
 function metagene_lines!(
     position,
@@ -67,6 +68,7 @@ function metagene_lines!(
     flank::Integer,
     title::AbstractString = "",
     ylabel::AbstractString = "",
+    mark_boundaries::Bool = true,
 )
     body_columns = length(profile) - 2 * flank
     axis = Axis(
@@ -76,7 +78,7 @@ function metagene_lines!(
         xticks = metagene_xticks(flank, body_columns),
     )
     lines!(axis, eachindex(profile), profile)
-    vlines!(
+    mark_boundaries && vlines!(
         axis,
         metagene_boundaries(flank, body_columns);
         color = :gray,
@@ -91,7 +93,8 @@ returns, perhaps through [`stretch_body_columns`](@ref)) and its `flank`, draw i
 as a heatmap, groups up the y axis. Returns `(axis, plot)` placed at `position`;
 pass `plot` to a `Colorbar` in a neighbouring cell.
 
-`NaN` cells — unmeasured positions — are left blank.
+`NaN` cells — unmeasured positions — are left blank. Set `mark_boundaries =
+false` to leave off the dashed TSS/TES lines.
 """
 function metagene_heatmap!(
     position,
@@ -101,6 +104,7 @@ function metagene_heatmap!(
     ylabel::AbstractString = "",
     colormap = :viridis,
     colorrange = CairoMakie.Makie.automatic,
+    mark_boundaries::Bool = true,
 )
     n_groups, n_columns = size(matrix)
     body_columns = n_columns - 2 * flank
@@ -119,7 +123,7 @@ function metagene_heatmap!(
         colormap = colormap,
         colorrange = colorrange,
     )
-    vlines!(
+    mark_boundaries && vlines!(
         axis,
         metagene_boundaries(flank, body_columns);
         color = :white,
