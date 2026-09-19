@@ -1181,6 +1181,7 @@ end
 """
 Given values whose non-finite entries mark unmeasured ones, summarise the finite
 ones. Returns their `(mean, std)`, `NaN` where there are too few to define it.
+Internal to [`zscore_finite`](@ref).
 """
 function finite_moments(values)
     measured = [value for value in values if isfinite(value)]
@@ -1191,7 +1192,8 @@ end
 """
 Given values and the `center` and `spread` to measure them against, standardise
 them. Returns `(value - center) / spread` for each finite value and `NaN` for the
-rest; with no spread at all, every finite value is `0`.
+rest; with no spread at all, every finite value is `0`. Internal to
+[`zscore_finite`](@ref).
 """
 function standardize(values, center::Real, spread::Real)
     flat = spread == 0 || !isfinite(spread)
@@ -1261,8 +1263,6 @@ export coverage,
     values_by_rank,
     moving_average,
     zscore_finite,
-    finite_moments,
-    standardize,
     mean_finite
 
 end
