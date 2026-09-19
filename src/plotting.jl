@@ -1,6 +1,6 @@
 """
-Figures for the package's data types: metagene line profiles and heatmaps, and
-per-quantile distributions.
+Figures for the package's data types: metagene line profiles and heatmaps,
+per-quantile distributions, and fitted probability curves.
 
 Every function draws into a caller-supplied grid position, so figure size and
 layout stay the caller's.
@@ -230,6 +230,43 @@ function overlay_trend!(
 end
 
 """
+Given an `observed` positive-class rate and a `fitted` probability (e.g.
+`Modeling.logistic_curve`) along the same `positions`, draw a classifier: the
+observed rate as a line, the fit over it, and the `0.5` decision level dotted
+in. Returns the new `Axis`, placed at `position`, with y fixed to `[0, 1]`.
+"""
+function probability_plot!(
+    position,
+    positions::AbstractVector{<:Real},
+    observed::AbstractVector{<:Real},
+    fitted::AbstractVector{<:Real};
+    title::AbstractString = "",
+    xlabel::AbstractString = "",
+    ylabel::AbstractString = "probability",
+    observed_label = nothing,
+    fitted_label = nothing,
+)
+    axis = Axis(
+        position;
+        title = title,
+        xlabel = xlabel,
+        ylabel = ylabel,
+        limits = (nothing, (-0.02, 1.02)),
+    )
+    hlines!(axis, [0.5]; color = :gray, linestyle = :dot)
+    lines!(
+        axis,
+        positions,
+        observed;
+        color = :steelblue,
+        linewidth = 2,
+        label = observed_label,
+    )
+    overlay_trend!(axis, positions, fitted; label = fitted_label)
+    return axis
+end
+
+"""
 Given x `positions` and their `labels`, mark each on `axis` with a dashed rule,
 labelled from the top down its `side` (`:right` or `:left`). Returns `axis`.
 
@@ -273,6 +310,7 @@ export metagene_xticks,
     violin_box!,
     trend_plot!,
     overlay_trend!,
+    probability_plot!,
     mark_positions!
 
 end

@@ -1055,9 +1055,9 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             @test isequal(zscore_finite([2.0 2.0; NaN 2.0]), [0.0 0.0; NaN 0.0])
             @test all(isnan, zscore_finite(fill(NaN, 2, 2)))
 
-            @test finite_moments([1.0, NaN, 3.0]) == (2.0, sqrt(2.0))
-            @test all(isnan, finite_moments([NaN]))
-            @test isequal(standardize([4.0, NaN], 2.0, 2.0), [1.0, NaN])
+            @test Exploration.finite_moments([1.0, NaN, 3.0]) == (2.0, sqrt(2.0))
+            @test all(isnan, Exploration.finite_moments([NaN]))
+            @test isequal(Exploration.standardize([4.0, NaN], 2.0, 2.0), [1.0, NaN])
 
             # A per-gene Dict is standardised across all of its genes.
             gene_z = zscore_finite(Dict("a" => 1.0, "b" => 3.0, "c" => NaN))

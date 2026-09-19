@@ -32,8 +32,8 @@ Pkg.add([
 | `Homologs.Paralogs` | `ParalogGroup` — paralog pair relations as sparse matrices — plus reciprocal-best-hit detection. |
 | `Homologs.Orthologs` | Between-genome orthology (placeholder). |
 | `Exploration` | Coverage, density estimates, quantile binning and metagene profiles over the above. |
-| `Modeling` | Statistical models: logistic regression of outcomes or proportions. |
-| `Plotting` | Metagene line profiles and heatmaps, and per-quantile violin plots (CairoMakie). |
+| `Modeling` | Statistical models: logistic regression as a binary classifier. |
+| `Plotting` | Metagene line profiles and heatmaps, per-quantile violin plots, and fitted probability curves (CairoMakie). |
 
 ## Reference documents
 
