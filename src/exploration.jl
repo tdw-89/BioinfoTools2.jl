@@ -1069,27 +1069,44 @@ function _tss_window(flank::Integer, window::Integer)
 end
 
 """
+Given `(upstream, downstream)` base counts and `flank`, locate an asymmetric
+TSS window. Returns its region indices, with the first body base included in
+`downstream`.
+"""
+function _tss_window(flank::Integer, window::Tuple{<:Integer,<:Integer})
+    upstream, downstream = window
+    0 <= upstream <= flank && downstream >= 0 && upstream + downstream > 0 || throw(
+        ArgumentError(
+            "`window` must have 0 <= upstream <= flank and a positive total width",
+        ),
+    )
+    return (flank-upstream+1):(flank+downstream)
+end
+
+"""
     tss_window(frequency; exclude = Set{String}(), flank = 500, window = 500)
 
-Given per-gene frequencies, summarise each gene over a `window`-bp window centred
-on its TSS, half upstream and half into the body. Returns a `gene ID => value` `Dict` in `[0, 1]`:
+Given per-gene frequencies, summarise each gene over an even `window` centred
+on its TSS, or `(upstream, downstream)` base counts. Returns a `gene ID => value` `Dict` in `[0, 1]`:
 the mean per-base frequency for a [`FeatureFrequency`](@ref), the depth-weighted
 methylation fraction for a [`MethylationFrequency`](@ref).
 
-Genes in `exclude`, and genes whose body is shorter than half the window, are
+Genes in `exclude`, and genes whose body is shorter than the downstream span, are
 left out; so is a methylation gene with no measured base in the window.
 """
 function tss_window(
     frequency::FeatureFrequency;
     exclude = Set{String}(),
     flank::Integer = 500,
-    window::Integer = 500,
+    window = 500,
 )
     positions = _tss_window(flank, window)
     summaries = Dict{String,Float64}()
     for (gene_id, counts) in frequency.features
-        (gene_id in exclude || length(counts) - 2 * flank < window ÷ 2) && continue
-        summaries[gene_id] = sum(view(counts, positions)) / (window * frequency.n)
+        (gene_id in exclude || length(counts) - 2 * flank < last(positions) - flank) &&
+            continue
+        summaries[gene_id] =
+            sum(view(counts, positions)) / (length(positions) * frequency.n)
     end
     return summaries
 end
@@ -1098,13 +1115,13 @@ function tss_window(
     frequency::MethylationFrequency;
     exclude = Set{String}(),
     flank::Integer = 500,
-    window::Integer = 500,
+    window = 500,
 )
     positions = _tss_window(flank, window)
     summaries = Dict{String,Float64}()
     for (gene_id, feature_levels) in frequency.features
         gene_id in exclude && continue
-        length(feature_levels) - 2 * flank < window ÷ 2 && continue
+        length(feature_levels) - 2 * flank < last(positions) - flank && continue
 
         weighted_total = 0.0
         weight_total = 0.0

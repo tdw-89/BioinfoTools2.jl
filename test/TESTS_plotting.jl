@@ -10,6 +10,9 @@ const Makie = BioinfoTools2.Plotting.CairoMakie
         @test positions == [1.0, 500.5, 600.5, 1100.0]
         @test labels == ["-500 bp", "TSS", "TES", "+500 bp"]
         @test metagene_boundaries(500, 100) == positions[2:3]
+        asymmetric_positions, asymmetric_labels = metagene_xticks(1000, 100, 500)
+        @test asymmetric_positions == [1.0, 1000.5, 1100.5, 1600.0]
+        @test asymmetric_labels == ["-1000 bp", "TSS", "TES", "+500 bp"]
     end
 
     @testset "stretch_body_columns - flanks kept, body repeated" begin
@@ -34,6 +37,9 @@ const Makie = BioinfoTools2.Plotting.CairoMakie
         @test all(axis -> axis isa Makie.Axis, axes)
         @test heat_axis.xticks[] == metagene_xticks(2, 3)
         @test heat_axis.yticks[] == 1:3
+        asymmetric_axis, _ =
+            metagene_heatmap!(figure[5, 2], rand(2, 8); flank = 3, downstream = 1)
+        @test asymmetric_axis.xticks[] == metagene_xticks(3, 4, 1)
         @test violin_axis.xticks[] == 1:2
         # Without boundaries an axis holds only its data plot.
         bare_axis, _ =

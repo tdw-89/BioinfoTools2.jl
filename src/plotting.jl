@@ -10,13 +10,18 @@ module Plotting
 using CairoMakie
 
 """
-Given a flank width and the number of body columns, place a metagene's four
-landmark ticks. Returns `(positions, labels)` — region start, TSS, TES and
-region end — ready for an axis's `xticks`.
+Given an upstream `flank`, body width and optional `downstream` width, place a
+metagene's four landmark ticks. Returns `(positions, labels)` for region start,
+TSS, TES and region end. By default both flanks have the same width.
 """
-metagene_xticks(flank::Integer, body_columns::Integer) = (
-    [1.0, flank + 0.5, flank + body_columns + 0.5, Float64(2 * flank + body_columns)],
-    ["-$(flank) bp", "TSS", "TES", "+$(flank) bp"],
+metagene_xticks(flank::Integer, body_columns::Integer, downstream::Integer = flank) = (
+    [
+        1.0,
+        flank + 0.5,
+        flank + body_columns + 0.5,
+        Float64(flank + body_columns + downstream),
+    ],
+    ["-$(flank) bp", "TSS", "TES", "+$(downstream) bp"],
 )
 
 """
@@ -88,10 +93,10 @@ function metagene_lines!(
 end
 
 """
-Given a `groups × positions` metagene matrix (as `Exploration.quantile_profiles`
-returns, perhaps through [`stretch_body_columns`](@ref)) and its `flank`, draw it
+Given a `groups × positions` metagene matrix and its upstream `flank`, draw it
 as a heatmap, groups up the y axis. Returns `(axis, plot)` placed at `position`;
-pass `plot` to a `Colorbar` in a neighbouring cell.
+pass `plot` to a `Colorbar` in a neighbouring cell. `downstream` defaults to
+`flank` and sets the downstream width when they differ.
 
 `NaN` cells — unmeasured positions — are left blank. Set `mark_boundaries =
 false` to leave off the dashed TSS/TES lines.
@@ -100,6 +105,7 @@ function metagene_heatmap!(
     position,
     matrix::AbstractMatrix;
     flank::Integer,
+    downstream::Integer = flank,
     title::AbstractString = "",
     ylabel::AbstractString = "",
     colormap = :viridis,
@@ -107,12 +113,12 @@ function metagene_heatmap!(
     mark_boundaries::Bool = true,
 )
     n_groups, n_columns = size(matrix)
-    body_columns = n_columns - 2 * flank
+    body_columns = n_columns - flank - downstream
     axis = Axis(
         position;
         title = title,
         ylabel = ylabel,
-        xticks = metagene_xticks(flank, body_columns),
+        xticks = metagene_xticks(flank, body_columns, downstream),
         yticks = 1:n_groups,
     )
     plot = heatmap!(

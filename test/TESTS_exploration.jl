@@ -1005,6 +1005,12 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             @test !haskey(tss_window(ff; exclude = Set(["c"]), flank, window = 2), "c")
             @test_throws ArgumentError tss_window(ff; flank, window = 3)
             @test_throws ArgumentError tss_window(ff; flank, window = 6)
+            @test tss_window(ff; flank, window = (2, 1))["a"] ≈ 2 / 3
+            @test_throws ArgumentError tss_window(ff; flank, window = (3, 1))
+            @test_throws ArgumentError tss_window(ff; flank, window = (0, 0))
+            short_counts =
+                FeatureFrequency(2, Dict("short" => sparsevec([3], UInt32[1], 5)))
+            @test isempty(tss_window(short_counts; flank, window = (2, 2)))
 
             levels = FeatureLevels(
                 sparsevec([2, 3], Float32[1.0, 0.0], 7),
@@ -1019,6 +1025,18 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             fractions = tss_window(methylation; flank, window = 2)
             @test fractions["levels"] ≈ 30 / 40     # depth-weighted, on [0, 1]
             @test !haskey(fractions, "unmeasured")
+            @test tss_window(methylation; flank, window = (2, 1))["levels"] ≈ 30 / 40
+            @test tss_window(methylation; flank, window = (2, 0))["levels"] ≈ 1.0
+            short_levels = FeatureLevels(
+                sparsevec([3], Float32[1.0], 5),
+                sparsevec([3], UInt32[10], 5),
+            )
+            short_methylation = MethylationFrequency(
+                Exploration.DEFAULT_MIN_DEPTH,
+                CTX_CPG,
+                Dict("short" => short_levels),
+            )
+            @test isempty(tss_window(short_methylation; flank, window = (2, 2)))
         end
 
         @testset "values_by_quantile - unranked genes dropped" begin
