@@ -16,6 +16,8 @@ using ..Data
 # has no use for.
 using ..Data.Methylation:
     MethylationData, CTX_CPG, find_calls_in_range, get_context, get_depth, meth_fraction
+using ..Data.Mappability:
+    MappabilityChannel, MappabilityData, metric_function, runs_in_range
 
 #= Feature regions =#
 
@@ -618,6 +620,96 @@ _entries_within(feature_levels::FeatureLevels, bases::AbstractUnitRange) =
     )
 
 """
+One feature's region as runs of equal level, for dense signals where per-base
+[`FeatureLevels`](@ref) would cost too much (mappability: every base measured).
+Run `k` covers region indices `starts[k]:stops[k]` (ascending, strand-oriented
+like `FeatureLevels`) at `levels[k]` with weight `weights[k]` per base.
+"""
+struct FeatureRuns
+    region_length::Int
+    starts::Vector{Int32}
+    stops::Vector{Int32}
+    levels::Vector{Float32}
+    weights::Vector{UInt32}
+end
+
+Base.length(feature_runs::FeatureRuns) = feature_runs.region_length
+
+"""
+Given a `FeatureRuns`, expand it to one entry per base. Returns the equivalent
+[`FeatureLevels`](@ref).
+"""
+function FeatureLevels(feature_runs::FeatureRuns)
+    spans = map((start, stop) -> start:stop, feature_runs.starts, feature_runs.stops)
+    return FeatureLevels(
+        feature_runs.region_length,
+        reduce(vcat, collect.(spans); init = Int32[]),
+        reduce(vcat, fill.(feature_runs.levels, length.(spans)); init = Float32[]),
+        reduce(vcat, fill.(feature_runs.weights, length.(spans)); init = UInt32[]),
+    )
+end
+
+"""
+Given a `FeatureLevels` or `FeatureRuns`, iterate its measured bases as
+`(base, level, weight)`, ascending. The one place the two layouts differ for
+[`gene_profile`](@ref) and the window summaries.
+"""
+_base_entries(feature_levels::FeatureLevels) =
+    zip(feature_levels.bases, feature_levels.levels, feature_levels.weights)
+
+_base_entries(feature_runs::FeatureRuns) = (
+    (base, level, weight) for (start, stop, level, weight) in zip(
+        feature_runs.starts,
+        feature_runs.stops,
+        feature_runs.levels,
+        feature_runs.weights,
+    ) for base = start:stop
+)
+
+"""
+Given a feature's levels and a range of region indices, total the measured bases
+there. Returns `(weighted, weight)`: the sum of `level * weight` and of `weight`.
+"""
+function _window_totals(feature_levels::FeatureLevels, positions::AbstractUnitRange)
+    weighted_total, weight_total = 0.0, 0.0
+    for entry in _entries_within(feature_levels, positions)
+        weight = Float64(feature_levels.weights[entry])
+        weighted_total += feature_levels.levels[entry] * weight
+        weight_total += weight
+    end
+    return (weighted_total, weight_total)
+end
+
+function _window_totals(feature_runs::FeatureRuns, positions::AbstractUnitRange)
+    weighted_total, weight_total = 0.0, 0.0
+    first_run = searchsortedfirst(feature_runs.stops, first(positions))
+    last_run = searchsortedlast(feature_runs.starts, last(positions))
+    for run = first_run:last_run
+        weight = Float64(feature_runs.weights[run])
+        # Per base, as `FeatureLevels` would add them, so the two agree exactly.
+        for _ =
+                max(feature_runs.starts[run], first(positions)):min(
+                    feature_runs.stops[run],
+                    last(positions),
+                )
+
+            weighted_total += feature_runs.levels[run] * weight
+            weight_total += weight
+        end
+    end
+    return (weighted_total, weight_total)
+end
+
+"""
+Per-feature levels — each base a value with a weight behind it, unmeasured bases
+absent — as opposed to a [`FeatureFrequency`](@ref)'s overlap counts. Subtypes
+hold them in `features`, a `gene ID => FeatureLevels` or `=> FeatureRuns`
+`Dict`; `mean_gene_profile`, `quantile_profiles`, `tss_window` and `body_mean`
+work on any of them.
+"""
+abstract type LevelFrequency end
+
+"""
 Per-feature, per-base methylation levels, together with the filters they were
 built under.
 
@@ -627,7 +719,7 @@ be divided by a measurement count, whereas this holds a *level* per base plus
 the depth it rests on, and must distinguish an unmeasured base from one measured
 at zero.
 """
-struct MethylationFrequency
+struct MethylationFrequency <: LevelFrequency
     min_depth::UInt32
     context::Union{Nothing,UInt8}
     features::Dict{String,FeatureLevels}
@@ -739,6 +831,92 @@ function feature_frequency(
     return MethylationFrequency(min_depth_bits, context_bits, features)
 end
 
+"""
+Per-feature mappability as [`FeatureRuns`](@ref): one channel's `metric` per base
+(`levels`) with `n_simulated` as the weight, plus the `channel` and `metric`.
+"""
+struct MappabilityFrequency <: LevelFrequency
+    channel::MappabilityChannel
+    metric::Symbol
+    features::Dict{String,FeatureRuns}
+end
+
+"""
+Given the runs overlapping a region and the metric to take from them, clip them
+to the region. Returns its [`FeatureRuns`](@ref), strand-oriented, skipping runs
+whose metric is not finite.
+"""
+function _region_runs(
+    runs,
+    region_start::Int,
+    region_end::Int,
+    negative::Bool,
+    value_of::V,
+) where {V}
+    starts, stops = Int32[], Int32[]
+    levels, weights = Float32[], UInt32[]
+    for run in runs
+        level = value_of(run)
+        isfinite(level) || continue
+        first_index = _region_index(
+            max(Int(run.start), region_start),
+            region_start,
+            region_end,
+            negative,
+        )
+        last_index = _region_index(
+            min(Int(run.stop), region_end),
+            region_start,
+            region_end,
+            negative,
+        )
+        push!(starts, min(first_index, last_index))
+        push!(stops, max(first_index, last_index))
+        push!(levels, level)
+        push!(weights, UInt32(run.n_simulated))
+    end
+    negative && foreach(reverse!, (starts, stops, levels, weights))
+    return FeatureRuns(region_end - region_start + 1, starts, stops, levels, weights)
+end
+
+"""
+    feature_frequency(genome, feature, data::MappabilityData; flank = 500,
+                      metric = :map_back)
+
+Given one mappability channel, project it onto every `feature`-type feature of
+`genome`. Returns a [`MappabilityFrequency`](@ref) of each feature's padded,
+strand-oriented region, unclipped like the methylation method; `metric` is
+`:map_back`, `:ectopic_rate` or `:log2_ratio`.
+"""
+function feature_frequency(
+    genome::Genome,
+    feature::Union{AbstractString,Symbol},
+    data::MappabilityData;
+    flank::Integer = 500,
+    metric::Symbol = :map_back,
+)
+    value_of = metric_function(metric, data.pseudocount)
+    features = _by_scaffold(genome, feature, FeatureRuns) do scaffold_name, tree
+        scaffold_runs = Dict{String,FeatureRuns}()
+        haskey(data, scaffold_name) || return scaffold_runs
+        runs = data[scaffold_name]
+        for interval in tree
+            region = _feature_region(genome, interval, flank; clip = false)
+            isnothing(region) && continue
+            feature_id, negative, region_start, region_end = region
+            scaffold_runs[feature_id] = _region_runs(
+                runs_in_range(runs, max(1, region_start), region_end),
+                region_start,
+                region_end,
+                negative,
+                value_of,
+            )
+        end
+        scaffold_runs
+    end
+    return MappabilityFrequency(data.channel, metric, features)
+end
+
 #= Metagene profiles =#
 
 """
@@ -825,10 +1003,10 @@ function gene_profile(
 end
 
 """
-    gene_profile(feature_levels::FeatureLevels; flank = 500, body_bins = 100,
-                 weight_by_depth = true, weight_transform = identity)
+    gene_profile(feature_levels::Union{FeatureLevels,FeatureRuns}; flank = 500,
+                 body_bins = 100, weight_by_depth = true, weight_transform = identity)
 
-Given one feature's per-base methylation, reduce it to a profile of length
+Given one feature's per-base levels (methylation, or mappability runs), reduce it to a profile of length
 `2 * flank + body_bins`. Returns a `NamedTuple` of `levels` and `weights`, or
 `nothing` when the region is shorter than `2 * flank + 2`. The body is
 **binned**, not interpolated: interpolating would invent levels across the long
@@ -838,7 +1016,7 @@ uncovered stretches between cytosines. See `docs/weighting.md` for the weighting
 meaningless there; a metagene needs both (see [`mean_gene_profile`](@ref)).
 """
 function gene_profile(
-    feature_levels::FeatureLevels;
+    feature_levels::Union{FeatureLevels,FeatureRuns};
     flank::Integer = 500,
     body_bins::Integer = 100,
     weight_by_depth::Bool = true,
@@ -855,8 +1033,7 @@ function gene_profile(
     weighted_sums = zeros(Float64, n_slots)
     body_length = region_length - 2 * flank
 
-    for (base, level, depth) in
-        zip(feature_levels.bases, feature_levels.levels, feature_levels.weights)
+    for (base, level, depth) in _base_entries(feature_levels)
         weight = weight_by_depth ? weight_of(depth, weight_transform) : 1.0
         weight == 0 && continue
 
@@ -907,7 +1084,7 @@ Given per-gene methylation levels and `group_of`, which maps a gene ID to a
 matrix, `NaN` wherever no gene of the group was measured.
 """
 function _group_profiles(
-    frequency::MethylationFrequency,
+    frequency::LevelFrequency,
     group_of::F,
     n_groups::Integer;
     flank::Integer = 500,
@@ -987,7 +1164,7 @@ reads as mean level among measured cytosines, not level times cytosine density;
 a position no gene measured comes back as `NaN`.
 """
 mean_gene_profile(
-    methylation_frequency::MethylationFrequency;
+    methylation_frequency::LevelFrequency;
     exclude = Set{String}(),
     flank::Integer = 500,
     body_bins::Integer = 100,
@@ -1018,7 +1195,7 @@ A gene missing from `feature_quantile`, or listed in `exclude` (see
 [`clipped_features`](@ref)), is skipped.
 """
 function quantile_profiles(
-    frequency::Union{FeatureFrequency,MethylationFrequency},
+    frequency::Union{FeatureFrequency,LevelFrequency},
     feature_quantile::AbstractDict{String,<:Integer};
     exclude = Set{String}(),
     n_quantiles::Integer = maximum(values(feature_quantile); init = 0),
@@ -1112,7 +1289,7 @@ function tss_window(
 end
 
 function tss_window(
-    frequency::MethylationFrequency;
+    frequency::LevelFrequency;
     exclude = Set{String}(),
     flank::Integer = 500,
     window = 500,
@@ -1122,14 +1299,27 @@ function tss_window(
     for (gene_id, feature_levels) in frequency.features
         gene_id in exclude && continue
         length(feature_levels) - 2 * flank < last(positions) - flank && continue
+        weighted_total, weight_total = _window_totals(feature_levels, positions)
+        weight_total == 0 || (summaries[gene_id] = weighted_total / weight_total)
+    end
+    return summaries
+end
 
-        weighted_total = 0.0
-        weight_total = 0.0
-        for entry in _entries_within(feature_levels, positions)
-            weight = Float64(feature_levels.weights[entry])
-            weighted_total += feature_levels.levels[entry] * weight
-            weight_total += weight
-        end
+"""
+    body_mean(frequency::LevelFrequency; exclude = Set{String}(), flank = 500)
+
+Given per-gene levels built with this `flank`, average each gene's body — its
+region less the flanks — weighting each measured base by its weight. Returns a
+`gene ID => value` `Dict`; genes in `exclude`, or with nothing measured in the
+body, are left out.
+"""
+function body_mean(frequency::LevelFrequency; exclude = Set{String}(), flank::Integer = 500)
+    summaries = Dict{String,Float64}()
+    for (gene_id, feature_levels) in frequency.features
+        gene_id in exclude && continue
+        body = (flank+1):(length(feature_levels)-flank)
+        isempty(body) && continue
+        weighted_total, weight_total = _window_totals(feature_levels, body)
         weight_total == 0 || (summaries[gene_id] = weighted_total / weight_total)
     end
     return summaries
@@ -1269,7 +1459,11 @@ export coverage,
     feature_frequency,
     FeatureFrequency,
     FeatureLevels,
+    FeatureRuns,
+    LevelFrequency,
+    MappabilityFrequency,
     MethylationFrequency,
+    body_mean,
     DEFAULT_MIN_DEPTH,
     gene_profile,
     mean_gene_profile,

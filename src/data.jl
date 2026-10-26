@@ -17,6 +17,12 @@ using Base: ImmutableDict
 include("data/methylation.jl")
 using .Methylation
 
+# Mappability is positional too, and leans on Methylation for its file naming
+# and for masking calls; `mappability_intervals` below is the one piece that
+# needs a `Genome`, to build a `BedData`.
+include("data/mappability.jl")
+using .Mappability
+
 # Field layout of the 64-bit BED metadata code (see `pack_bed_code`).
 const BED_STRAND_SHIFT = 32
 const BED_STRAND_WIDTH = 8
@@ -533,7 +539,52 @@ function Base.show(io::IO, t::TabularData)
     print(io, "TabularData($(rows)×$(columns) $(eltype(t.table)))")
 end
 
+"""
+    mappability_intervals(data, genome; below = 0.9, metric = :map_back)
+
+Given one mappability channel, collect the stretches whose `metric` is under
+`below`, merging adjacent runs. Returns a [`BedData`](@ref) against `genome`
+(strand `STRAND_NA`), ready for `intersect` or `coverage`. Unmeasured bases
+end a stretch rather than join one.
+"""
+function mappability_intervals(
+    data::MappabilityData,
+    genome::Genome;
+    below::Real = 0.9,
+    metric::Symbol = :map_back,
+)
+    value_of = metric_function(metric, data.pseudocount)
+    code = pack_bed_code(STRAND_NA)
+    scaffolds = Dict{String,IntervalTreeM64}()
+    for (scaffold, runs) in data.scaffolds
+        tree = IntervalTreeM64()
+        open_start, open_stop = 0, -1
+        for run in runs
+            value_of(run) < below || continue
+            if Int(run.start) == open_stop + 1
+                open_stop = Int(run.stop)
+                continue
+            end
+            open_stop >= open_start > 0 &&
+                push!(tree, IntervalValue(UInt32(open_start), UInt32(open_stop), code))
+            open_start, open_stop = Int(run.start), Int(run.stop)
+        end
+        open_stop >= open_start > 0 &&
+            push!(tree, IntervalValue(UInt32(open_start), UInt32(open_stop), code))
+        scaffolds[scaffold] = tree
+    end
+    return BedData(genome, scaffolds)
+end
+
 export BedData,
-    Methylation, TabularData, intersect, leftjoin, load_bed, load_table, merge_segments
+    Mappability,
+    Methylation,
+    TabularData,
+    intersect,
+    leftjoin,
+    load_bed,
+    load_table,
+    mappability_intervals,
+    merge_segments
 
 end

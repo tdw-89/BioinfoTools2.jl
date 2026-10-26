@@ -40,6 +40,7 @@ julia --project=. -t auto -e 'using Pkg; Pkg.test()'
 | `Reference` | The in-memory genome: `Species` → `Genome` → `Scaffold` → interval tree of GFF3 features. |
 | `Data` | Sample-level data loaded against a `Genome`: `BedData`, `TabularData`, `Experiment`, and interval set operations. |
 | `Data.Methylation` | Single-base methylation calls, packed 8 bytes per site, with Bismark loaders and Arrow I/O. |
+| `Data.Mappability` | Per-base empirical mappability from [UniMap.jl](https://github.com/tdw-89/UniMap.jl): converts a `mappability.zarr` (with `using Zarr`) into a lossless run-length Arrow cache, read lazily per channel, and used for metagenes, low-mappability intervals and masking methylation calls. |
 | `Homologs.Paralogs` | `ParalogGroup` — paralog pair relations as sparse matrices — plus reciprocal-best-hit detection and duplication-node annotation from OrthoFinder output. |
 | `Homologs.Orthologs` | Between-genome orthology (placeholder). |
 | `Exploration` | Coverage, density estimates, quantile binning, metagene profiles and TSS-window summaries over the above. |
@@ -50,6 +51,7 @@ julia --project=. -t auto -e 'using Pkg; Pkg.test()'
 
 - [`docs/paralog_group.md`](docs/paralog_group.md) — `ParalogGroup`'s input columns, relation-matrix layouts, and `lca_depth` numbering.
 - [`docs/weighting.md`](docs/weighting.md) — how read depth becomes weight through the methylation metagene pipeline.
+- [`docs/mappability.md`](docs/mappability.md) — converting UniMap output, the cache layout and sizes, genome matching, and the analysis built on it.
 
 ## Author
 Tom Wolfe<br>
