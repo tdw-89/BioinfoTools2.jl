@@ -1392,3 +1392,129 @@ end
     @test species_tree_path("/results/Gene_Duplication_Events/Duplications.tsv") ==
           "/results/Species_Tree/SpeciesTree_rooted_node_labels.txt"
 end
+
+# ============================================================================
+# Tests for divergence tables and paralog-age ranking
+# ============================================================================
+@testset "divergence tables and age ranking" begin
+    tree = "(mouse:0.08,(macaque:0.02,(human:0.01,(bonobo:0.004,chimp:0.004)N3:0.003)N2:0.005)N1:0.08)N0;"
+
+    # Columns out of the pipeline's order, plus one the loader ignores.
+    divergence_csv = tempname() * ".csv"
+    write(
+        divergence_csv,
+        """
+        orthogroup,gene_b,gene_a,pct_id_a_in_b,pct_id_b_in_a,tree_dN,tree_dS,pair_dS
+        OG1,g2,g1,90,85,0.05,-0.2,9
+        OG1,g3,g1,90,20,0.1,0.3,9
+        OG2,g4,g3,50,50,0.1,NA,9
+        OG2,g4,g2,60,70,NA,0.4,9
+        """,
+    )
+
+    @testset "load_divergence - by name, NA as NaN, identity in both directions" begin
+        pairs = load_divergence(divergence_csv; min_identity = 30)
+        @test names(pairs) ==
+              ["query", "subject", "id_subject_query", "id_query_subject", "dS", "dN"]
+        @test pairs.query == ["g1", "g2"] && pairs.subject == ["g2", "g4"]
+        @test pairs.id_subject_query == [90.0, 60.0] &&
+              pairs.id_query_subject == [85.0, 70.0]
+        @test pairs.dS == [0.2, 0.4]   # made non-negative
+        @test pairs.dN[1] == 0.05 && isnan(pairs.dN[2])
+        @test nrow(load_divergence(divergence_csv; min_identity = 95)) == 0
+
+        not_divergence = tempname() * ".csv"
+        write(not_divergence, "gene_a,gene_b\ng1,g2\n")
+        @test_throws ArgumentError load_divergence(not_divergence; min_identity = 0)
+    end
+
+    genome = genome_from_genes([
+        ("chr1", 100, 200, "+", "gene-g1"),
+        ("chr1", 300, 400, "-", "gene-g2"),
+        ("chr1", 500, 600, "+", "gene-g3"),
+        ("chr1", 700, 800, "+", "gene-g4"),
+    ])
+
+    @testset "load_paralogs - converter maps names onto the genome" begin
+        # The g2-g4 pair has no dN, so the constructor drops it.
+        group = @test_logs (:warn, r"dropped 1 row") load_paralogs(
+            divergence_csv,
+            genome;
+            min_identity = 30,
+            converter = name -> "gene-" * name,
+        )
+        table = pair_table(group)
+        @test nrow(table) == 1
+        @test Set([table[1, 1], table[1, 2]]) == Set(["gene-g1", "gene-g2"])
+        @test_throws ArgumentError load_paralogs(
+            divergence_csv,
+            genome;
+            min_identity = 30,
+            species = "human",
+        )
+    end
+
+    @testset "load_protein_map and protein_to_gene - fallbacks in order" begin
+        map_csv = tempname() * ".csv"
+        write(map_csv, "gene,protein\na,XP_1\nb,NP_2.1\n")
+        mapping = load_protein_map(map_csv)
+        @test mapping == Dict("XP_1" => "gene-a", "NP_2.1" => "gene-b")
+        found = [
+            protein_to_gene(protein, mapping) for
+            protein in ("XP_1", "XP_1.2", "rna-XP_1", "human_NP_2.1", "unknown")
+        ]
+        @test found == ["gene-a", "gene-a", "gene-a", "gene-b", "unknown"]
+    end
+
+    # Depth 2 genes are younger than depth 1; within a depth, lower dS then dN.
+    age_pairs = DataFrame(
+        query = ["a", "a", "c", "d", "f"],
+        subject = ["b", "c", "d", "e", "g"],
+        dN = [0.1, 0.1, 0.1, 0.05, 0.1],
+        dS = [0.5, 0.1, 0.2, 0.2, 0.0],
+        lca_depth = [2.0, 1.0, 2.0, 2.0, 1.0],
+    )
+    ranked = rank_by_age(age_pairs)
+
+    @testset "rank_by_age - each gene's youngest pair, deepest split first" begin
+        # d and e tie on every level, so ID breaks it; c's depth-1 pair loses to its depth-2 one.
+        @test ranked.ID == ["d", "e", "c", "a", "b", "f", "g"]
+        @test ranked.rank == 1:7
+        @test ranked.lca_depth == [2, 2, 2, 2, 2, 1, 1]
+        @test ranked.dS == [0.2, 0.2, 0.2, 0.5, 0.5, 0.0, 0.0]
+        @test ranked.dN == [0.05, 0.05, 0.1, 0.1, 0.1, 0.1, 0.1]
+        @test age_ranks(ranked) == Dict(zip(ranked.ID, 1:7))
+
+        group = ParalogGroup(
+            genome,
+            DataFrame(
+                q = ["gene-g1", "gene-g1"],
+                s = ["gene-g2", "gene-g3"],
+                dS = [0.1, 0.2],
+                dN = [0.1, 0.1],
+                lca_depth = [2.0, 1.0],
+            ),
+        )
+        @test rank_by_age(group) == rank_by_age(pair_table(group))
+
+        @test_throws ArgumentError rank_by_age(select(age_pairs, Not(:lca_depth)))
+        @test_throws ArgumentError rank_by_age(
+            transform(age_pairs, :lca_depth => (d -> NaN) => :lca_depth),
+        )
+    end
+
+    @testset "load_lineage and duplication_marks - a rule per depth change" begin
+        root = mktempdir()
+        mkpath(joinpath(root, "Species_Tree"))
+        write(joinpath(root, "Species_Tree", "SpeciesTree_rooted_node_labels.txt"), tree)
+        duplications = joinpath(root, "Gene_Duplication_Events", "Duplications.tsv")
+        lineage = load_lineage(duplications, "human")
+        @test lineage == lineage_splits(tree, "human")
+
+        # Depth 2 (node N1) ends after rank 5: those genes duplicated after N0's split.
+        positions, labels = duplication_marks(ranked, lineage)
+        @test positions == [5.5]
+        @test labels == ["← after mouse split"]
+        @test duplication_marks(ranked[1:5, :], lineage) == (Float64[], String[])
+    end
+end

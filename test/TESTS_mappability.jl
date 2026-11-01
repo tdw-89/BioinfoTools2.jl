@@ -270,6 +270,79 @@ mp_shifted(fields, offset) = join(
         @test all(agrees)
     end
 
+    @testset "mapq_weighted_recall" begin
+        @test mapq_confidence(0) == 0 &&
+              mapq_confidence(10) ≈ 0.9 &&
+              mapq_confidence(30) ≈ 0.999
+        recall_channels = [
+            read_mappability(cache; L = 50, F = 200, mapq_cutoff = cutoff) for
+            cutoff in cutoffs
+        ]
+        expand(recall) = Dict(id => FeatureLevels(runs) for (id, runs) in recall.features)
+        lower = expand(mapq_weighted_recall(genome, :gene, recall_channels; flank = 500))
+        upper = expand(
+            mapq_weighted_recall(
+                genome,
+                :gene,
+                recall_channels;
+                flank = 500,
+                bound = :upper,
+            ),
+        )
+        @test keys(lower) == keys(frequency.features)
+        bracketed = [
+            lower[id].bases == upper[id].bases &&
+                all(0 .<= lower[id].levels .<= upper[id].levels .<= 1) for
+            id in keys(lower)
+        ]
+        @test all(bracketed)
+        @test lower["gene-dupA"].levels != upper["gene-dupA"].levels
+
+        # A single band counted at weight 1 is plain map_back at cutoff 0.
+        at_zero = first(recall_channels)
+        single = expand(
+            mapq_weighted_recall(genome, :gene, [at_zero]; flank = 500, bound = :upper),
+        )
+        plain = expand(feature_frequency(genome, :gene, at_zero; flank = 500))
+        same_as_map_back = [
+            single[id].bases == plain[id].bases &&
+                single[id].levels == plain[id].levels &&
+                single[id].weights == plain[id].weights for id in keys(plain)
+        ]
+        @test all(same_as_map_back)
+        only_unique = mapq_weighted_recall(
+            genome,
+            :gene,
+            recall_channels;
+            flank = 500,
+            features = Set(["gene-uniqB"]),
+        )
+        @test collect(keys(only_unique.features)) == ["gene-uniqB"]
+        @test only_unique.metric === :mapq_weighted_recall
+
+        @test_throws ArgumentError mapq_weighted_recall(
+            genome,
+            :gene,
+            recall_channels[2:end],
+        )
+        @test_throws ArgumentError mapq_weighted_recall(
+            genome,
+            :gene,
+            reverse(recall_channels),
+        )
+        @test_throws ArgumentError mapq_weighted_recall(
+            genome,
+            :gene,
+            [at_zero, read_mappability(cache; L = 50, F = 120, mapq_cutoff = 2)],
+        )
+        @test_throws ArgumentError mapq_weighted_recall(
+            genome,
+            :gene,
+            recall_channels;
+            bound = :middle,
+        )
+    end
+
     @testset "runs summarise exactly as per-base levels" begin
         per_base_frequency = MethylationFrequency(
             0,

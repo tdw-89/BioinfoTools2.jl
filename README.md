@@ -40,12 +40,12 @@ julia --project=. -t auto -e 'using Pkg; Pkg.test()'
 | `Reference` | The in-memory genome: `Species` → `Genome` → `Scaffold` → interval tree of GFF3 features. |
 | `Data` | Sample-level data loaded against a `Genome`: `BedData`, `TabularData`, `Experiment`, and interval set operations. |
 | `Data.Methylation` | Single-base methylation calls, packed 8 bytes per site, with Bismark loaders and Arrow I/O. |
-| `Data.Mappability` | Per-base empirical mappability from [UniMap.jl](https://github.com/tdw-89/UniMap.jl): converts a `mappability.zarr` (with `using Zarr`) into a lossless run-length Arrow cache, read lazily per channel, and used for metagenes, low-mappability intervals and masking methylation calls. |
-| `Homologs.Paralogs` | `ParalogGroup` — paralog pair relations as sparse matrices — plus reciprocal-best-hit detection and duplication-node annotation from OrthoFinder output. |
+| `Data.Mappability` | Per-base empirical mappability from [UniMap.jl](https://github.com/tdw-89/UniMap.jl): converts a `mappability.zarr` (with `using Zarr`) into a lossless run-length Arrow cache, read lazily per channel, and used for metagenes, MAPQ-weighted recall, low-mappability intervals and masking methylation calls. |
+| `Homologs.Paralogs` | `ParalogGroup` — paralog pair relations as sparse matrices — plus divergence-table loading, reciprocal-best-hit detection, duplication-node annotation from OrthoFinder output, and ranking genes by duplication age. |
 | `Homologs.Orthologs` | Between-genome orthology (placeholder). |
-| `Exploration` | Coverage, density estimates, quantile binning, metagene profiles and TSS-window summaries over the above. |
+| `Exploration` | Coverage, density estimates, quantile binning, metagene profiles, per-gene profile matrices and TSS-window summaries over the above. |
 | `Modeling` | Statistical models: logistic regression as a binary classifier. |
-| `Plotting` | Metagene line profiles and heatmaps, per-quantile violin plots, rank-trend plots, and fitted probability curves (CairoMakie). |
+| `Plotting` | Metagene line profiles and heatmaps, rank heatmaps, per-quantile violin and box plots, rank-trend plots, and fitted probability curves (CairoMakie). |
 
 ## Reference documents
 

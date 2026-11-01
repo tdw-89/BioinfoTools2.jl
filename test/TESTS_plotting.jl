@@ -84,6 +84,35 @@ const Makie = BioinfoTools2.Plotting.CairoMakie
         @test length(probability_axis.scene.plots) == 3
         @test Makie.axislegend(probability_axis) isa Makie.Legend
 
+        box_axis = quantile_boxplot!(figure[11, 1], [1, 1, 3, 3], [0.1, 0.2, 0.3, 0.4])
+        @test box_axis.xticks[] == 1:3
+        @test length(box_axis.scene.plots) == 1
+        @test quantile_boxplot!(figure[11, 2], Int[], Float64[]; n_bins = 4).xticks[] == 1:4
+
+        # 3 blocks over ranks 1:10, flanks of 2 columns standing for 500 bp each.
+        rank_axis, rank_plot = rank_heatmap!(
+            figure[12, 1],
+            [rand(2, 6); fill(NaN, 1, 6)],
+            [1, 4, 8, 11];
+            flank = 500,
+            flank_columns = 2,
+            highclip = :red,
+        )
+        Makie.Colorbar(figure[12, 2], rank_plot)
+        @test rank_axis.xticks[] ==
+              ([0.5, 2.5, 4.5, 6.5], ["-500 bp", "TSS", "TES", "+500 bp"])
+        @test length(rank_axis.scene.plots) == 2    # the heatmap and the TSS/TES rules
+        @test_throws DimensionMismatch rank_heatmap!(
+            figure[13, 1],
+            rand(3, 6),
+            [1, 11];
+            flank = 500,
+            flank_columns = 2,
+        )
+        mark_rows!(rank_axis, [3.5, 10.4], ["low", "near the top"])
+        @test length(rank_axis.scene.plots) == 5    # plus the rules and two labels
+        @test_throws DimensionMismatch mark_rows!(rank_axis, [1, 2], ["only one"])
+
         # Headless render: the whole figure draws without error.
         @test Makie.colorbuffer(figure) isa AbstractMatrix
     end

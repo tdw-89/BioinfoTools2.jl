@@ -85,6 +85,13 @@ log2_ratio(run, pseudocount::Real) =
     Float32(log2((run.n_correct + pseudocount) / (run.n_ectopic + pseudocount)))
 
 """
+Given a Bowtie2 MAPQ, the probability that a fragment with it was placed
+correctly. Returns `1 - 10^(-mapq / 10)`, Bowtie2 reporting MAPQ as
+`-10 log10(Pr(placed wrongly))`.
+"""
+mapq_confidence(mapq::Real) = 1 - 10.0^(-mapq / 10)
+
+"""
 Given a metric name — `:map_back`, `:ectopic_rate` or `:log2_ratio` — and the
 data's `pseudocount`, return a function from a run to that metric. Build it
 once, outside a loop: the `Symbol` dispatch is not free.
@@ -546,6 +553,7 @@ export MappabilityRun,
     mappability_at,
     mappability_channels,
     mappability_manifest,
+    mapq_confidence,
     mask_calls,
     metric_function,
     n_runs,

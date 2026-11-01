@@ -66,6 +66,14 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
         end
 
         # ---------------------------------------------------------------------
+        @testset "quantile_map - feature ID => quantile, unmatched left out" begin
+            @test quantile_map(tab) ==
+                  Dict(gid => cld(i, 2) for (i, gid) in enumerate(gene_ids))
+            @test quantile_map(tab; quantiles = 2) ==
+                  Dict(gid => cld(i, 4) for (i, gid) in enumerate(gene_ids))
+        end
+
+        # ---------------------------------------------------------------------
         @testset "custom quantiles count" begin
             q2 = quantiles(tab; quantiles = 2)
             byid = Dict(rec.id => qi for (rec, _, qi) in q2)
@@ -1063,6 +1071,54 @@ const EX_GFF_SINGLE = joinpath(EX_DATA_DIR, "NC_003280.10.gff.gz")
             @test moving_average(fill(-0.004997, 5000), 250) == fill(-0.004997, 5000)
             @test all(isnan, moving_average([NaN, NaN], 3))
             @test_throws ArgumentError moving_average([1.0], -1)
+        end
+
+        @testset "profile_matrix - one row per ID, flanks pooled" begin
+            # 12 bases: a 4-base flank, a 4-base body (2 bins), a 4-base flank.
+            all_bases = collect(1:12)
+            uniform = FeatureLevels(
+                sparsevec(all_bases, fill(0.5f0, 12), 12),
+                sparsevec(all_bases, fill(UInt32(1), 12), 12),
+            )
+            first_bases = FeatureLevels(
+                sparsevec([1, 2], Float32[1.0, 0.0], 12),
+                sparsevec([1, 2], UInt32[2, 2], 12),
+            )
+            too_short =
+                FeatureLevels(sparsevec([1], Float32[1.0], 9), sparsevec([1], UInt32[1], 9))
+            frequency = MethylationFrequency(
+                0,
+                nothing,
+                Dict("u" => uniform, "f" => first_bases, "s" => too_short, "x" => uniform),
+            )
+            matrix, n_missing = profile_matrix(
+                frequency,
+                ["f", "absent", "u", "s", "x"];
+                flank = 4,
+                flank_bin = 2,
+                body_bins = 2,
+                exclude = Set(["x"]),
+            )
+            @test size(matrix) == (5, 6)
+            @test matrix[3, :] == fill(0.5f0, 6)
+            # Bases 1 and 2 pool into one column, weighted by depth.
+            @test matrix[1, 1] == 0.5f0 && all(isnan, matrix[1, 2:end])
+            @test all(isnan, matrix[[2, 4, 5], :]) && n_missing == 3
+            @test_throws ArgumentError profile_matrix(
+                frequency,
+                ["u"];
+                flank = 4,
+                flank_bin = 3,
+            )
+        end
+
+        @testset "block_rows - blocks never straddle a break" begin
+            matrix = Float32[1 10; 3 NaN; 5 30; 7 NaN; NaN NaN]
+            blocked, edges = block_rows(matrix, 2; breaks = [3])
+            @test edges == [1, 3, 5, 6]
+            @test isequal(blocked, Float32[2 10; 6 30; NaN NaN])
+            @test last(block_rows(matrix, 3)) == [1, 4, 6]
+            @test_throws ArgumentError block_rows(matrix, 0)
         end
 
         @testset "zscore_finite and mean_finite - NaN means unmeasured" begin

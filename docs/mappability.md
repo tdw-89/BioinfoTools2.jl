@@ -27,6 +27,32 @@ A **channel** is one grid point `(L, F, mapq_cutoff)`: read length, fragment
 length, and the MAPQ a fragment needed to count. Each is converted and read on
 its own.
 
+### Getting Zarr
+
+`convert_unimap` is in a package extension that loads only with Zarr.jl. An
+analysis project that only reads caches need not depend on Zarr: give Zarr an
+environment of its own and stack it on the project's for the one conversion.
+
+```sh
+julia --project=<zarr_env> -e 'using Pkg; Pkg.add("Zarr")'
+JULIA_LOAD_PATH="@:<zarr_env>:@stdlib" julia --project=. convert.jl
+```
+
+Unpack a tarred store (`tar -xf mappability.zarr.tar`) before converting.
+Converting into an existing cache skips the channels it already holds, so
+re-running a conversion script is cheap.
+
+### Choosing channels
+
+Name only the channels the analysis reads (see "Sizes" below), and keep every
+`F` a multiple of the simulation `step`. For `mapq_weighted_recall`, convert
+every MAPQ cutoff at the `(L, F)` it scores, since it needs all of them. For
+example, with 150 bp reads and fragments of ~200 bp:
+
+```julia
+channels = [[(150, 200, cutoff) for cutoff in (0, 2, 5, 10, 20, 30)]; (150, 300, 2)]
+```
+
 ## What UniMap writes, and why it isn't queried directly
 
 `mappability.zarr` holds exact per-base counts for every channel:
@@ -121,6 +147,12 @@ BioinfoTools2's `Genome` holds annotation only (no lengths or checksum), so a
   `mean_gene_profile`, `quantile_profiles`, `tss_window` and `body_mean` take
   either. `gene_profile` and the window sums visit each base as the per-base path
   does, so results equal those on the expanded `FeatureLevels` exactly.
+- `mapq_weighted_recall(genome, feature, channels; flank, bound)` takes one
+  `(L, F)` at every MAPQ cutoff from 0 up and returns a `MappabilityFrequency`
+  whose level is correct fragments weighted by `mapq_confidence` of their MAPQ,
+  over `n_simulated`. The cache keeps counts per cutoff, so a fragment's MAPQ is
+  known only by band; `bound = :lower` and `:upper` count each band at its lowest
+  and highest MAPQ, bracketing the true value.
 - `mappability_intervals` merges low runs into a `BedData`; `mask_calls` filters
   methylation calls in one pass per scaffold; `binned_mappability` gives
   `n_simulated`-weighted means per fixed bin.

@@ -17,7 +17,12 @@ using ..Data
 using ..Data.Methylation:
     MethylationData, CTX_CPG, find_calls_in_range, get_context, get_depth, meth_fraction
 using ..Data.Mappability:
-    MappabilityChannel, MappabilityData, metric_function, runs_in_range
+    MappabilityChannel,
+    MappabilityData,
+    expand_counts,
+    mapq_confidence,
+    metric_function,
+    runs_in_range
 
 #= Feature regions =#
 
@@ -265,6 +270,22 @@ function quantiles(data::TabularData; quantiles::Int = 4, merge = mean)
     end
 
     return result
+end
+
+"""
+    quantile_map(data::TabularData; quantiles = 4, merge = mean)
+
+Given a table, bin its features as the value-based [`quantiles`](@ref) does.
+Returns a `feature ID => quantile` `Dict` (1 = lowest), the shape
+[`quantile_profiles`](@ref) and [`values_by_quantile`](@ref) take.
+
+**NOTE:** a feature absent from `data` gets no entry; treat a missing key as
+unranked, not as quantile 0.
+"""
+function quantile_map(data::TabularData; quantiles::Int = 4, merge = mean)
+    # The keyword shadows the function, so the function is reached through the module.
+    binned = Exploration.quantiles(data; quantiles = quantiles, merge = merge)
+    return Dict{String,Int}(record.id => bin for (record, _, bin) in binned)
 end
 
 """
@@ -917,6 +938,144 @@ function feature_frequency(
     return MappabilityFrequency(data.channel, metric, features)
 end
 
+"""
+Given channels for one `(L, F)`, check they run from MAPQ cutoff 0 upwards with
+no repeats. Returns their cutoffs, or throws an `ArgumentError`.
+"""
+function _check_recall_channels(channels)
+    isempty(channels) && throw(ArgumentError("`channels` must be non-empty"))
+    cutoffs = [data.channel.mapq_cutoff for data in channels]
+    (issorted(cutoffs) && allunique(cutoffs) && first(cutoffs) == 0) ||
+        throw(ArgumentError("channels must run from MAPQ cutoff 0 upwards, got $cutoffs"))
+    allequal([(data.channel.L, data.channel.F) for data in channels]) || throw(ArgumentError("channels must share one L and F"))
+    return cutoffs
+end
+
+"""
+Given MAPQ cutoffs, weigh the band from each cutoff up to the next. Returns one
+weight per band: [`mapq_confidence`](@ref) of the band's lowest MAPQ with
+`bound = :lower`, of the next cutoff up (1 for the top band) with `:upper`.
+"""
+function _band_weights(cutoffs::AbstractVector{<:Integer}, bound::Symbol)
+    bound === :lower && return mapq_confidence.(cutoffs)
+    bound === :upper && return [mapq_confidence.(cutoffs[2:end]); 1.0]
+    throw(ArgumentError("`bound` must be :lower or :upper"))
+end
+
+"""
+Given each channel's `(n_simulated, n_correct, n_ectopic)` over one span (as
+`expand_counts` returns, cutoffs ascending) and the band weights, total the
+weighted correct fragments per base. Returns a `Vector{Float64}`.
+"""
+function _weighted_correct(counts, band_weights)
+    weighted = zeros(Float64, length(first(counts)[1]))
+    for band in eachindex(counts)
+        correct = counts[band][2]
+        above = band < length(counts) ? counts[band+1][2] : nothing
+        for offset in eachindex(weighted)
+            # Correct at this cutoff but not at the next: the fragments in this band.
+            in_band = Int(correct[offset]) - (isnothing(above) ? 0 : Int(above[offset]))
+            weighted[offset] += band_weights[band] * in_band
+        end
+    end
+    return weighted
+end
+
+"""
+Given each channel's runs over one region and the band weights, score each
+measured base as weighted correct fragments over `n_simulated`. Returns the
+region's [`FeatureRuns`](@ref), strand-oriented, weighted by `n_simulated`, with
+equal neighbours sharing a run.
+"""
+function _weighted_recall_runs(
+    channel_runs,
+    band_weights,
+    region_start::Int,
+    region_end::Int,
+    negative::Bool,
+)
+    first_base = max(1, region_start)
+    counts = [expand_counts(runs, first_base, region_end) for runs in channel_runs]
+    simulated = first(counts)[1]
+    weighted = _weighted_correct(counts, band_weights)
+
+    starts, stops, levels, weights = Int[], Int[], Float32[], UInt32[]
+    for (offset, n_simulated) in enumerate(simulated)
+        n_simulated == 0 && continue
+        base = first_base + offset - 1
+        level = Float32(weighted[offset] / n_simulated)
+        if !isempty(stops) &&
+           stops[end] == base - 1 &&
+           levels[end] == level &&
+           weights[end] == n_simulated
+            stops[end] = base
+        else
+            push!(starts, base)
+            push!(stops, base)
+            push!(levels, level)
+            push!(weights, n_simulated)
+        end
+    end
+    # A run's genomic stop is its region start on the negative strand.
+    to_region(bases) = _region_index.(bases, region_start, region_end, negative)
+    region_starts, region_stops =
+        negative ? (to_region(stops), to_region(starts)) :
+        (to_region(starts), to_region(stops))
+    negative && foreach(reverse!, (region_starts, region_stops, levels, weights))
+    return FeatureRuns(
+        region_end - region_start + 1,
+        region_starts,
+        region_stops,
+        levels,
+        weights,
+    )
+end
+
+"""
+    mapq_weighted_recall(genome, feature, channels; flank = 500, bound = :lower,
+                         features = nothing)
+
+Given one `(L, F)` at several MAPQ cutoffs from 0 up, score each base of every
+`feature`'s padded, strand-oriented region: correct fragments, each counting
+[`mapq_confidence`](@ref) of its MAPQ, over `n_simulated`. Returns a
+[`MappabilityFrequency`](@ref), limited to the IDs in `features` when given.
+
+**NOTE:** a MAPQ is known only by band between cutoffs. `bound = :lower` counts a
+band at its lowest MAPQ, `:upper` at the next cutoff (1 for the top band).
+"""
+function mapq_weighted_recall(
+    genome::Genome,
+    feature::Union{AbstractString,Symbol},
+    channels::AbstractVector{<:MappabilityData};
+    flank::Integer = 500,
+    bound::Symbol = :lower,
+    features = nothing,
+)
+    band_weights = _band_weights(_check_recall_channels(channels), bound)
+    recall = _by_scaffold(genome, feature, FeatureRuns) do scaffold_name, tree
+        scaffold_runs = Dict{String,FeatureRuns}()
+        all(data -> haskey(data, scaffold_name), channels) || return scaffold_runs
+        for interval in tree
+            region = _feature_region(genome, interval, flank; clip = false)
+            isnothing(region) && continue
+            feature_id, negative, region_start, region_end = region
+            isnothing(features) || feature_id in features || continue
+            channel_runs = [
+                runs_in_range(data[scaffold_name], max(1, region_start), region_end) for data in channels
+            ]
+            scaffold_runs[feature_id] = _weighted_recall_runs(
+                channel_runs,
+                band_weights,
+                region_start,
+                region_end,
+                negative,
+            )
+        end
+        scaffold_runs
+    end
+    return MappabilityFrequency(first(channels).channel, :mapq_weighted_recall, recall)
+end
+
 #= Metagene profiles =#
 
 """
@@ -1209,6 +1368,83 @@ function quantile_profiles(
 end
 
 """
+Given a `flank`, the step `flank_bin` to pool it in and the body bin count, list
+the profile slots each [`profile_matrix`](@ref) column pools. Returns a vector of
+ranges: the upstream flank in `flank_bin`-base steps, each body bin on its own,
+then the downstream flank.
+"""
+function _profile_columns(flank::Integer, flank_bin::Integer, body_bins::Integer)
+    (flank_bin >= 1 && flank % flank_bin == 0) || throw(
+        ArgumentError("`flank` ($flank) must be a multiple of `flank_bin` ($flank_bin)"),
+    )
+    flank_steps(offset) =
+        [(offset+step-flank_bin+1):(offset+step) for step = flank_bin:flank_bin:flank]
+    return [
+        flank_steps(0)
+        [slot:slot for slot = (flank+1):(flank+body_bins)]
+        flank_steps(flank + body_bins)
+    ]
+end
+
+"""
+Given one feature's levels and the [`_profile_columns`](@ref) `columns`, reduce
+its profile to one value per column, the weighted mean of the slots it pools.
+Returns a `Float32` vector, `NaN` where nothing was measured, or `nothing` when
+the region is too short for a profile.
+"""
+function _binned_profile(feature_levels, columns; flank::Integer, body_bins::Integer)
+    profile = gene_profile(feature_levels; flank = flank, body_bins = body_bins)
+    isnothing(profile) && return nothing
+    return map(columns) do slots
+        weight = sum(view(profile.weights, slots))
+        weight == 0 && return NaN32
+        return Float32(
+            sum(view(profile.levels, slots) .* view(profile.weights, slots)) / weight,
+        )
+    end
+end
+
+"""
+    profile_matrix(frequency, ids; flank, flank_bin, body_bins = 100,
+                   exclude = Set{String}())
+
+Given per-feature levels and an ordered list of feature `ids`, lay each profile
+out as a matrix row, row `r` holding `ids[r]`: the flanks pooled into
+`flank_bin`-base columns, the body bins one per column. Returns `(matrix,
+n_missing)`; widen the body for display with `Plotting.stretch_body_columns`.
+
+**NOTE:** an ID in `exclude`, absent from `frequency` or too short for a profile
+keeps an all-`NaN` row, so rows stay aligned with `ids`; `n_missing` counts them.
+"""
+function profile_matrix(
+    frequency::LevelFrequency,
+    ids::AbstractVector;
+    flank::Integer,
+    flank_bin::Integer,
+    body_bins::Integer = 100,
+    exclude = Set{String}(),
+)
+    columns = _profile_columns(flank, flank_bin, body_bins)
+    matrix = fill(NaN32, length(ids), length(columns))
+    # Not a `BitVector`: threads writing neighbouring bits would race on one word.
+    found = fill(false, length(ids))
+    Threads.@threads for row = 1:length(ids)
+        feature_id = String(ids[row])
+        (feature_id in exclude || !haskey(frequency.features, feature_id)) && continue
+        profile = _binned_profile(
+            frequency.features[feature_id],
+            columns;
+            flank = flank,
+            body_bins = body_bins,
+        )
+        isnothing(profile) && continue
+        matrix[row, :] .= profile
+        found[row] = true
+    end
+    return matrix, count(!, found)
+end
+
+"""
 Given a flank and the `feature`-type features of `genome`, find those whose
 padded region `[first - flank, last + flank]` runs off the start of their
 scaffold. Returns their IDs as a `Set{String}`, ready to pass as `exclude`.
@@ -1452,6 +1688,39 @@ function mean_finite(matrices)
     return map((total, count) -> count == 0 ? NaN : total / count, sums, counts)
 end
 
+"""
+Given a matrix, average consecutive rows in blocks of `block` over finite cells
+only, starting a new block at every row in `breaks` as well, so none straddles
+one (the block before a break may be shorter). Returns `(blocked, edges)`, block
+`k` spanning rows `edges[k]:edges[k + 1] - 1`; a cell with nothing finite is `NaN`.
+"""
+function block_rows(matrix::AbstractMatrix, block::Integer; breaks = Int[])
+    block >= 1 || throw(ArgumentError("`block` must be positive (got $block)"))
+    n_rows = size(matrix, 1)
+    segment_starts = sort!(unique!([1; filter(row -> 1 < row <= n_rows, collect(breaks))]))
+    segment_stops = [segment_starts[2:end] .- 1; n_rows]
+    edges = [
+        reduce(
+            vcat,
+            [
+                collect(start:block:stop) for
+                (start, stop) in zip(segment_starts, segment_stops)
+            ],
+        )
+        n_rows + 1
+    ]
+    blocked = map(
+        Iterators.product(1:(length(edges)-1), axes(matrix, 2)),
+    ) do (block_index, column)
+        finite = filter(
+            isfinite,
+            view(matrix, edges[block_index]:(edges[block_index+1]-1), column),
+        )
+        isempty(finite) ? NaN32 : Float32(mean(finite))
+    end
+    return blocked, edges
+end
+
 export coverage,
     kde,
     quantiles,
@@ -1469,11 +1738,15 @@ export coverage,
     mean_gene_profile,
     quantile_profiles,
     clipped_features,
+    mapq_weighted_recall,
+    profile_matrix,
+    quantile_map,
     tss_window,
     values_by_quantile,
     values_by_rank,
     moving_average,
     zscore_finite,
-    mean_finite
+    mean_finite,
+    block_rows
 
 end

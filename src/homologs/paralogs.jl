@@ -6,6 +6,7 @@ See [`Orthologs`](@ref) for the between-genome counterpart.
 """
 module Paralogs
 
+using CSV
 using DataFrames
 using Graphs
 using SimpleWeightedGraphs
@@ -1458,8 +1459,212 @@ function rbh_ds(paralog_df::DataFrame)
     )
 end
 
+#= Loading divergence tables and ranking by age =#
+
+"""
+The divergence-pipeline columns [`load_divergence`](@ref) reads, each paired with
+the name [`ParalogGroup`](@ref) matches it by.
+"""
+const DIVERGENCE_COLUMNS = (
+    "gene_a" => "query",
+    "gene_b" => "subject",
+    "pct_id_a_in_b" => "id_subject_query",
+    "pct_id_b_in_a" => "id_query_subject",
+    "tree_dS" => "dS",
+    "tree_dN" => "dN",
+)
+
+"""Given a table cell, read it as a `Float64`. Returns `NaN` for `missing` (an `NA`)."""
+_rate_or_nan(value) = ismissing(value) ? NaN : Float64(value)
+
+"""
+    load_divergence(path; min_identity) -> DataFrame
+
+Given a divergence-pipeline CSV, keep the pairs at least `min_identity` percent
+identical both ways with a finite dS. Returns the [`DIVERGENCE_COLUMNS`](@ref),
+renamed for [`ParalogGroup`](@ref), `NA` read as `NaN`, dS made non-negative.
+
+**NOTE:** a pair with no dN recorded is kept, as `NaN`; `ParalogGroup` drops it.
+"""
+function load_divergence(path::AbstractString; min_identity::Real)
+    raw = CSV.read(path, DataFrame; missingstring = "NA")
+    absent = [column for (column, _) in DIVERGENCE_COLUMNS if !(column in names(raw))]
+    isempty(absent) ||
+        throw(ArgumentError("\"$path\" lacks divergence columns: $(join(absent, ", "))"))
+    pairs = DataFrame(
+        "query" => String.(raw.gene_a),
+        "subject" => String.(raw.gene_b),
+        "id_subject_query" => _rate_or_nan.(raw.pct_id_a_in_b),
+        "id_query_subject" => _rate_or_nan.(raw.pct_id_b_in_a),
+        "dS" => abs.(_rate_or_nan.(raw.tree_dS)),
+        "dN" => _rate_or_nan.(raw.tree_dN),
+    )
+    # NaN fails `>=`, so a missing identity drops its pair too.
+    keep =
+        (pairs.id_subject_query .>= min_identity) .&
+        (pairs.id_query_subject .>= min_identity) .& isfinite.(pairs.dS)
+    return pairs[keep, :]
+end
+
+"""
+    load_paralogs(path, genome; min_identity, converter = identity,
+                  duplications = nothing, species = nothing) -> ParalogGroup
+
+Given a divergence-pipeline CSV, build its [`ParalogGroup`](@ref) over `genome`
+(see [`load_divergence`](@ref)), with `converter` mapping each gene name to
+`genome`'s ID. Returns the group, annotated by [`add_duplications_of`](@ref) when
+an OrthoFinder `duplications` file is given for `species`.
+"""
+function load_paralogs(
+    path::AbstractString,
+    genome::Reference.Genome;
+    min_identity::Real,
+    converter = identity,
+    duplications::Union{Nothing,AbstractString} = nothing,
+    species::Union{Nothing,AbstractString} = nothing,
+)
+    isnothing(duplications) == isnothing(species) ||
+        throw(ArgumentError("pass `duplications` and `species` together"))
+    pairs = load_divergence(path; min_identity = min_identity)
+    pairs.query = converter.(pairs.query)
+    pairs.subject = converter.(pairs.subject)
+    group = ParalogGroup(genome, pairs)
+    isnothing(duplications) && return group
+    return add_duplications_of(group, duplications, species; transform = converter)
+end
+
+"""
+Given a `protein_to_gene.csv` (columns `gene`, `protein`), map each protein
+accession to its NCBI gene ID. Returns a `Dict` for [`protein_to_gene`](@ref).
+
+**NOTE:** an NCBI GFF3 names a gene feature `gene-<symbol>`, so that prefix is added.
+"""
+function load_protein_map(path::AbstractString)
+    table = CSV.read(path, DataFrame)
+    return Dict(
+        String(protein) => "gene-" * String(gene) for
+        (gene, protein) in zip(table.gene, table.protein)
+    )
+end
+
+"""
+Given a protein accession and a [`load_protein_map`](@ref) `mapping`, find its
+gene ID, retrying without the version suffix, without a leading `<prefix>-`, and
+without a leading `<species>_`. Returns the gene ID, or `protein_id` unchanged
+when nothing matches, so that it simply matches no genome feature.
+"""
+function protein_to_gene(
+    protein_id::AbstractString,
+    mapping::AbstractDict{<:AbstractString,<:AbstractString},
+)
+    candidates = (
+        protein_id,
+        first(split(protein_id, '.')),
+        last(split(protein_id, '-')),
+        join(split(protein_id, '_')[2:end], "_"),
+    )
+    for candidate in candidates
+        haskey(mapping, candidate) && return mapping[candidate]
+    end
+    return String(protein_id)
+end
+
+"""
+Given a pair's `(lca_depth, dS, dN)`, order it by age. Returns a key that sorts
+youngest first: deepest `lca_depth` (the most recent split), then lowest dS and dN.
+"""
+_age_key((lca_depth, dS, dN)) = (-lca_depth, dS, dN)
+
+"""
+Given a pair table, check it carries finite, non-negative `lca_depth`s and the
+`dS` and `dN` columns. Returns `nothing`, or throws an `ArgumentError`.
+"""
+function _check_age_columns(pairs::DataFrame)
+    absent = setdiff(["dS", "dN", "lca_depth"], names(pairs))
+    isempty(absent) || throw(ArgumentError("`pairs` lacks columns: $(join(absent, ", "))"))
+    all(depth -> isfinite(depth) && depth >= 0, pairs.lca_depth) ||
+        throw(ArgumentError("`lca_depth` must be finite and non-negative"))
+    return nothing
+end
+
+"""
+    rank_by_age(pairs::DataFrame) -> DataFrame
+    rank_by_age(pg::ParalogGroup) -> DataFrame
+
+Given pairs shaped like [`pair_table`](@ref)'s, with `dS`, `dN` and `lca_depth`,
+rank every gene by its youngest pair (see [`_age_key`](@ref)). Returns one row
+per gene, `ID`, `lca_depth`, `dS`, `dN` and `rank`, rank 1 being the youngest;
+exact ties are ordered by ID.
+"""
+function rank_by_age(pairs::DataFrame)
+    _check_age_columns(pairs)
+    best = Dict{String,NTuple{3,Float64}}()
+    for (query, subject, lca_depth, dS, dN) in
+        zip(pairs[!, 1], pairs[!, 2], pairs.lca_depth, pairs.dS, pairs.dN)
+        age = (Float64(lca_depth), Float64(dS), Float64(dN))
+        for gene in (String(query), String(subject))
+            current = get(best, gene, nothing)
+            (isnothing(current) || _age_key(age) < _age_key(current)) && (best[gene] = age)
+        end
+    end
+    genes = sort!(collect(keys(best)); by = gene -> (_age_key(best[gene])..., gene))
+    return DataFrame(
+        :ID => genes,
+        :lca_depth => [best[gene][1] for gene in genes],
+        :dS => [best[gene][2] for gene in genes],
+        :dN => [best[gene][3] for gene in genes],
+        :rank => 1:length(genes),
+    )
+end
+
+rank_by_age(pg::ParalogGroup) = rank_by_age(pair_table(pg))
+
+"""Given a [`rank_by_age`](@ref) table, map each gene ID to its rank (1 = youngest)."""
+age_ranks(ranked::DataFrame) = Dict(zip(String.(ranked.ID), ranked.rank))
+
+"""
+Given an OrthoFinder `Duplications.tsv` path and a species, read the species tree
+beside it. Returns that species' [`lineage_splits`](@ref).
+"""
+load_lineage(duplications::AbstractString, species::AbstractString) =
+    lineage_splits(read(species_tree_path(duplications), String), species)
+
+"""
+Given an `lca_depth` and a [`load_lineage`](@ref) lineage, name the split every
+younger duplication followed. Returns e.g. `"← after human, chimp split"`.
+
+**NOTE:** OrthoFinder places a duplication on the branch leading *into* its node,
+so the label is the parent node's split.
+"""
+_split_label(
+    depth::Integer,
+    lineage,
+) = "← after $(join(last(lineage[depth-1]), ", ")) split"
+
+"""
+Given a [`rank_by_age`](@ref) table and its species' lineage, find the end of
+each `lca_depth` block but the oldest. Returns `(positions, labels)`, positions
+half a rank past each block and labels naming the split every gene left of it
+duplicated after, ready for `Plotting.mark_positions!(axis, positions, labels)`.
+"""
+function duplication_marks(ranked::DataFrame, lineage)
+    ends = [
+        row for row = 1:(nrow(ranked)-1) if ranked.lca_depth[row] != ranked.lca_depth[row+1]
+    ]
+    labels = [_split_label(Int(depth), lineage) for depth in ranked.lca_depth[ends]]
+    return ranked.rank[ends] .+ 0.5, labels
+end
+
 export ParalogGroup,
     add_duplications_of,
+    age_ranks,
+    duplication_marks,
+    load_divergence,
+    load_lineage,
+    load_paralogs,
+    load_protein_map,
+    protein_to_gene,
+    rank_by_age,
     dN_graph,
     dS_graph,
     edge_identity,

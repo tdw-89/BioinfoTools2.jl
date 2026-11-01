@@ -182,6 +182,88 @@ function violin_box!(
 end
 
 """
+Given `values` grouped by integer `bins`, draw each group as a boxplot. Returns
+the new `Axis`, placed at `position`, with a tick per bin up to `n_bins`.
+"""
+function quantile_boxplot!(
+    position,
+    bins::AbstractVector{<:Integer},
+    values::AbstractVector{<:Real};
+    title::AbstractString = "",
+    xlabel::AbstractString = "quantile",
+    ylabel::AbstractString = "",
+    n_bins::Integer = maximum(bins; init = 0),
+)
+    axis =
+        Axis(position; title = title, xlabel = xlabel, ylabel = ylabel, xticks = 1:n_bins)
+    isempty(bins) && return axis
+    boxplot!(
+        axis,
+        bins,
+        values;
+        color = :steelblue,
+        strokecolor = :black,
+        strokewidth = 0.5,
+    )
+    return axis
+end
+
+"""
+Given a `blocks × positions` metagene matrix whose rows are blocks of ranks,
+block `k` spanning ranks `rank_edges[k]` to `rank_edges[k + 1]`, draw it as a
+heatmap, lowest rank at the bottom. Returns `(axis, plot)` placed at `position`.
+
+`flank` is in bp and `flank_columns` the columns each flank spans, so the ticks
+read in bp however the flanks were pooled. `NaN` cells are grey; values beyond
+`colorrange` take the end colours, or `lowclip`/`highclip` when given.
+"""
+function rank_heatmap!(
+    position,
+    matrix::AbstractMatrix,
+    rank_edges::AbstractVector{<:Real};
+    flank::Integer,
+    flank_columns::Integer,
+    title::AbstractString = "",
+    ylabel::AbstractString = "rank",
+    colormap = :viridis,
+    colorrange = CairoMakie.Makie.automatic,
+    highclip = nothing,
+    lowclip = nothing,
+)
+    n_columns = size(matrix, 2)
+    size(matrix, 1) == length(rank_edges) - 1 || throw(
+        DimensionMismatch("`rank_edges` must have one more entry than `matrix` has rows"),
+    )
+    body_end = n_columns - flank_columns
+    axis = Axis(
+        position;
+        title = title,
+        ylabel = ylabel,
+        xticks = (
+            [0.5, flank_columns + 0.5, body_end + 0.5, n_columns + 0.5],
+            ["-$(flank) bp", "TSS", "TES", "+$(flank) bp"],
+        ),
+    )
+    clips = (;
+        (isnothing(highclip) ? (;) : (; highclip = highclip))...,
+        (isnothing(lowclip) ? (;) : (; lowclip = lowclip))...,
+    )
+    plot = heatmap!(
+        axis,
+        0.5:1:(n_columns+0.5),
+        rank_edges .- 0.5,
+        permutedims(matrix);
+        colormap = colormap,
+        colorrange = colorrange,
+        nan_color = :gray80,
+        clips...,
+    )
+    vlines!(axis, [flank_columns + 0.5, body_end + 0.5]; color = :white, linestyle = :dash)
+    limits!(axis, 0.5, n_columns + 0.5, first(rank_edges) - 0.5, last(rank_edges) - 0.5)
+    return axis, plot
+end
+
+"""
 Given `values` along `positions` and a smoothed `trend` over the same positions
 (e.g. `Exploration.moving_average`), draw the values as faint points and the
 trend as a line over them, labelled `trend_label` for a legend. Returns the new
@@ -308,15 +390,55 @@ function mark_positions!(
     return axis
 end
 
+"""
+Given y `positions` and their `labels`, rule each across `axis` and label it at
+the right edge, above the rule, or below it when the rule is too near the top to
+fit one. Returns `axis`.
+
+**NOTE:** like [`mark_positions!`](@ref), the labels are placed against the
+limits at the time of the call, so draw the data first.
+"""
+function mark_rows!(
+    axis,
+    positions::AbstractVector{<:Real},
+    labels::AbstractVector{<:AbstractString};
+    color = :white,
+)
+    length(positions) == length(labels) ||
+        throw(DimensionMismatch("`labels` must run parallel to `positions`"))
+    hlines!(axis, positions; color = color, linewidth = 1)
+    reset_limits!(axis)
+    limits = axis.finallimits[]
+    right = limits.origin[1] + limits.widths[1]
+    top = limits.origin[2] + limits.widths[2]
+    for (row_position, label) in zip(positions, labels)
+        above = row_position < top - 0.02 * limits.widths[2]
+        text!(
+            axis,
+            right,
+            row_position;
+            text = label,
+            align = (:right, above ? :bottom : :top),
+            offset = (-4, above ? 2 : -2),
+            fontsize = 11,
+            color = color,
+        )
+    end
+    return axis
+end
+
 export metagene_xticks,
     metagene_boundaries,
     stretch_body_columns,
     metagene_lines!,
     metagene_heatmap!,
     violin_box!,
+    quantile_boxplot!,
+    rank_heatmap!,
     trend_plot!,
     overlay_trend!,
     probability_plot!,
-    mark_positions!
+    mark_positions!,
+    mark_rows!
 
 end
