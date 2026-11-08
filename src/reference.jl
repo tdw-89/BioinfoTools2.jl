@@ -115,17 +115,157 @@ from IDs when present. Prefixes can be stacked (`gene:transcript:...`).
 """
 function sanitize_id(id::AbstractString)
     cleaned = String(id)
-    while true
+    # Every prefix ends in ':', so an ID without one skips the regex.
+    while occursin(':', cleaned)
         matched = match(r"^(gene|transcript|mrna|rna|cds|protein):(.+)$"i, cleaned)
         matched === nothing && return cleaned
         cleaned = String(matched.captures[2])
     end
+    return cleaned
 end
 
-"""Single value of GFF3 attribute `key`, or `"NA"` when absent or multi-valued."""
-function attribute_or_na(attributes::Dict, key::String)
-    found = get(attributes, key, nothing)
-    return (found === nothing || length(found) != 1) ? "NA" : only(found)
+"""The GFF3 attribute a feature's biotype is read from (NCBI's convention)."""
+const BIOTYPE_KEY = "gene_biotype"
+
+"""
+Given a string and a byte range of `data`, compare them without allocating.
+Returns `true` when the bytes are exactly the string's.
+"""
+@inline function _bytes_equal(text::String, data::Vector{UInt8}, range::UnitRange{Int})
+    sizeof(text) == length(range) || return false
+    isempty(range) && return true
+    return GC.@preserve text data ccall(
+        :memcmp,
+        Cint,
+        (Ptr{UInt8}, Ptr{UInt8}, Csize_t),
+        pointer(text),
+        pointer(data, first(range)),
+        length(range),
+    ) == 0
+end
+
+"""
+Single value of GFF3 attribute `key` on `record`, or `"NA"` when absent or
+multi-valued. Only that attribute is decoded; a repeated key reads its last copy.
+"""
+function attribute_or_na(record::GFF3.Record, key::String)
+    found = 0
+    for (index, key_range) in enumerate(record.attribute_keys)
+        _bytes_equal(key, record.data, key_range) && (found = index)
+    end
+    found == 0 && return "NA"
+    values = GFF3.attrvals(record, found)
+    return length(values) == 1 ? only(values) : "NA"
+end
+
+"""
+Each distinct type column one load has met, as raw bytes, beside the SO short
+code it loads under: `0` when the type is not a SOFA term or not in `wanted`
+(`nothing` wants every term). Saves resolving `SO_TERMS` once per record.
+"""
+struct FeatureTypeCache
+    labels::Vector{String}
+    codes::Vector{UInt16}
+    wanted::Union{Nothing,Set{UInt16}}
+end
+
+"""Create an empty `FeatureTypeCache` keeping the SO codes in `wanted` (`nothing`: all)."""
+FeatureTypeCache(wanted::Union{Nothing,Set{UInt16}} = nothing) =
+    FeatureTypeCache(String[], UInt16[], wanted)
+
+"""
+Given a record, resolve its type column through `cache`, adding the type on a
+miss. Returns the SO short code to load it under, `0` to skip it.
+"""
+function _so_code!(cache::FeatureTypeCache, record::GFF3.Record)
+    for (slot, label) in enumerate(cache.labels)
+        _bytes_equal(label, record.data, record.type_) && return cache.codes[slot]
+    end
+    code = something(convert_so_term(GFF3.featuretype(record)), 0x0000)
+    wanted = cache.wanted
+    isnothing(wanted) || code in wanted || (code = 0x0000)
+    push!(cache.labels, String(record.data[record.type_]))
+    push!(cache.codes, code)
+    return code
+end
+
+"""
+The last value decoded from one GFF3 column, under the raw bytes it came from,
+so a run of records on one scaffold (or from one source) shares one `String`.
+"""
+mutable struct ColumnCache
+    raw::String
+    value::String
+end
+
+"""Create an empty `ColumnCache`: no column holds a tab, so its first lookup misses."""
+ColumnCache() = ColumnCache("\t", "")
+
+"""
+Given a record and its column's byte `range`, return the cached value when the
+bytes match, else `read_value(record)`, caching it.
+"""
+@inline function _column!(read_value, cache::ColumnCache, record::GFF3.Record, range)
+    _bytes_equal(cache.raw, record.data, range) && return cache.value
+    cache.value = read_value(record)
+    cache.raw = String(record.data[range])
+    return cache.value
+end
+
+"""The source column of `record`, `"NA"` when it is `.`."""
+_source_or_na(record::GFF3.Record) = GFF3.hassource(record) ? GFF3.source(record) : "NA"
+
+"""
+Everything one load decides up front — which SO codes and biotypes to keep
+(`nothing` keeps all), whether to sanitize IDs — plus its column caches.
+"""
+struct RecordParser
+    sanitize_ids::Bool
+    biotypes::Union{Nothing,Set{String}}
+    types::FeatureTypeCache
+    scaffolds::ColumnCache
+    sources::ColumnCache
+end
+
+"""
+Create a `RecordParser`, taking `feature_types` and `biotypes` as
+`_wanted_types`/`_wanted_biotypes` return them.
+"""
+RecordParser(;
+    sanitize_ids::Bool = true,
+    feature_types::Union{Nothing,Set{UInt16}} = nothing,
+    biotypes::Union{Nothing,Set{String}} = nothing,
+) = RecordParser(
+    sanitize_ids,
+    biotypes,
+    FeatureTypeCache(feature_types),
+    ColumnCache(),
+    ColumnCache(),
+)
+
+"""
+Given a record, reduce it to a [`ParseResult`](@ref) carrying `meta_index`.
+Returns `nothing` for a type or biotype `parser` does not keep; the type is
+checked first, so a skipped type costs no attribute decoding.
+"""
+function _parse!(parser::RecordParser, record::GFF3.Record, meta_index::UInt32)
+    so_term = _so_code!(parser.types, record)
+    so_term == 0x0000 && return nothing
+    biotype = attribute_or_na(record, BIOTYPE_KEY)
+    wanted = parser.biotypes
+    isnothing(wanted) || biotype in wanted || return nothing
+
+    feature_id = attribute_or_na(record, "ID")
+    parser.sanitize_ids && (feature_id = sanitize_id(feature_id))
+    return ParseResult(
+        _column!(GFF3.seqname, parser.scaffolds, record, record.seqid),
+        UInt32(GFF3.seqstart(record)),
+        UInt32(GFF3.seqend(record)),
+        pack_metadata(meta_index, strand_code(GFF3.strand(record)), so_term),
+        feature_id,
+        _column!(_source_or_na, parser.sources, record, record.source),
+        biotype,
+    )
 end
 
 """
@@ -133,28 +273,8 @@ Reduce a GFF3 record to a [`ParseResult`](@ref) carrying metadata index
 `meta_index`, or `nothing` when its feature type is not a known SO term.
 Feature IDs are stripped of type prefixes unless `sanitize_ids` is `false`.
 """
-function parse_record(
-    record::GFF3.Record,
-    meta_index::UInt32;
-    sanitize_ids::Bool = true,
-)::Union{Nothing,ParseResult}
-    so_term = convert_so_term(GFF3.featuretype(record))
-    isnothing(so_term) && return nothing
-
-    attributes = Dict(GFF3.attributes(record))
-    feature_id = attribute_or_na(attributes, "ID")
-    sanitize_ids && (feature_id = sanitize_id(feature_id))
-
-    return ParseResult(
-        GFF3.seqname(record),
-        UInt32(GFF3.seqstart(record)),
-        UInt32(GFF3.seqend(record)),
-        pack_metadata(meta_index, strand_code(GFF3.strand(record)), so_term),
-        feature_id,
-        GFF3.hassource(record) ? GFF3.source(record) : "NA",
-        attribute_or_na(attributes, "gene_biotype"),
-    )
-end
+parse_record(record::GFF3.Record, meta_index::UInt32; sanitize_ids::Bool = true) =
+    _parse!(RecordParser(; sanitize_ids), record, meta_index)
 
 #= Metadata store =#
 
@@ -394,30 +514,40 @@ function _intern_string!(genome::Genome, s::String)
 end
 
 """
+Given a genome, the metadata index its next loaded feature takes. Returns one
+past the features already stored (`meta_offsets` ends in a sentinel once loaded).
+"""
+_next_meta_index(genome::Genome) = UInt32(max(length(genome.meta_offsets), 1))
+
+"""
 Given a channel of parsed record batches, drain it into `genome` — intervals and
 metadata blob alike. Returns `nothing`; runs on its own task, so that committing
 overlaps [`add_features!`](@ref)'s parsing.
 """
 function _build_genome!(channel::Channel{Vector{ParseResult}}, genome::Genome)
-    for batch in channel
-        for result in batch
+    # A previous load's closing sentinel is exactly this load's first offset.
+    isempty(genome.meta_offsets) || pop!(genome.meta_offsets)
+    scaffold = nothing
+    for batch in channel, result in batch
+        if isnothing(scaffold) || scaffold.name != result.scaffold_id
             scaffold = get!(genome.scaffolds, result.scaffold_id) do
                 Scaffold(result.scaffold_id, IntervalTreeM64())
             end
-            push!(
-                scaffold.features,
-                IntervalValue(result.start_pos, result.end_pos, result.code),
-            )
+        end
+        push!(
+            scaffold.features,
+            IntervalValue(result.start_pos, result.end_pos, result.code),
+        )
 
-            push!(genome.meta_offsets, UInt32(length(genome.meta_blob) + 1))
-            for field in (result.id, result.source, result.biotype)
-                _append_token!(genome.meta_blob, _intern_string!(genome, field))
-            end
+        push!(genome.meta_offsets, UInt32(length(genome.meta_blob) + 1))
+        for field in (result.id, result.source, result.biotype)
+            _append_token!(genome.meta_blob, _intern_string!(genome, field))
         end
     end
 
     # Sentinel offset so the last feature's end byte can be computed.
     push!(genome.meta_offsets, UInt32(length(genome.meta_blob) + 1))
+    return nothing
 end
 
 """
@@ -430,25 +560,24 @@ gzip_stream(handle::IO, path::AbstractString) =
 
 """
 Given an open GFF3 reader, parse its records onto `channel` in batches of
-[`RECORD_BUFFER`](@ref). Returns `nothing`; records whose feature type is not a
-known SO term are skipped, and do not consume a metadata index.
+[`RECORD_BUFFER`](@ref), numbering them from `meta_index`. Returns `nothing`;
+directives, comments and records `parser` skips consume no metadata index.
 """
 function _batch_records!(
     channel::Channel{Vector{ParseResult}},
     reader::GFF3.Reader,
-    sanitize_ids::Bool,
+    parser::RecordParser,
+    meta_index::UInt32,
 )
     record = GFF3.Record()
-    # meta_index is 1-based: it becomes the array index used by get_metadata
-    meta_index = UInt32(1)
     buffer = sizehint!(ParseResult[], RECORD_BUFFER)
 
     while !eof(reader)
         # No need to `empty!` record; GFF3.jl does that inside `read!`
         read!(reader, record)
-        BioGenerics.isfilled(record) || continue
+        (BioGenerics.isfilled(record) && GFF3.isfeature(record)) || continue
 
-        result = parse_record(record, meta_index; sanitize_ids = sanitize_ids)
+        result = _parse!(parser, record, meta_index)
         isnothing(result) && continue
 
         push!(buffer, result)
@@ -464,22 +593,70 @@ function _batch_records!(
 end
 
 """
-Given a GFF3 file (optionally gzipped), add every feature whose type is a known
-SO term to `genome`. Returns `nothing`; feature IDs are stripped of type
-prefixes unless `sanitize_ids` is `false` (see [`sanitize_id`](@ref)).
-
-The main task batches parsed records onto a channel while a spawned task commits
-them, so parsing and tree construction overlap.
+Given SO term labels (one, several, or `nothing`), resolve their short codes.
+Returns a `Set{UInt16}`, or `nothing` to keep every type; throws an
+`ArgumentError` on a label that is not a SOFA term.
 """
-function add_features!(gff_path::String, genome::Genome; sanitize_ids::Bool = true)
+_wanted_types(::Nothing) = nothing
+_wanted_types(label::Union{Symbol,AbstractString}) = _wanted_types((label,))
+function _wanted_types(labels)
+    codes = Set{UInt16}()
+    for label in labels
+        found = SO_TERMS[Symbol(label)]
+        isnothing(found) && throw(ArgumentError("`$label` is not a SOFA feature type"))
+        push!(codes, found[1])
+    end
+    return codes
+end
+
+"""
+Given biotypes (one, several, or `nothing`), collect them. Returns a
+`Set{String}`, or `nothing` to keep every biotype.
+"""
+_wanted_biotypes(::Nothing) = nothing
+_wanted_biotypes(biotype::Union{Symbol,AbstractString}) = Set([String(biotype)])
+_wanted_biotypes(biotypes) = Set{String}(String(biotype) for biotype in biotypes)
+
+"""
+    add_features!(gff_path, genome; sanitize_ids, feature_types, biotypes)
+
+Given a GFF3 file (optionally gzipped), add its SOFA-typed features to `genome`.
+Returns `nothing`. `feature_types` (SO labels, e.g. `:gene`) and `biotypes`
+(`gene_biotype` values, e.g. `"protein_coding"`) each keep only matching records;
+`nothing` keeps all. IDs lose type prefixes unless `sanitize_ids` is `false`.
+
+**NOTE:** a record without `gene_biotype` (in NCBI files every `mRNA`, `exon` and
+`CDS`) has biotype `"NA"`, so `biotypes` drops it unless `"NA"` is listed.
+Types SOFA lacks (NCBI's `lncRNA`, `V_gene_segment`) never load, and naming one throws.
+"""
+function add_features!(
+    gff_path::String,
+    genome::Genome;
+    sanitize_ids::Bool = true,
+    feature_types = nothing,
+    biotypes = nothing,
+)
+    parser = RecordParser(;
+        sanitize_ids,
+        feature_types = _wanted_types(feature_types),
+        biotypes = _wanted_biotypes(biotypes),
+    )
+    # Read before the builder spawns: it pops the previous load's sentinel.
+    first_index = _next_meta_index(genome)
     # Unbounded channel so the parser never blocks waiting for the builder
     channel = Channel{Vector{ParseResult}}(Inf)
     builder_task = Threads.@spawn _build_genome!(channel, genome)
 
     open(gff_path) do handle
-        reader = GFF3.Reader(gzip_stream(handle, gff_path))
+        # A skipped line is consumed silently, and GFF3.jl then throws `EOFError`
+        # when only such lines (NCBI's closing `###`) follow the last record.
+        reader = GFF3.Reader(
+            gzip_stream(handle, gff_path);
+            skip_directives = false,
+            skip_comments = false,
+        )
         try
-            _batch_records!(channel, reader, sanitize_ids)
+            _batch_records!(channel, reader, parser, first_index)
         finally
             close(reader)
             close(channel)
@@ -487,11 +664,11 @@ function add_features!(gff_path::String, genome::Genome; sanitize_ids::Bool = tr
     end
 
     wait(builder_task)
+    return nothing
 end
 
-function add_features!(gff_path::String, species::Species; sanitize_ids::Bool = true)
-    add_features!(gff_path, species.genome; sanitize_ids = sanitize_ids)
-end
+add_features!(gff_path::String, species::Species; options...) =
+    add_features!(gff_path, species.genome; options...)
 
 #= Base.show overloads =#
 
