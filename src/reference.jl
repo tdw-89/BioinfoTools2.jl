@@ -559,6 +559,17 @@ gzip_stream(handle::IO, path::AbstractString) =
     endswith(path, ".gz") ? GzipDecompressorStream(handle) : handle
 
 """
+Given an open GFF3 file handle and its path, wrap it in a reader that keeps
+directives and comments. Returns that `GFF3.Reader`; callers skip non-feature
+records themselves.
+
+**NOTE:** GFF3.jl consumes a skipped line silently, then throws `EOFError` when
+only such lines (NCBI's closing `###`) follow the last record.
+"""
+_gff_reader(handle::IO, path::AbstractString) =
+    GFF3.Reader(gzip_stream(handle, path); skip_directives = false, skip_comments = false)
+
+"""
 Given an open GFF3 reader, parse its records onto `channel` in batches of
 [`RECORD_BUFFER`](@ref), numbering them from `meta_index`. Returns `nothing`;
 directives, comments and records `parser` skips consume no metadata index.
@@ -648,13 +659,7 @@ function add_features!(
     builder_task = Threads.@spawn _build_genome!(channel, genome)
 
     open(gff_path) do handle
-        # A skipped line is consumed silently, and GFF3.jl then throws `EOFError`
-        # when only such lines (NCBI's closing `###`) follow the last record.
-        reader = GFF3.Reader(
-            gzip_stream(handle, gff_path);
-            skip_directives = false,
-            skip_comments = false,
-        )
+        reader = _gff_reader(handle, gff_path)
         try
             _batch_records!(channel, reader, parser, first_index)
         finally
@@ -669,6 +674,81 @@ end
 
 add_features!(gff_path::String, species::Species; options...) =
     add_features!(gff_path, species.genome; options...)
+
+"""
+Given a GFF3 file, read the links [`protein_gene_map`](@ref) climbs. Returns
+`(genes, parents, cds_parents)`: the gene IDs, every other feature's `ID =>
+Parent` (exons, which parent nothing, aside) and each CDS's `protein_id => Parent`.
+"""
+function _protein_links(gff_path::String, sanitize_ids::Bool)
+    gene_code, cds_code, exon_code = (SO_TERMS[term][1] for term in (:gene, :CDS, :exon))
+    types = FeatureTypeCache()
+    clean(id) = sanitize_ids ? sanitize_id(id) : id
+    genes, parents, cds_parents =
+        Set{String}(), Dict{String,String}(), Dict{String,String}()
+
+    open(gff_path) do handle
+        reader = _gff_reader(handle, gff_path)
+        record = GFF3.Record()
+        try
+            while !eof(reader)
+                read!(reader, record)
+                (BioGenerics.isfilled(record) && GFF3.isfeature(record)) || continue
+                code = _so_code!(types, record)
+                code == exon_code && continue
+                id = attribute_or_na(record, "ID")
+                if code == gene_code
+                    id == "NA" || push!(genes, clean(id))
+                    continue
+                end
+                parent = attribute_or_na(record, "Parent")
+                parent == "NA" && continue
+                if code == cds_code
+                    protein = attribute_or_na(record, "protein_id")
+                    protein == "NA" || (cds_parents[protein] = clean(parent))
+                elseif id != "NA"
+                    parents[clean(id)] = clean(parent)
+                end
+            end
+        finally
+            close(reader)
+        end
+    end
+    return (; genes, parents, cds_parents)
+end
+
+"""
+Given a feature ID, follow `parents` up to a gene. Returns that gene's ID, or
+`nothing` when the chain ends (or cycles) before reaching one.
+"""
+function _climb_to_gene(id::String, parents::Dict{String,String}, genes::Set{String})
+    for _ = 0:length(parents)
+        id in genes && return id
+        next_id = get(parents, id, nothing)
+        isnothing(next_id) && return nothing
+        id = next_id
+    end
+    return nothing
+end
+
+"""
+    protein_gene_map(gff_path; sanitize_ids = true)
+
+Given a GFF3 file (optionally gzipped), follow each CDS's `protein_id` up its
+`Parent` chain (CDS → mRNA → gene, or CDS → gene) to a `gene` record. Returns a
+`protein_id => gene ID` `Dict`, IDs sanitized as [`add_features!`](@ref) would, so
+they match a genome loaded with the same `sanitize_ids`. Exact where
+`"gene-" * symbol` is not (`gene-TRNAK-UUU-2`); a chain reaching no gene is left out.
+"""
+function protein_gene_map(gff_path::String; sanitize_ids::Bool = true)
+    links = _protein_links(gff_path, sanitize_ids)
+    proteins = Dict{String,String}()
+    for (protein, parent) in links.cds_parents
+        gene = _climb_to_gene(parent, links.parents, links.genes)
+        isnothing(gene) || (proteins[protein] = gene)
+    end
+    return proteins
+end
 
 #= Base.show overloads =#
 
@@ -721,6 +801,7 @@ export FeatureRecord,
     parse_record,
     parse_so_term,
     parse_strand,
+    protein_gene_map,
     sanitize_id,
     strand_code
 
