@@ -10,3 +10,11 @@ REFERENCE_SUITE["add_features! - Single"] =
         gff_file_path = GFF_SINGLE,
         test_genome = Species("C. elegans").genome,
     )
+
+REFERENCE_SUITE["add_features! - Single, protein-coding genes"] =
+    @benchmarkable add_features!(
+        gff_file_path,
+        test_genome;
+        feature_types = :gene,
+        biotypes = "protein_coding",
+    ) setup(gff_file_path = GFF_SINGLE, test_genome = Species("C. elegans").genome)
