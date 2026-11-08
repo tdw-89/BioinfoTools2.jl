@@ -636,12 +636,14 @@ id_query_subject_graph(pg::ParalogGroup) = _weighted_directed_graph(pg.id_query_
 
 """
 Given a Newick tree, split it into its structure and its labels. Returns the
-`'('`/`')'` characters and label `String`s in order; branch lengths and
-separators are dropped.
+`'('`/`')'` characters and label `String`s in order; separators are dropped, and
+branch lengths too unless `lengths`, which emits each as a `Float64` after the
+node it belongs to.
 """
-function _newick_tokens(newick::AbstractString)
-    tokens = Union{Char,String}[]
+function _newick_tokens(newick::AbstractString; lengths::Bool = false)
+    tokens = lengths ? Union{Char,String,Float64}[] : Union{Char,String}[]
     label_start = 0
+    length_start = 0
     reading_length = false
 
     for (index, char) in pairs(newick)
@@ -651,12 +653,21 @@ function _newick_tokens(newick::AbstractString)
                 isempty(label) || push!(tokens, String(label))
                 label_start = 0
             end
+            if length_start > 0
+                push!(
+                    tokens,
+                    parse(Float64, strip(newick[length_start:prevind(newick, index)])),
+                )
+                length_start = 0
+            end
             reading_length = char == ':'
+            reading_length && lengths && (length_start = nextind(newick, index))
             char in ('(', ')') && push!(tokens, char)
         elseif !reading_length && label_start == 0 && !isspace(char)
             label_start = index
         end
     end
+    length_start > 0 && push!(tokens, parse(Float64, strip(newick[length_start:end])))
     return tokens
 end
 

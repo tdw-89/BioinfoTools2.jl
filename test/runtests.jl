@@ -5,6 +5,7 @@ using Test
     include("TESTS_sofa_lookup.jl")
     include("TESTS_bit_codes.jl")
     include("TESTS_paralogs.jl")
+    include("TESTS_orthologs.jl")
     include("TESTS_reference.jl")
     include("TESTS_data.jl")
     include("TESTS_methylation.jl")
