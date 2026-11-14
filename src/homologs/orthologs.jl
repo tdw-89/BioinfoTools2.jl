@@ -411,11 +411,24 @@ end
 """Given a species position, its bit in a species mask."""
 _bit(position::Integer) = one(UInt64) << (position - 1)
 
-"""Given a forest, the leaves of the species whose bit is `bit`, in preorder."""
-_species_leaves(forest::GeneForest, bit::UInt64) = Int32[
-    node for node in eachindex(forest.parent) if
-    forest.subtree_end[node] == node && forest.species[node] == bit
-]
+"""Given a forest node, tell whether it is a leaf."""
+_is_leaf(forest::GeneForest, node::Integer) = forest.subtree_end[node] == node
+
+"""Given a forest leaf, its species' position in the clade."""
+_leaf_position(forest::GeneForest, node::Integer) = trailing_zeros(forest.species[node]) + 1
+
+"""
+Given a forest and its species count, partition its leaves by species position,
+in preorder. Returns a vector of leaf vectors, one per species.
+"""
+function _species_leaves(forest::GeneForest, n_species::Int)
+    by_species = [Int32[] for _ = 1:n_species]
+    for node in eachindex(forest.parent)
+        _is_leaf(forest, node) || continue
+        push!(by_species[_leaf_position(forest, node)], Int32(node))
+    end
+    return by_species
+end
 
 """
 Given a genome and gene IDs, resolve each ID's metadata index in one walk,
@@ -435,17 +448,16 @@ function _gene_indices(genome::Genome, ids::Vector{String})
 end
 
 """
-Given a forest and the species at `position`, point each of its leaves at the
-gene its protein codes for, through `proteins` (a [`protein_gene_map`](@ref)).
-Returns `nothing`; leaves it cannot place keep gene 0, and are counted in a warning.
+Given a forest and one species' `leaves`, point each at the gene its protein
+codes for, through `proteins` (a [`protein_gene_map`](@ref)). Returns `nothing`;
+leaves it cannot place keep gene 0, and are counted in a warning.
 """
 function _place_genes!(
     forest::GeneForest,
-    position::Int,
+    leaves::Vector{Int32},
     member::Species,
     proteins::AbstractDict,
 )
-    leaves = _species_leaves(forest, _bit(position))
     gene_ids = [get(proteins, forest.protein[leaf], nothing) for leaf in leaves]
     indices = _gene_indices(
         member.genome,
@@ -468,13 +480,13 @@ function _place_genes!(
 end
 
 """
-Given a forest and the species at `position`, index its leaves by `key_of(leaf)`,
-skipping a leaf whose key is `nothing`. Returns a [`GeneIndex`](@ref); a repeated
-key warns, its first leaf (in orthogroup order) answering lookups.
+Given one species' `leaves`, index them by `key_of(leaf)`, skipping a leaf whose
+key is `nothing`. Returns a [`GeneIndex`](@ref); a repeated key warns, its first
+leaf (in orthogroup order) answering lookups.
 """
-function _build_index(forest::GeneForest, position::Int, key_of, what::String, name::String)
+function _build_index(leaves::Vector{Int32}, key_of, what::String, name::String)
     keys, nodes = String[], Int32[]
-    for leaf in _species_leaves(forest, _bit(position))
+    for leaf in leaves
         key = key_of(leaf)
         isnothing(key) && continue
         push!(keys, key)
@@ -541,31 +553,26 @@ function Clade(
         _read_orthogroups(orthogroups, names, keys(trees))
     forest = _build_forest(trees, tree_less, _leaf_prefixes(names))
 
-    for (position, member) in enumerate(members)
+    leaves_by_species = _species_leaves(forest, length(members))
+    for (leaves, member) in zip(leaves_by_species, members)
         proteins = get(protein_maps, member.name, nothing)
         if !isnothing(proteins)
-            _place_genes!(forest, position, member, proteins)
+            _place_genes!(forest, leaves, member, proteins)
         elseif !isempty(member.genome.scaffolds)
             @warn "$(member.name) has a genome but no protein map; its leaves have no gene"
         end
     end
     genes = [
         _build_index(
-            forest,
-            position,
+            leaves,
             leaf -> _leaf_gene_id(forest, member, leaf),
             "gene",
             member.name,
-        ) for (position, member) in enumerate(members)
+        ) for (leaves, member) in zip(leaves_by_species, members)
     ]
     proteins = [
-        _build_index(
-            forest,
-            position,
-            leaf -> forest.protein[leaf],
-            "protein",
-            member.name,
-        ) for (position, member) in enumerate(members)
+        _build_index(leaves, leaf -> forest.protein[leaf], "protein", member.name) for
+        (leaves, member) in zip(leaves_by_species, members)
     ]
     return Clade(members, tree, forest, genes, proteins)
 end
@@ -600,9 +607,11 @@ function load_clade(
     sanitize_ids = get(load_options, :sanitize_ids, true)
     tasks = map(collect(gffs)) do (name, path)
         Threads.@spawn begin
+            gff_path = String(path)
+            proteins_task = Threads.@spawn protein_gene_map(gff_path; sanitize_ids)
             member = Species(String(name))
-            add_features!(String(path), member; load_options...)
-            member => protein_gene_map(String(path); sanitize_ids)
+            add_features!(gff_path, member; load_options...)
+            member => fetch(proteins_task)
         end
     end
     species, protein_maps = Species[], Dict{String,Dict{String,String}}()
@@ -668,12 +677,6 @@ Base.iterate(children::_Children, child::Int32 = children.first) =
 Base.IteratorSize(::Type{_Children}) = Base.SizeUnknown()
 Base.eltype(::Type{_Children}) = Int32
 
-"""Given a forest node, tell whether it is a leaf."""
-_is_leaf(forest::GeneForest, node::Integer) = forest.subtree_end[node] == node
-
-"""Given a forest leaf, its species' position in the clade."""
-_leaf_position(forest::GeneForest, node::Integer) = trailing_zeros(forest.species[node]) + 1
-
 """Given a forest node, the tree it belongs to. Returns that tree's index."""
 _tree_of(forest::GeneForest, node::Integer) = searchsortedlast(forest.tree_start, node)
 
@@ -697,10 +700,15 @@ function _ortholog_leaves(forest::GeneForest, leaf::Int32, wanted::UInt64)
     forest.source[_tree_of(forest, leaf)] == TREE_PAIR && return found
     side, node = leaf, forest.parent[leaf]
     while node != 0
-        for child in _Children(forest.subtree_end, node)
-            child == side && continue
-            forest.species[child] & forest.species[side] == 0 || continue
-            append!(found, _leaves_in(forest, child, wanted))
+        if forest.species[node] & wanted != 0
+            for child in _Children(forest.subtree_end, node)
+                child == side && continue
+                (
+                    forest.species[child] & wanted != 0 &&
+                    forest.species[child] & forest.species[side] == 0
+                ) || continue
+                append!(found, _leaves_in(forest, child, wanted))
+            end
         end
         side, node = node, forest.parent[node]
     end
@@ -760,6 +768,28 @@ function orthologs(
 end
 
 """
+Given two sibling subtrees `from` and `to`, append every `(x, y)` with `x` a
+`bit_a` leaf of `from` and `y` a `bit_b` leaf of `to` to `left`/`right`.
+Returns `nothing`.
+"""
+function _append_leaf_pairs!(
+    left::Vector{Int32},
+    right::Vector{Int32},
+    forest::GeneForest,
+    from::Int32,
+    to::Int32,
+    bit_a::UInt64,
+    bit_b::UInt64,
+)
+    (forest.species[from] & bit_a != 0 && forest.species[to] & bit_b != 0) || return nothing
+    for x in _leaves_in(forest, from, bit_a), y in _leaves_in(forest, to, bit_b)
+        push!(left, x)
+        push!(right, y)
+    end
+    return nothing
+end
+
+"""
 Given a forest node, append every ortholog pair it decides — a leaf of `bit_a`
 under one child, a leaf of `bit_b` under another sharing no species — to
 `left`/`right`. Returns `nothing`.
@@ -772,31 +802,54 @@ function _node_pairs!(
     bit_a::UInt64,
     bit_b::UInt64,
 )
+    both = bit_a | bit_b
     for first_child in _Children(forest.subtree_end, node)
+        first_mask = forest.species[first_child]
+        first_mask & both == 0 && continue
         later =
             _Children(forest.subtree_end, node, forest.subtree_end[first_child] + Int32(1))
         for second_child in later
-            forest.species[first_child] & forest.species[second_child] == 0 || continue
-            for (from, to) in ((first_child, second_child), (second_child, first_child))
-                for x in _leaves_in(forest, from, bit_a), y in _leaves_in(forest, to, bit_b)
-                    push!(left, x)
-                    push!(right, y)
-                end
-            end
+            second_mask = forest.species[second_child]
+            (second_mask & both != 0 && first_mask & second_mask == 0) || continue
+            _append_leaf_pairs!(
+                left,
+                right,
+                forest,
+                first_child,
+                second_child,
+                bit_a,
+                bit_b,
+            )
+            _append_leaf_pairs!(
+                left,
+                right,
+                forest,
+                second_child,
+                first_child,
+                bit_a,
+                bit_b,
+            )
         end
     end
     return nothing
 end
 
 """
-    ortholog_pairs(clade, species_a, species_b)
+    ortholog_pairs(clade, species_a, species_b; codeml = nothing)
 
 Given two species of `clade`, list every ortholog pair between them, as
 OrthoFinder's `Orthologues/<a>__v__<b>.tsv` does but one pair per row. Returns a
 `DataFrame` (`orthogroup`, `gene_a`, `gene_b`, `protein_a`, `protein_b`,
 `one_to_one`), `one_to_one` marking a pair whose genes have no other ortholog.
+With `codeml` ([`CodemlTrees`](@ref)), a `dS` column adds each pair's `patristic`
+dS on its orthogroup's divergence tree, `NaN` where that tree lacks either gene.
 """
-function ortholog_pairs(clade::Clade, species_a::AbstractString, species_b::AbstractString)
+function ortholog_pairs(
+    clade::Clade,
+    species_a::AbstractString,
+    species_b::AbstractString;
+    codeml = nothing,
+)
     bit_a = _bit(_species_position(clade, species_a))
     bit_b = _bit(_species_position(clade, species_b))
     bit_a == bit_b && throw(ArgumentError("ortholog_pairs needs two different species"))
@@ -811,7 +864,30 @@ function ortholog_pairs(clade::Clade, species_a::AbstractString, species_b::Abst
             append!(trees, Iterators.repeated(Int32(tree), length(left) - length(trees)))
         end
     end
-    return _pair_table(clade, left, right, trees)
+    table = _pair_table(clade, left, right, trees)
+    isnothing(codeml) || (table.dS = _pair_dS(clade, codeml, left, right, trees))
+    return table
+end
+
+"""
+Given ortholog pairs as forest leaf vectors and their trees, read each pair's dS
+off its orthogroup's divergence tree, built once per orthogroup. Returns a
+`Vector{Float64}`, `NaN` without a codeml tree or where it lacks either gene.
+"""
+function _pair_dS(clade::Clade, codeml, left, right, trees)
+    dS = fill(NaN, length(left))
+    built = Dict{Int32,Any}()
+    for index in eachindex(left)
+        divergence =
+            get!(() -> _divergence_of(clade, codeml, trees[index]), built, trees[index])
+        isnothing(divergence) && continue
+        tree, by_forest = divergence
+        first_leaf, second_leaf =
+            get(by_forest, left[index], 0), get(by_forest, right[index], 0)
+        (first_leaf == 0 || second_leaf == 0) && continue
+        dS[index] = patristic(tree, first_leaf, second_leaf)
+    end
+    return dS
 end
 
 """Given ortholog pairs as leaf vectors, tabulate them for [`ortholog_pairs`](@ref)."""
@@ -1006,6 +1082,8 @@ function _write_newick!(io::IO, tree::GeneTree, node::Int32, n_internal::Base.Re
     return nothing
 end
 
+include("divergence_trees.jl")
+
 #= Base.show overloads =#
 
 Base.show(io::IO, tree::SpeciesTree) =
@@ -1039,6 +1117,8 @@ Base.show(io::IO, tree::GeneTree) = print(
 )
 
 export Clade,
+    CodemlTrees,
+    DivergenceTree,
     GeneForest,
     GeneIndex,
     GeneTree,
@@ -1046,6 +1126,7 @@ export Clade,
     branch_length,
     children,
     common_ancestor,
+    divergence_tree,
     gene_tree,
     is_leaf,
     leaf_gene,
@@ -1053,14 +1134,21 @@ export Clade,
     leaf_species,
     leaves,
     load_clade,
+    nearest_orthologs,
     newick,
+    node_ages,
+    node_event,
     node_label,
     ortholog_pairs,
     orthogroup,
     orthogroups,
     orthologs,
+    patristic,
+    prune,
     root,
+    root_distances,
     species_names,
+    species_node,
     tree_nodes
 
 end

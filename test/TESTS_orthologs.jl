@@ -410,4 +410,216 @@ pair_set(table) = Set(zip(table.orthogroup, table.protein_a, table.protein_b))
             clade_fixture(orthogroups = ["Orthogroup\tape\tcat", "OG0000009\tA1.1\tX1.1"])[1]
         @test_throws ArgumentError Clade(Species[], stray_column)
     end
+
+    # -------------------------------------------------------------------------
+    @testset "node_event and species_node on gene trees" begin
+        duplicated = gene_tree(clade, "OG0000001")
+        top, inner = root(duplicated), children(duplicated, root(duplicated))[2]
+        @test node_event.(Ref(duplicated), (top, inner, leaves(duplicated)[1])) ==
+              (:speciation, :duplication, :leaf)
+        @test species_node(duplicated, inner) == "N1" &&
+              species_node(duplicated, top) == "N0"
+        polytomy = gene_tree(clade, "OG0000002")
+        @test node_event(polytomy, root(polytomy)) == :mixed
+        pair = gene_tree(clade, "OG0000004")
+        @test node_event(pair, root(pair)) == :unresolved
+        @test (
+            orthogroup(clade, "C2.1"),
+            orthogroup(clade, "O3.1"),
+            orthogroup(clade, "gene-A1"),
+            orthogroup(clade, "nope"),
+        ) == ("OG0000002", "OG0000002", "OG0000000", nothing)
+    end
+
+    # -------------------------------------------------------------------------
+    # OG0000001 as codeml writes it: unrooted, at a trifurcation over n2, n3 and O2.1.
+    divergence_dS = "((A2.1:0.3,B2.1:0.1):0.2,(A3.1:0.2,B3.1:0.4):0.6,O2.1:1.4);"
+    divergence_dN = "((A2.1:0.15,B2.1:0.05):0.1,(A3.1:0.1,B3.1:0.2):0.3,O2.1:0.7);"
+
+    @testset "divergence_tree rooting and events" begin
+        tree = divergence_tree(clade, "OG0000001"; dS = divergence_dS, dN = divergence_dN)
+        tips, top = leaves(tree), children(tree, root(tree))
+        @test leaf_protein.(Ref(tree), tips) == ["O2.1", "A2.1", "B2.1", "A3.1", "B3.1"]
+        # OrthoFinder's lengths below its root are 0.5 (O2.1) and 0.2 (n1): 1.4 splits 1.0 + 0.4.
+        @test branch_length.(Ref(tree), top) ≈ [1.0, 0.4] &&
+              branch_length(tree, top[1]; rate = :dN) ≈ 0.5
+        @test isnothing(parent(tree, root(tree))) && isnan(branch_length(tree, root(tree)))
+        @test node_event.(Ref(tree), tree_nodes(tree)) == [
+            :speciation,
+            :leaf,
+            :duplication,
+            :speciation,
+            :leaf,
+            :leaf,
+            :speciation,
+            :leaf,
+            :leaf,
+        ]
+        @test all(tree.exact) && isempty(tree.dropped)
+        # Lengths are stored as Float32, hence the tolerance.
+        @test isapprox(patristic(tree, tips[2], tips[5]), 1.5; atol = 1e-6) &&
+              isapprox(patristic(tree, tips[2], tips[5]; rate = :dN), 0.75; atol = 1e-6)
+        @test isapprox(root_distances(tree)[tips[2]], 0.9; atol = 1e-6)
+        @test (species_node(tree, top[2]), species_node(tree, tips[2])) == ("N1", "ape")
+        @test (leaf_species(tree, tips[2]), leaf_gene(tree, tips[2])) == ("ape", "gene-A2")
+        @test ismissing(leaf_gene(tree, tips[1]))
+        @test sprint(show, tree) == "DivergenceTree(\"OG0000001\", 5 leaves)"
+
+        # The same unrooted tree, written rooted on the O2.1 branch, lands identically.
+        bifurcating = "(O2.1:0.7,((A2.1:0.3,B2.1:0.1):0.2,(A3.1:0.2,B3.1:0.4):0.6):0.7);"
+        rerooted = divergence_tree(clade, "OG0000001"; dS = bifurcating)
+        @test rerooted.parent == tree.parent &&
+              rerooted.dS[2:end] ≈ tree.dS[2:end] &&
+              all(isnan, rerooted.dN)
+
+        # Two genes, no OrthoFinder lengths: the root falls midway, the event unresolved.
+        pair = divergence_tree(clade, "OG0000004"; dS = "(A6.1:0.2,B7.1:0.6);")
+        @test branch_length.(Ref(pair), children(pair, 1)) ≈ [0.4, 0.4] &&
+              node_event(pair, 1) == :unresolved
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "divergence_tree at a polytomy and with dropped genes" begin
+        # codeml resolves OG0000002's four-way root as ((A4, B4), n1, O3).
+        resolved = divergence_tree(
+            clade,
+            "OG0000002";
+            dS = "((A4.1:0.1,B4.1:0.2):0.3,(B5.1:0.1,C2.1:0.1):0.2,O3.1:0.5);",
+        )
+        @test leaf_protein.(Ref(resolved), leaves(resolved)) ==
+              ["A4.1", "B4.1", "B5.1", "C2.1", "O3.1"]
+        @test node_event.(Ref(resolved), tree_nodes(resolved)) ==
+              [:mixed, :speciation, :leaf, :leaf, :speciation, :leaf, :leaf, :leaf]
+        @test resolved.exact == [true, false, true, true, true, true, true, true]
+        @test species_node(resolved, 2) == "N1"
+
+        # Without B3.1, A3.1 still stands for n3's lineage, so n1 stays a duplication.
+        partial = divergence_tree(
+            clade,
+            "OG0000001";
+            dS = "((A2.1:0.3,B2.1:0.1):0.2,A3.1:0.8,O2.1:1.4);",
+        )
+        lone = last(leaves(partial))
+        @test forest.protein[partial.dropped] == ["B3.1"]
+        @test node_event(partial, parent(partial, lone)) == :duplication
+        @test species_node(partial, lone) == "ape"
+        @test prune(partial, ["ape", "big"]).dropped == partial.dropped &&
+              isempty(prune(partial, "ape").dropped)
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "prune" begin
+        tree = divergence_tree(clade, "OG0000001"; dS = divergence_dS, dN = divergence_dN)
+        primates = prune(tree, ["ape", "big"])
+        @test leaf_protein.(Ref(primates), leaves(primates)) ==
+              ["A2.1", "B2.1", "A3.1", "B3.1"]
+        @test node_event.(Ref(primates), tree_nodes(primates)) ==
+              [:duplication, :speciation, :leaf, :leaf, :speciation, :leaf, :leaf]
+        # The root lost O2.1, so n1 is the new root and its branch is the stem.
+        @test branch_length(primates, 1) ≈ 0.4 &&
+              branch_length(primates, 1; rate = :dN) ≈ 0.2
+        apes = prune(tree, "ape")
+        @test branch_length.(Ref(apes), leaves(apes)) ≈ [0.5, 0.8] &&
+              node_event(apes, 1) == :duplication
+        @test isapprox(patristic(apes, leaves(apes)...), 1.3; atol = 1e-6)
+        @test prune(apes, "ape").parent == apes.parent
+        @test_throws ArgumentError prune(tree, "out")
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "CodemlTrees and malformed codeml trees" begin
+        codeml = mktempdir()
+        write(joinpath(codeml, "OG0000001_dS.nwk"), divergence_dS)
+        write(joinpath(codeml, "OG0000001_dN.nwk"), divergence_dN)
+        write(
+            joinpath(codeml, "OG0000002_dS.nwk"),
+            "((A4.1:0.1,B4.1:0.2):0.3,(B5.1:0.1,C2.1:0.1):0.2,O3.1:0.5);",
+        )
+        write(joinpath(codeml, "OG0000001_ks.tsv"), "")
+        trees = CodemlTrees(codeml)
+        @test orthogroups(trees) == ["OG0000001", "OG0000002"] && "OG0000002" in trees
+        @test branch_length(divergence_tree(clade, trees, "OG0000001"), 2; rate = :dN) ≈ 0.5
+        @test all(isnan, divergence_tree(clade, trees, "OG0000002").dN)
+        @test_throws ArgumentError divergence_tree(clade, trees, "OG0000003")
+        @test_throws ArgumentError CodemlTrees(mktempdir())
+
+        conflicting = "((A2.1:0.3,A3.1:0.1):0.2,(B2.1:0.2,B3.1:0.4):0.6,O2.1:1.4);"
+        @test_throws ArgumentError divergence_tree(clade, "OG0000001"; dS = conflicting)
+        stranger = "((A2.1:0.3,X9.1:0.1):0.2,(A3.1:0.2,B3.1:0.4):0.6,O2.1:1.4);"
+        @test_throws ArgumentError divergence_tree(clade, "OG0000001"; dS = stranger)
+        @test_throws ArgumentError divergence_tree(
+            clade,
+            "OG0000001";
+            dS = divergence_dS,
+            dN = "((A2.1:0.1,B2.1:0.1):0.1,(B3.1:0.1,A3.1:0.1):0.1,O2.1:0.1);",
+        )
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "nearest_orthologs" begin
+        codeml = mktempdir()
+        write(joinpath(codeml, "OG0000001_dS.nwk"), divergence_dS)
+        trees = CodemlTrees(codeml)
+        by_tree = nearest_orthologs(clade, "ape")
+        by_dS = nearest_orthologs(clade, "ape"; codeml = trees)
+        row(table, protein) = only(eachrow(table[table.protein .== protein, :]))
+        # O2.1 has both ape genes as orthologs. OrthoFinder's lengths tie (0.9 each), so
+        # the first in the walk up wins; by dS, A2.1 is nearer (1.9 against 2.2).
+        outgroup_tree, outgroup_dS = row(by_tree, "O2.1"), row(by_dS, "O2.1")
+        @test (
+            outgroup_tree.ortholog_protein,
+            outgroup_tree.n_orthologs,
+            outgroup_tree.basis,
+        ) == ("A2.1", 2, :tree)
+        @test (outgroup_dS.ortholog_protein, outgroup_dS.basis) == ("A2.1", :dS) &&
+              isapprox(outgroup_dS.distance, 1.9; atol = 1e-6)
+        big = row(by_dS, "B3.1")
+        @test (big.gene, big.ortholog_gene, big.n_orthologs) == ("B3", "gene-SHARED-2", 1)
+        # A star (OG0000003) has no lengths; a two-gene orthogroup (OG0000004) none at all.
+        star = row(by_tree, "B6.1")
+        @test star.basis == :none && isnan(star.distance) && star.ortholog_protein == "A5.1"
+        @test !("B7.1" in by_tree.protein) && !any(by_tree.species .== "ape")
+        @test ismissing(row(by_tree, "O1.1").gene)
+        @test_throws ArgumentError nearest_orthologs(clade, "cat")
+
+        # `among` leaves only the listed orthologs: O2.1 falls back to A3.1 (by gene ID,
+        # dS 1.4 + 0.6 + 0.2), and B2.1, whose only ape ortholog is A2.1, drops out.
+        limited = nearest_orthologs(clade, "ape"; codeml = trees, among = ["gene-SHARED-2"])
+        outgroup = row(limited, "O2.1")
+        @test (outgroup.ortholog_protein, outgroup.n_orthologs, outgroup.basis) ==
+              ("A3.1", 1, :dS) && isapprox(outgroup.distance, 2.2; atol = 1e-6)
+        @test !("B2.1" in limited.protein) && "B3.1" in limited.protein
+        @test row(nearest_orthologs(clade, "ape"; among = ["A5.1"]), "B6.1").basis == :none
+
+        # With codeml trees, ortholog pairs carry their dS: OG0000001's two ape–big
+        # pairs (0.3 + 0.1 and 0.2 + 0.4), NaN for orthogroups without a tree.
+        pairs = ortholog_pairs(clade, "ape", "big"; codeml = trees)
+        with_dS = pairs[isfinite.(pairs.dS), :]
+        @test Set(zip(with_dS.protein_a, with_dS.protein_b)) ==
+              Set([("A2.1", "B2.1"), ("A3.1", "B3.1")])
+        @test isapprox(sort(with_dS.dS), [0.4, 0.6]; atol = 1e-6) &&
+              nrow(with_dS) < nrow(pairs)
+        @test !("dS" in names(ortholog_pairs(clade, "ape", "big")))
+    end
+
+    # -------------------------------------------------------------------------
+    @testset "node_ages" begin
+        tree = divergence_tree(clade, "OG0000001"; dS = divergence_dS, dN = divergence_dN)
+        # Mean path down to the genes below: n2 (0.3, 0.1), n3 (0.2, 0.4), n1 from
+        # 0.4 deep (0.9, 0.7, 1.2, 1.4), the root over all five (1.0 for O2.1).
+        @test isapprox(node_ages(tree), [1.04, 0, 0.65, 0.2, 0, 0, 0.3, 0, 0]; atol = 1e-6)
+        @test node_ages(tree; rate = :dN) ≈ node_ages(tree) ./ 2
+        # Pruning keeps the full tree's ages, so hiding species moves no node.
+        @test isapprox(node_ages(prune(tree, "ape")), [0.65, 0, 0]; atol = 1e-6)
+        # n3's deep genes outweigh n1's own mean (1.65), so n1 is raised to n3's 3.
+        deep = divergence_tree(
+            clade,
+            "OG0000001";
+            dS = "((A2.1:0.1,B2.1:0.1):0.1,(A3.1:3,B3.1:3):0.1,O2.1:0.1);",
+        )
+        ages = node_ages(deep)
+        @test isapprox(ages[3], 3; atol = 1e-6) && ages[7] == ages[3] && ages[1] >= ages[3]
+        @test all(isnan, node_ages(deep; rate = :dN))
+        @test_throws ArgumentError node_ages(tree; rate = :dX)
+    end
 end

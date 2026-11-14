@@ -1,6 +1,7 @@
 """
 Figures for the package's data types: metagene line profiles and heatmaps,
-per-quantile distributions, and fitted probability curves.
+per-quantile distributions, fitted probability curves, and gene-family
+phylograms ([`gene_family_plot!`](@ref), [`gene_family_explorer`](@ref)).
 
 Every function draws into a caller-supplied grid position, so figure size and
 layout stay the caller's.
@@ -8,6 +9,25 @@ layout stay the caller's.
 module Plotting
 
 using CairoMakie
+using ..Homologs: Orthologs
+
+include("plotting/gene_family.jl")
+
+"""
+    gene_family_explorer(clade, trees::CodemlTrees; species = nothing, orthogroup = "",
+                         layout = :chronogram, size = (1300, 950), screen, plot_options...)
+
+Given a clade and its codeml trees, open an interactive [`gene_family_plot!`](@ref)
+window: type an orthogroup or any gene ID/protein (its leaf is ringed) or step
+with ◀/▶; switch between the chronogram (`layout`, genes aligned) and phylogram;
+tick species to prune every tree to them (`species` the initial ones, all by
+default; orthogroups with under two of their genes are skipped); hover a node for
+its tooltip. `plot_options` (`tracks`, …) pass on. Returns `(figure, screen,
+textbox, previous, next, aligned, status, current, species_boxes)`; `screen =
+nothing` shows nothing. **NOTE:** needs `using GLMakie`; outside a REPL,
+`wait(explorer.screen)` keeps the window open.
+"""
+function gene_family_explorer end
 
 """
 Given an upstream `flank`, body width and optional `downstream` width, place a
@@ -439,6 +459,15 @@ export metagene_xticks,
     overlay_trend!,
     probability_plot!,
     mark_positions!,
-    mark_rows!
+    mark_rows!,
+    phylogram_layout,
+    phylogram_segments,
+    relative_rate,
+    species_palette,
+    default_leaf_label,
+    GeneTrack,
+    track_values,
+    gene_family_plot!,
+    gene_family_explorer
 
 end

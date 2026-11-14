@@ -145,6 +145,12 @@ both counts.
 | `orthogroup`, per gene | ~0.4 µs |
 | `ortholog_pairs`, all 21 species pairs | ~0.9 s |
 
+## codeml branch lengths
+
+`divergence_tree` roots a divergence-pipeline codeml tree (per-branch dS and dN)
+on an orthogroup of the clade, for `Plotting.gene_family_plot!`. See
+[`divergence_tree.md`](divergence_tree.md).
+
 ## Not carried
 
 - **HOGs** (`Phylogenetic_Hierarchical_Orthogroups`); they can be derived from
