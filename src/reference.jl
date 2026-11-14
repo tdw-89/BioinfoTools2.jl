@@ -317,6 +317,16 @@ function get_metadata(genome::Genome, meta_index::UInt32)
 end
 
 """
+Given a metadata index, read the vocabulary token of its feature ID (the first
+metadata field). Returns that `UInt32` token, or `0` when the index carries no
+metadata.
+"""
+@inline function _id_token(genome::Genome, meta_index::UInt32)
+    bytes = _meta_range(genome, meta_index)
+    return isnothing(bytes) ? zero(UInt32) : _read_token(genome.meta_blob, first(bytes))
+end
+
+"""
 Return only the interned ID (the first metadata token) for `meta_index`, or
 `nothing` when the feature carries no metadata.
 
@@ -325,9 +335,8 @@ metadata vector; prefer this over [`get_metadata`](@ref) when only the ID is
 needed.
 """
 function get_metadata_id(genome::Genome, meta_index::UInt32)
-    bytes = _meta_range(genome, meta_index)
-    bytes === nothing && return nothing
-    return genome.vocab[_read_token(genome.meta_blob, first(bytes))]
+    token = _id_token(genome, meta_index)
+    return iszero(token) ? nothing : genome.vocab[token]
 end
 
 """
@@ -432,8 +441,10 @@ This scans the genome's features (O(features) per lookup) rather than keeping an
 ID index; use the `Vector` method to resolve many IDs in one walk.
 """
 function Base.getindex(genome::Genome, id::AbstractString)
+    token = get(genome.vocab_lookup, String(id), zero(UInt32))
+    iszero(token) && return nothing
     for (name, interval) in _features(genome)
-        if feature_id(genome, interval) == id
+        if _id_token(genome, parse_index(interval.value)) == token
             return feature_record(genome, name, interval)
         end
     end
@@ -446,11 +457,17 @@ returning a `Vector{FeatureRecord}` resolved in one O(features) walk. IDs with
 no matching feature are skipped.
 """
 function Base.getindex(genome::Genome, ids::AbstractVector{<:AbstractString})
-    wanted = Set{String}(ids)
     records = FeatureRecord[]
+    wanted = falses(length(genome.vocab))
+    for id in ids
+        token = get(genome.vocab_lookup, String(id), zero(UInt32))
+        iszero(token) || (wanted[token] = true)
+    end
+    any(wanted) || return records
+
     for (name, interval) in _features(genome)
-        found = feature_id(genome, interval)
-        if !isnothing(found) && found in wanted
+        token = _id_token(genome, parse_index(interval.value))
+        if !iszero(token) && wanted[token]
             push!(records, feature_record(genome, name, interval))
         end
     end
